@@ -6,7 +6,7 @@ use super::decode::ToolCall;
 
 /// A format-specific recogniser for tool calls embedded in model text.
 pub trait RescueParser: Send + Sync {
-    /// Stable identifier, used in logs to record which parser fired.
+    /// Stable identifier used in logs.
     fn name(&self) -> &'static str;
     /// Attempt to extract tool calls from `text`.
     fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>>;
@@ -65,7 +65,7 @@ fn tool_call_from_value(v: &Value) -> Option<ToolCall> {
     let (name, args) = match obj.get("function").and_then(Value::as_object) {
         Some(func) => (func.get("name"), func.get("arguments")),
         None => (
-            // forge accepts `tool` or `name`, and `args` or `arguments`.
+            // Accepts `tool` or `name`, and `args` or `arguments`.
             obj.get("name").or_else(|| obj.get("tool")),
             obj.get("arguments")
                 .or_else(|| obj.get("args"))
@@ -201,8 +201,7 @@ impl RescueParser for Rehearsal {
 }
 
 /// Qwen-Coder XML: `<function=name><parameter=key>value</parameter>...</function>`.
-/// Parameter values are coerced to JSON scalars/objects when they parse, else
-/// kept as strings. Mirrors forge's `_QWEN_FUNCTION_RE` / `_QWEN_PARAMETER_RE`.
+/// Parameter values are coerced to JSON scalars/objects when they parse, else kept as strings.
 pub struct QwenCoder;
 impl RescueParser for QwenCoder {
     fn name(&self) -> &'static str {
@@ -481,7 +480,7 @@ mod tests {
 
     #[test]
     fn arguments_as_object_round_trip_through_canonical() {
-        // A rescued call should re-emit canonically (used by M6).
+        // A rescued call re-emits canonically.
         let calls = Qwen
             .try_parse("<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}</tool_call>")
             .unwrap();

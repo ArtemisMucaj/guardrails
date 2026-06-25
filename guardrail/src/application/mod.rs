@@ -279,7 +279,7 @@ async fn guardrail_loop(
                     Some(text) => {
                         json_response(status, out_headers, &response_with_text(&value, text))
                     }
-                    None => json_response(status, out_headers, &value),
+                    None => json_response(status, out_headers, &response_with_text(&value, &nudge)),
                 };
             }
         }

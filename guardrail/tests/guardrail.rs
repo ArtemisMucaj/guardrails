@@ -71,6 +71,26 @@ fn text_response(content: &str) -> Value {
     })
 }
 
+fn native_tool_response(name: &str, arguments: Value) -> Value {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+}
+
 async fn post(proxy: &str, body: &Value) -> Value {
     reqwest::Client::new()
         .post(format!("{proxy}/v1/chat/completions"))
@@ -232,6 +252,34 @@ async fn retry_exhaustion_falls_back_to_last_text() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(got["choices"][0]["finish_reason"], "stop");
     assert_eq!(got["choices"][0]["message"]["content"], bad);
+}
+
+#[tokio::test]
+async fn native_invalid_tool_call_exhaustion_does_not_forward_tool_call() {
+    let backend = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Sequence {
+            calls: calls.clone(),
+            bodies: vec![native_tool_response(
+                "Edit",
+                json!({"oldString": "old", "newString": "new"}),
+            )],
+        })
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn(&backend.uri(), Guardrails::default()).await;
+    let got = post(&proxy, &edit_request()).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(got["choices"][0]["finish_reason"], "stop");
+    assert!(got["choices"][0]["message"]["tool_calls"].is_null());
+    assert!(got["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("filePath"));
 }
 
 #[tokio::test]

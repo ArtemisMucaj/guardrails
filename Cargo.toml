@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["guardrail"]
+
+# Shared profile tuning for the shipped binary. Guardrails are added as
+# separate crates (rescue, validate, ...) under members as the milestones land;
+# the workspace exists now so that growth doesn't require a layout change.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

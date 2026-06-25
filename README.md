@@ -1,77 +1,122 @@
-# guardrail
+# guardrails
 
-A transparent **OpenAI chat-completions proxy** that sits in front of an
-OpenAI-compatible backend (LM Studio first) and applies small-model tool-call
-reliability guardrails in the wire path. Ships as a Jarvis sidecar: a single
-static binary the menu bar app launches and supervises alongside the jarvis MCP
-proxy.
+`guardrails` is a transparent proxy for OpenAI-compatible chat-completions
+servers. It is designed for local model servers such as LM Studio, where models
+often produce tool calls in inconsistent formats or omit required arguments.
 
-## Where it fits
+The proxy sits between your OpenAI-compatible client and backend. Plain chat
+requests pass through unchanged. Tool-enabled, non-streaming requests are checked
+and repaired before the response reaches the client.
 
-Jarvis and guardrail operate at two different edges of the same agent and do not
-call each other at runtime:
+## What It Does
 
+- Forwards non-tool and streaming requests without rewriting the request or
+  response body.
+- Normalizes valid tool calls into OpenAI's `tool_calls` shape.
+- Recovers tool calls from model text formats such as Qwen, Qwen-Coder, Hermes,
+  Llama, Mistral, fenced JSON, and bare JSON.
+- Validates tool names and JSON-object arguments against the request's declared
+  tools.
+- Checks required JSON-schema argument fields, preventing calls such as `Edit`
+  without a required `filePath`.
+- Retries invalid tool calls with a corrective nudge, then falls back safely
+  instead of forwarding invalid tool calls to the client.
+- Optionally injects a synthetic `respond` tool so models can return a final text
+  answer through the same tool-call path.
+
+## Request Flow
+
+```text
+OpenAI client -> guardrail proxy -> LM Studio or another OpenAI-compatible server
 ```
-agent harness ──(MCP)──────────► jarvis ──(MCP)──► backend MCP servers
-agent harness ──(OpenAI HTTP)──► guardrail ──(HTTP)──► LM Studio
+
+For requests without tools, or requests with `stream: true`, guardrails forwards
+bytes directly.
+
+For tool-enabled, non-streaming requests, guardrails runs this loop:
+
+```text
+backend response -> decode -> rescue -> validate -> retry or return
 ```
 
-Jarvis shrinks the tool surface the model sees to 3 synthetic tools; guardrail
-makes the calls to those tools reliable on small models. Complementary, not
-coupled.
+Valid native tool calls pass through unchanged. Rescued tool calls are re-emitted
+in canonical OpenAI format. Invalid calls are retried up to the configured retry
+budget.
 
-## Status
+## Install And Run
 
-Requests without tools (and any streamed request) are forwarded **verbatim**,
-byte-for-byte, including the response stream — the `model` field is never
-rewritten. Tool-enabled, non-streamed requests run the **active guardrail loop**:
-inject `respond`, call the backend, decode → rescue → validate, retry with a
-nudge on failure, unwrap `respond` to text. Native valid calls pass through
-unchanged; only repaired responses are rewritten. Every guardrail is on by
-default and individually toggleable (`--rescue/--respond/--retry false`), so the
-proxy degrades to a zero-overhead passthrough.
+Start your OpenAI-compatible backend first. For LM Studio, the default local URL
+is usually `http://127.0.0.1:1234`.
 
-Milestones:
-
-1. ✅ Transparent passthrough (failure-isolation).
-2. ✅ Typed+passthrough serde model — round-trip fidelity.
-3. ✅ Validation + canonical re-emit.
-4. ✅ Rescue parsing — Mistral, rehearsal (`name[ARGS]{}`), Qwen-Coder
-   (`<function=…><parameter=…>`), Qwen `<tool_call>`, Hermes, Llama, fenced JSON,
-   and `{tool,args}`/`{name,arguments}` JSON (forge's full set + native formats).
-5. ✅ Synthetic `respond` tool + strip-to-text.
-6. ✅ Retry loop + ErrorTracker with fallback-to-last-text.
-7. ✅ Per-guardrail config toggles (observability tracing throughout).
-8. _(deferred)_ optimistic streaming; more backends; Anthropic wire format.
-
-## Run
+Run the proxy from the repository root:
 
 ```bash
-# from the repo root (or drop --manifest-path when run inside rust/)
-cargo run --manifest-path rust/Cargo.toml -p guardrail -- \
-  --listen 127.0.0.1:8080 --backend http://127.0.0.1:1234
+cargo run -p guardrail -- \
+  --listen 127.0.0.1:8080 \
+  --backend http://127.0.0.1:1234
 ```
 
-Config is also available via env: `GUARDRAIL_LISTEN`, `GUARDRAIL_BACKEND`,
-`GUARDRAIL_CONNECT_TIMEOUT_SECS`, `GUARDRAIL_READ_TIMEOUT_SECS`, and the guardrail
-toggles `GUARDRAIL_RESCUE`, `GUARDRAIL_RESPOND`, `GUARDRAIL_RETRY`,
-`GUARDRAIL_MAX_RETRIES`. Logging via `RUST_LOG` (default `guardrail=info,warn`).
+Then point your client at:
 
-Point your OpenAI-compatible client's base URL at `http://127.0.0.1:8080/v1`.
-
-## Test
-
-```bash
-cargo test          # from the rust/ workspace root
+```text
+http://127.0.0.1:8080/v1
 ```
 
-`tests/passthrough.rs` stands up a wiremock backend and asserts status, headers,
-request body, and a streamed SSE body all round-trip unchanged — the Milestone 1
-acceptance suite.
+## Configuration
 
-## Build a release binary
+Every option is available as both a CLI flag and an environment variable.
+
+| CLI flag | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--listen` | `GUARDRAIL_LISTEN` | `127.0.0.1:8080` | Proxy listen address. |
+| `--backend` | `GUARDRAIL_BACKEND` | `http://127.0.0.1:1234` | Backend base URL. |
+| `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
+| `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
+| `--rescue` | `GUARDRAIL_RESCUE` | `true` | Recover tool calls embedded in text. |
+| `--respond` | `GUARDRAIL_RESPOND` | `true` | Inject and unwrap the synthetic `respond` tool. |
+| `--retry` | `GUARDRAIL_RETRY` | `true` | Retry invalid tool calls with a corrective nudge. |
+| `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. |
+
+Example with all guardrails disabled:
 
 ```bash
-bash scripts/build_guardrail_binary.sh        # macOS → app Resources/
-bash scripts/build_guardrail_binary_linux.sh  # Linux → dist/
+cargo run -p guardrail -- \
+  --rescue false \
+  --respond false \
+  --retry false
+```
+
+## Logging
+
+Logs use `tracing` and default to:
+
+```text
+guardrail=info,warn
+```
+
+Override logging with `RUST_LOG`:
+
+```bash
+RUST_LOG=guardrail=debug cargo run -p guardrail
+```
+
+## Tests
+
+Run the full test suite from the repository root:
+
+```bash
+cargo test -p guardrail
+```
+
+The integration tests cover byte-for-byte passthrough, response inspection,
+rescue parsing, validation, retry behavior, and safe fallback for invalid tool
+calls.
+
+## Project Layout
+
+```text
+guardrail/src/application/  HTTP proxy and guardrail loop
+guardrail/src/connector/    Backend HTTP forwarding
+guardrail/src/domain/       Decode, rescue, validate, retry, and respond logic
+guardrail/tests/            End-to-end proxy tests
 ```

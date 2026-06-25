@@ -2,7 +2,7 @@
 name = "guardrail"
 version = "0.1.0"
 edition = "2021"
-description = "Transparent OpenAI chat-completions proxy with small-model tool-call guardrails (Jarvis sidecar)"
+description = "Transparent OpenAI chat-completions proxy with tool-call guardrails"
 license = "MIT"
 
 [[bin]]

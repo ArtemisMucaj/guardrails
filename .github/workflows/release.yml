@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: rust
+
+  build:
+    name: Build ${{ matrix.os }}
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: guardrail
+            asset_name: guardrail-linux-x86_64
+          - os: macos-14
+            artifact_name: guardrail
+            asset_name: guardrail-macos-aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: cargo build --release -p guardrail
+
+      - name: Rename binary
+        run: mv target/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          retention-days: 1
+
+  upload-assets:
+    name: Upload Release Assets
+    needs: [release-please, build]
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Upload assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.release-please.outputs.tag_name }} artifacts/* --repo ${{ github.repository }}

@@ -9,7 +9,7 @@ use crate::domain::guardrails::Guardrails;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "guardrail",
-    about = "Transparent OpenAI chat-completions proxy (Jarvis sidecar)"
+    about = "Transparent OpenAI chat-completions proxy with tool-call guardrails"
 )]
 pub struct Config {
     /// Address the proxy listens on.

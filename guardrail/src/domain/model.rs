@@ -1,20 +1,4 @@
-//! Milestone 2: typed-where-touched request model with lossless passthrough.
-//!
-//! The guardrails only ever read a few fields of an OpenAI chat-completions
-//! request — the tool names (to validate calls against), the messages (to append
-//! nudges), and the stream flag. Everything else (sampling params, the verbatim
-//! `model` id, future OpenAI fields) must round-trip untouched so the backend
-//! sees exactly what the client sent.
-//!
-//! The design is "type what you touch, flatten the rest": named fields capture
-//! the touched parts; a flattened [`Map`] captures everything else. Because
-//! serde consumes named fields before populating a `#[serde(flatten)]` map, the
-//! typed fields never also appear in `rest` — no duplication on re-emit.
-//!
-//! Round-trip fidelity is the acceptance criterion for this milestone, and it is
-//! *semantic*, not byte-identical: JSON object key order is insignificant, so the
-//! tests compare parsed [`Value`]s. No guardrail behaviour is wired into the
-//! proxy path yet — this is purely the data model future milestones build on.
+//! Typed chat-completion request model with lossless passthrough of unknown fields.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -22,23 +6,16 @@ use serde_json::{Map, Value};
 /// An OpenAI `POST /v1/chat/completions` request body, parsed
 /// typed-where-touched. Unknown / untouched fields live in [`rest`] and
 /// round-trip losslessly.
-///
-/// [`rest`]: ChatRequest::rest
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatRequest {
-    /// The conversation so far. Kept as raw [`Value`]s — the retry guardrail
-    /// appends a nudge message but never needs to inspect message internals, so
-    /// over-typing them would only risk fidelity loss.
+    /// The conversation so far, kept as raw [`Value`]s.
     pub messages: Vec<Value>,
 
-    /// Tool definitions, when the request is tool-enabled. Absent (rather than
-    /// empty) when the client sent no `tools`, so it is skipped on re-emit and
-    /// the passthrough path stays clean for plain chat requests.
+    /// Tool definitions, absent when the client sent no `tools`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
 
-    /// The model id, forwarded verbatim — never rewritten. Required by the
-    /// OpenAI schema, so always present.
+    /// The model identifier.
     pub model: String,
 
     /// Every other field (temperature, top_p, stream, tool_choice, …) preserved
@@ -61,20 +38,17 @@ impl ChatRequest {
             .unwrap_or(false)
     }
 
-    /// Whether the request carries any tool definitions. The guardrail loop only
-    /// engages when this is true; otherwise the request is pure passthrough.
+    /// Whether the request carries any tool definitions.
     pub fn has_tools(&self) -> bool {
         self.tools.as_ref().is_some_and(|t| !t.is_empty())
     }
 
-    /// Append a tool definition (used to inject the synthetic `respond` tool).
+    /// Append a tool definition.
     pub fn push_tool(&mut self, tool: Tool) {
         self.tools.get_or_insert_with(Vec::new).push(tool);
     }
 
     /// The set of tool names the model is allowed to call, in declaration order.
-    /// This is the one piece of the tool definitions the validate guardrail
-    /// actually reads.
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools
             .as_deref()

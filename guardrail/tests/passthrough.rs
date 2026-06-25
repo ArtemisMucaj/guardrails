@@ -8,13 +8,14 @@
 
 use std::net::SocketAddr;
 
+use guardrail::application::Backend;
 use guardrail::{build_app, AppState};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as WmRequest, Respond, ResponseTemplate};
 
 /// Spawn the proxy on an ephemeral port pointing at `backend`; return its base URL.
 async fn spawn_proxy(backend: &str) -> String {
-    let state = AppState::new(reqwest::Client::new(), backend);
+    let state = AppState::new(Backend::new(reqwest::Client::new()), backend);
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

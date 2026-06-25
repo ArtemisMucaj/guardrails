@@ -1,10 +1,5 @@
 //! Application layer — port definition, axum router, shared state, and the
 //! guardrail loop.
-//!
-//! Depends only inward on `domain`. Infrastructure (HTTP plumbing) is behind
-//! the [`BackendPort`] trait; the concrete implementation lives in `connector`
-//! and is injected at startup via [`AppState`].
-
 
 use axum::{
     extract::{Request, State},
@@ -27,7 +22,6 @@ use crate::domain::retry::ErrorTracker;
 use crate::domain::validate::{validate, Validation};
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
-/// `connector` provides the production implementation; tests can supply a mock.
 #[async_trait::async_trait]
 pub trait BackendPort: Send + Sync {
     /// POST a buffered body to `target`, return (status, headers, body).
@@ -78,8 +72,14 @@ impl BackendPort for Backend {
         headers: &HeaderMap,
         body: bytes::Bytes,
     ) -> Response {
-        let builder = self.client.request(method.clone(), target).headers(crate::connector::forward_headers(headers));
-        let builder = if method == axum::http::Method::POST || method == axum::http::Method::PUT || method == axum::http::Method::PATCH {
+        let builder = self
+            .client
+            .request(method.clone(), target)
+            .headers(crate::connector::forward_headers(headers));
+        let builder = if method == axum::http::Method::POST
+            || method == axum::http::Method::PUT
+            || method == axum::http::Method::PATCH
+        {
             builder.body(body.to_vec())
         } else {
             builder.body(Vec::<u8>::new())
@@ -91,7 +91,8 @@ impl BackendPort for Backend {
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("backend request failed: {e}"),
-                ).into_response();
+                )
+                    .into_response();
             }
         };
         crate::connector::relay_response(resp)
@@ -164,7 +165,11 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             if state.guardrails.any_active() {
                 return guardrail_loop(&state, &target, &parts.headers, request).await;
             }
-            return match state.port.post(&target, &parts.headers, body_bytes.to_vec()).await {
+            return match state
+                .port
+                .post(&target, &parts.headers, body_bytes.to_vec())
+                .await
+            {
                 Ok((status, headers, bytes)) => {
                     if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
                         inspect_response(&body, &request, state.guardrails);
@@ -177,7 +182,10 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             };
         }
 
-        state.port.forward(parts.method, &target, &parts.headers, body_bytes).await
+        state
+            .port
+            .forward(parts.method, &target, &parts.headers, body_bytes)
+            .await
     }
     .instrument(span)
     .await
@@ -193,7 +201,7 @@ async fn guardrail_loop(
     if g.respond {
         request.push_tool(respond::respond_tool());
     }
-    let valid_names: Vec<String> = request.tool_names().iter().map(|s| s.to_string()).collect();
+    let tools = request.tools.clone().unwrap_or_default();
 
     let mut tracker = ErrorTracker::new(if g.retry { g.max_retries } else { 0 });
     let mut last_text: Option<String> = None;
@@ -220,7 +228,6 @@ async fn guardrail_loop(
             }
         };
 
-        let names: Vec<&str> = valid_names.iter().map(String::as_str).collect();
         let calls = match decode_response(&value) {
             ModelOutput::ToolCalls(calls) => Some((calls, false)),
             ModelOutput::Text(text) => {
@@ -246,10 +253,14 @@ async fn guardrail_loop(
             }
         }
 
-        match validate(&calls, &names) {
+        match validate(&calls, &tools) {
             Validation::Valid => {
                 return if rescued {
-                    json_response(status, out_headers, &response_with_tool_calls(&value, &calls))
+                    json_response(
+                        status,
+                        out_headers,
+                        &response_with_tool_calls(&value, &calls),
+                    )
                 } else {
                     bytes_response(status, out_headers, bytes)
                 };
@@ -265,7 +276,9 @@ async fn guardrail_loop(
                 }
                 warn!("tool call invalid and retries exhausted; falling back");
                 return match &last_text {
-                    Some(text) => json_response(status, out_headers, &response_with_text(&value, text)),
+                    Some(text) => {
+                        json_response(status, out_headers, &response_with_text(&value, text))
+                    }
                     None => json_response(status, out_headers, &value),
                 };
             }
@@ -295,7 +308,7 @@ fn inspect_response(body: &Value, request: &ChatRequest, guardrails: Guardrails)
         ModelOutput::ToolCalls(calls) => {
             let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
             info!(count = calls.len(), tool_calls = ?names, "decoded native tool_calls");
-            match validate(&calls, &request.tool_names()) {
+            match validate(&calls, request.tools.as_deref().unwrap_or(&[])) {
                 Validation::Valid => info!("tool calls valid"),
                 Validation::NeedsRetry(nudge) => warn!(%nudge, "tool calls invalid (log-only)"),
             }
@@ -304,7 +317,7 @@ fn inspect_response(body: &Value, request: &ChatRequest, guardrails: Guardrails)
             Some((parser, calls)) => {
                 let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                 info!(parser, count = calls.len(), tool_calls = ?names, "rescued tool calls from text (log-only)");
-                match validate(&calls, &request.tool_names()) {
+                match validate(&calls, request.tools.as_deref().unwrap_or(&[])) {
                     Validation::Valid => info!("rescued tool calls valid"),
                     Validation::NeedsRetry(nudge) => warn!(%nudge, "rescued tool calls invalid"),
                 }

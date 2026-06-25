@@ -1,40 +1,10 @@
-//! Milestone 4: rescue parsing.
-//!
-//! When a small model emits a tool call in the *wrong* place — as text in the
-//! `content` field rather than as native `tool_calls` — [`decode`] yields
-//! [`ModelOutput::Text`]. Rescue tries, in order, a set of format-specific
-//! parsers to recover structured [`ToolCall`]s from that text. Each parser
-//! targets one model family's malformed output and is independently unit-tested.
-//!
-//! The families covered are forge's rescue formats plus the native delimiters of
-//! the families a transparent proxy actually sees (Anthropic's wire format is
-//! out of scope here):
-//!
-//! | Parser | Format |
-//! |---|---|
-//! | [`Mistral`] | `[TOOL_CALLS][{...}]` or `[TOOL_CALLS]name{args}` |
-//! | [`Rehearsal`] | `name[ARGS]{...}` (reasoning models) |
-//! | [`QwenCoder`] | `<function=name><parameter=k>v</parameter></function>` |
-//! | [`Qwen`] | `<tool_call>{...}</tool_call>` |
-//! | [`Hermes`] | `<function_call>{...}</function_call>` |
-//! | [`Llama`] | `<|python_tag|>{...}` |
-//! | [`FencedJson`] | a ```json fenced code block |
-//! | [`BareJson`] | the whole text is a tool-call JSON value |
-//!
-//! All JSON-shaped parsers funnel through [`tool_calls_from_value`], which
-//! interprets the common shapes: forge's `{tool, args}`, `{name, arguments}`,
-//! `{name, parameters}`, OpenAI's `{type, function:{...}}`, arrays, and
-//! `{tool_calls:[...]}` wrappers.
-//!
-//! [`decode`]: crate::decode::decode_response
-//! [`ModelOutput::Text`]: crate::decode::ModelOutput::Text
+//! Rescue parsing: recover structured tool calls from model text output.
 
 use serde_json::Value;
 
 use super::decode::ToolCall;
 
-/// A format-specific recogniser for tool calls embedded in model text. Parsers
-/// are cheap to try and return `None` when the text isn't in their format.
+/// A format-specific recogniser for tool calls embedded in model text.
 pub trait RescueParser: Send + Sync {
     /// Stable identifier, used in logs to record which parser fired.
     fn name(&self) -> &'static str;
@@ -42,9 +12,7 @@ pub trait RescueParser: Send + Sync {
     fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>>;
 }
 
-/// The parsers tried, in order. Distinctive-delimiter formats come first;
-/// [`BareJson`] is last because it is the most permissive and would otherwise
-/// shadow the others.
+/// The parsers tried, in order.
 pub fn default_parsers() -> Vec<Box<dyn RescueParser>> {
     vec![
         Box::new(Mistral),
@@ -59,7 +27,7 @@ pub fn default_parsers() -> Vec<Box<dyn RescueParser>> {
 }
 
 /// Try every parser in [`default_parsers`] and return the first match, along
-/// with the parser's name (for logging).
+/// with the parser's name.
 pub fn rescue(text: &str) -> Option<(&'static str, Vec<ToolCall>)> {
     for parser in default_parsers() {
         if let Some(calls) = parser.try_parse(text) {
@@ -71,8 +39,7 @@ pub fn rescue(text: &str) -> Option<(&'static str, Vec<ToolCall>)> {
 
 // ── Shared JSON interpretation ──────────────────────────────────────────────
 
-/// Interpret a JSON value as one or more tool calls across the shapes small
-/// models emit. Returns `None` if nothing call-shaped is present.
+/// Interpret a JSON value as one or more tool calls.
 fn tool_calls_from_value(v: &Value) -> Option<Vec<ToolCall>> {
     match v {
         Value::Array(items) => {
@@ -91,9 +58,7 @@ fn tool_calls_from_value(v: &Value) -> Option<Vec<ToolCall>> {
 
 /// Interpret a single JSON object as one tool call. Accepts the OpenAI
 /// `{type, function:{name, arguments}}` shape, the flatter `{name,
-/// arguments|parameters}` shape, and forge's `{tool, args}` shape (the format
-/// forge's prompt injection elicits). `arguments` is normalised to a
-/// JSON-encoded string for lossless re-emit.
+/// arguments|parameters}` shape, and forge's `{tool, args}` shape.
 fn tool_call_from_value(v: &Value) -> Option<ToolCall> {
     let obj = v.as_object()?;
 
@@ -126,8 +91,7 @@ fn tool_call_from_value(v: &Value) -> Option<ToolCall> {
     })
 }
 
-/// Parse the first JSON value out of `s`, ignoring any trailing text. Useful
-/// when a delimiter is followed by JSON plus trailing tokens/prose.
+/// Parse the first JSON value out of `s`, ignoring any trailing text.
 fn first_json_value(s: &str) -> Option<Value> {
     serde_json::Deserializer::from_str(s)
         .into_iter::<Value>()
@@ -154,8 +118,7 @@ fn extract_tagged(text: &str, tag: &str) -> Vec<String> {
     out
 }
 
-/// Parse every `<tag>JSON</tag>` block as tool calls. Shared by the XML-ish
-/// parsers (Qwen, Hermes).
+/// Parse every `<tag>JSON</tag>` block as tool calls.
 fn parse_tagged(text: &str, tag: &str) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
     for inner in extract_tagged(text, tag) {
@@ -171,7 +134,7 @@ fn parse_tagged(text: &str, tag: &str) -> Option<Vec<ToolCall>> {
 // ── Parsers ─────────────────────────────────────────────────────────────────
 
 /// Mistral: `[TOOL_CALLS]` followed by a JSON list/object, or the flatter
-/// `[TOOL_CALLS]name{args}` form some quantizations emit.
+/// `[TOOL_CALLS]name{args}` form.
 pub struct Mistral;
 const MISTRAL_TOKEN: &str = "[TOOL_CALLS]";
 impl RescueParser for Mistral {
@@ -204,8 +167,7 @@ impl RescueParser for Mistral {
     }
 }
 
-/// Rehearsal syntax used by some reasoning models: `name[ARGS]{...}`.
-/// Mirrors forge's `(\w+)\[ARGS\](\{.*\})`.
+/// Rehearsal syntax: `name[ARGS]{...}`.
 pub struct Rehearsal;
 const ARGS_MARKER: &str = "[ARGS]";
 impl RescueParser for Rehearsal {
@@ -305,7 +267,7 @@ impl RescueParser for Qwen {
     }
 }
 
-/// Hermes (legacy): `<function_call>{...}</function_call>` blocks.
+/// Hermes: `<function_call>{...}</function_call>` blocks.
 pub struct Hermes;
 impl RescueParser for Hermes {
     fn name(&self) -> &'static str {
@@ -376,7 +338,7 @@ fn fenced_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
-/// The entire text is a tool-call JSON value. Most permissive; tried last.
+/// The entire text is a tool-call JSON value.
 pub struct BareJson;
 impl RescueParser for BareJson {
     fn name(&self) -> &'static str {

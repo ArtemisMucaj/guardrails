@@ -1,18 +1,11 @@
-//! Milestone 5: the synthetic `respond` tool.
-//!
-//! Small models are more reliable when *every* turn is a tool call than when
-//! they must choose between "call a tool" and "write prose". So when the respond
-//! guardrail is on we inject a `respond` tool into the request: the model uses it
-//! to deliver a final natural-language answer through the same tool-call channel.
-//! On the way back we detect that call and **strip it to text** — the client sees
-//! an ordinary assistant message, never the synthetic tool.
+//! Synthetic `respond` tool.
 
 use serde_json::{json, Value};
 
 use super::decode::ToolCall;
 use super::model::Tool;
 
-/// Name of the injected tool. Chosen to be unlikely to collide with a real tool.
+/// Name of the injected tool.
 pub const RESPOND: &str = "respond";
 
 /// The tool definition to inject into a request's `tools` array.
@@ -39,14 +32,14 @@ pub fn respond_tool() -> Tool {
     .expect("respond tool definition is valid")
 }
 
-/// Whether a tool call targets the synthetic `respond` tool.
+/// Whether a tool call targets the `respond` tool.
 pub fn is_respond(call: &ToolCall) -> bool {
     call.name == RESPOND
 }
 
 /// Extract the user-facing text from a `respond` call's arguments. Accepts
-/// `message` (canonical) and the `content`/`text` aliases small models drift to;
-/// missing/unparseable arguments yield an empty string rather than failing.
+/// `message` (canonical) and the `content`/`text` aliases; missing/unparseable
+/// arguments yield an empty string.
 pub fn message_text(call: &ToolCall) -> String {
     serde_json::from_str::<Value>(&call.arguments)
         .ok()

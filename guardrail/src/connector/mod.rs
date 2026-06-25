@@ -1,7 +1,4 @@
-//! HTTP connector — low-level plumbing between the proxy and its backend.
-//!
-//! Owns: POST a buffered body to the backend, stream a response back to the
-//! client, and filter hop-by-hop headers on both directions.
+//! HTTP connector — POST, stream, and filter headers for the backend.
 
 use axum::{
     body::Body,
@@ -10,9 +7,7 @@ use axum::{
 };
 
 /// Headers that are connection-specific and must not be forwarded across a
-/// proxy hop (RFC 9110 §7.6.1). `host` is dropped so reqwest sets it for the
-/// backend; `content-length`/`transfer-encoding` are dropped on the response
-/// path because we re-stream the body and let the server framing layer decide.
+/// proxy hop (RFC 9110 §7.6.1).
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -63,8 +58,6 @@ pub async fn post_backend(
 }
 
 /// Stream the backend response back to the client, preserving status and headers.
-/// The body is streamed (not buffered) so SSE / chunked responses pass through
-/// with no added latency.
 pub fn relay_response(resp: reqwest::Response) -> Response {
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

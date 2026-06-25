@@ -1,6 +1,4 @@
 /// Runtime on/off state for each guardrail, plus the retry budget.
-/// Every guardrail is independently toggleable so the proxy can degrade to a
-/// zero-overhead passthrough; all default on.
 #[derive(Clone, Copy, Debug)]
 pub struct Guardrails {
     pub rescue: bool,
@@ -21,8 +19,7 @@ impl Default for Guardrails {
 }
 
 impl Guardrails {
-    /// Whether any guardrail is enabled. When false the tool-enabled path is a
-    /// plain passthrough.
+    /// Whether any guardrail is enabled.
     pub fn any_active(&self) -> bool {
         self.rescue || self.respond || self.retry
     }

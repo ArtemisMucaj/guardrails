@@ -1,20 +1,11 @@
-//! Milestone 3: decode an OpenAI chat-completions response into the internal
-//! [`ModelOutput`] the guardrails reason about, and re-emit tool calls in
-//! canonical OpenAI form.
-//!
-//! At this milestone decoding is **log-only**: the proxy decodes and validates
-//! the backend's response to confirm it correctly detects native `tool_calls`,
-//! but still forwards the original body unchanged. The canonical encoder built
-//! here is the foundation later milestones use — rescue (M4) produces
-//! [`ToolCall`]s from raw text, and the retry loop (M6) re-emits them as a
-//! canonical response.
+//! Decode an OpenAI chat-completions response into the internal [`ModelOutput`]
+//! the guardrails reason about, and re-emit tool calls in canonical OpenAI form.
 
 use serde_json::{json, Value};
 
 /// What the model actually produced, normalised across "native tool_calls" and
 /// "tool call buried in text". Native decoding yields [`ModelOutput::ToolCalls`];
-/// anything else is [`ModelOutput::Text`], which is the input rescue (M4) tries
-/// to repair.
+/// anything else is [`ModelOutput::Text`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelOutput {
     ToolCalls(Vec<ToolCall>),
@@ -49,8 +40,7 @@ impl ToolCall {
 ///
 /// The first choice's message is examined: a non-empty `tool_calls` array yields
 /// [`ModelOutput::ToolCalls`]; otherwise the (possibly empty/null) `content`
-/// yields [`ModelOutput::Text`]. Malformed/missing fields degrade to empty text
-/// rather than panicking — decoding is best-effort and never fails the request.
+/// yields [`ModelOutput::Text`]. Malformed/missing fields degrade to empty text.
 pub fn decode_response(body: &Value) -> ModelOutput {
     let message = body
         .get("choices")
@@ -96,9 +86,7 @@ fn decode_tool_call(call: &Value) -> ToolCall {
     }
 }
 
-/// Render tool calls as a canonical OpenAI `tool_calls` array. Used by the retry
-/// loop (M6) to re-emit rescued calls; exercised now via tests to confirm a
-/// native response round-trips through decode → canonical unchanged.
+/// Render tool calls as a canonical OpenAI `tool_calls` array.
 pub fn canonical_tool_calls(calls: &[ToolCall]) -> Value {
     Value::Array(
         calls
@@ -110,8 +98,7 @@ pub fn canonical_tool_calls(calls: &[ToolCall]) -> Value {
 }
 
 /// Rebuild a response with canonical `tool_calls`, reusing `template` so id,
-/// model, usage, etc. are preserved. Used by the guardrail loop to re-emit
-/// rescued or repaired calls.
+/// model, usage, etc. are preserved.
 pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
     let mut out = template.clone();
     set_first_choice_message(
@@ -126,8 +113,7 @@ pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
     out
 }
 
-/// Rebuild a response carrying a plain assistant text message (used to unwrap a
-/// `respond` call and for fallback-to-last-text on retry exhaustion).
+/// Rebuild a response carrying a plain assistant text message.
 pub fn response_with_text(template: &Value, text: &str) -> Value {
     let mut out = template.clone();
     set_first_choice_message(

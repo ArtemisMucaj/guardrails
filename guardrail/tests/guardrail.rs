@@ -10,13 +10,15 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use guardrail::application::Backend;
 use guardrail::{build_app, AppState, Guardrails};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as WmRequest, Respond, ResponseTemplate};
 
 async fn spawn(backend: &str, guardrails: Guardrails) -> String {
-    let state = AppState::new(reqwest::Client::new(), backend).with_guardrails(guardrails);
+    let state =
+        AppState::new(Backend::new(reqwest::Client::new()), backend).with_guardrails(guardrails);
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -34,6 +36,28 @@ fn tool_request() -> Value {
         "tools": [{
             "type": "function",
             "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]
+    })
+}
+
+fn edit_request() -> Value {
+    json!({
+        "model": "local-model",
+        "messages": [{"role": "user", "content": "edit the file"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filePath": {"type": "string"},
+                        "oldString": {"type": "string"},
+                        "newString": {"type": "string"}
+                    },
+                    "required": ["filePath", "oldString", "newString"]
+                }
+            }
         }]
     })
 }
@@ -152,6 +176,36 @@ async fn invalid_tool_name_is_retried_then_succeeds() {
         "get_weather"
     );
     // First attempt + one retry.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn missing_required_tool_argument_is_retried_then_succeeds() {
+    let backend = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let missing_file = text_response(
+        "<function=Edit><parameter=oldString>old</parameter><parameter=newString>new</parameter></function>",
+    );
+    let good = text_response(
+        "<function=Edit><parameter=filePath>/tmp/example.rs</parameter><parameter=oldString>old</parameter><parameter=newString>new</parameter></function>",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Sequence {
+            calls: calls.clone(),
+            bodies: vec![missing_file, good],
+        })
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn(&backend.uri(), Guardrails::default()).await;
+    let got = post(&proxy, &edit_request()).await;
+
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "Edit");
+    let args: Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["filePath"], "/tmp/example.rs");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 

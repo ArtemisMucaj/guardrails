@@ -1,12 +1,4 @@
-//! Milestone 6: retry bookkeeping.
-//!
-//! When a tool call fails validation, the guardrail loop appends a corrective
-//! nudge and asks the backend again, up to a budget. [`ErrorTracker`] holds that
-//! budget. The nudge is delivered on the **canonical tool channel** (matching
-//! forge): the model's tool call is echoed as an `assistant` message and the
-//! correction comes back as a `tool` message per call — the channel the model
-//! was pretrained on, which survives heavy-context attention drop-off better
-//! than a trailing `user` message.
+//! Retry bookkeeping.
 
 use serde_json::{json, Value};
 

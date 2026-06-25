@@ -16,8 +16,7 @@ pub struct Config {
     #[arg(long, env = "GUARDRAIL_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
 
-    /// Base URL of the OpenAI-compatible backend (e.g. LM Studio).
-    /// Forwarded verbatim; the `model` field is never rewritten.
+    /// Base URL of the OpenAI-compatible backend.
     #[arg(
         long,
         env = "GUARDRAIL_BACKEND",
@@ -25,14 +24,11 @@ pub struct Config {
     )]
     pub backend: String,
 
-    /// Timeout for establishing the TCP/TLS connection to the backend, in
-    /// seconds. Does not bound the response — streams may run indefinitely.
+    /// Timeout for establishing the TCP/TLS connection to the backend, in seconds.
     #[arg(long, env = "GUARDRAIL_CONNECT_TIMEOUT_SECS", default_value_t = 10)]
     pub connect_timeout_secs: u64,
 
     /// Maximum idle gap between read chunks of the backend response, in seconds.
-    /// Resets on every chunk, so a steadily-streaming SSE response is never cut
-    /// off; only a stalled backend trips it.
     #[arg(long, env = "GUARDRAIL_READ_TIMEOUT_SECS", default_value_t = 300)]
     pub read_timeout_secs: u64,
 

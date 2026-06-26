@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.2.0...v0.3.0) (2026-06-26)
+
+
+### Features
+
+* **guardrails:** lenient JSON repair and scalar argument coercion ([#7](https://github.com/ArtemisMucaj/guardrails/issues/7)) ([4e94057](https://github.com/ArtemisMucaj/guardrails/commit/4e94057730ba7363abdec76940bbf5dbe2255732))
+
 ## [0.2.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.1.0...v0.2.0) (2026-06-26)
 
 

@@ -6,6 +6,8 @@ use serde_json::{Map, Value};
 /// An OpenAI `POST /v1/chat/completions` request body, parsed
 /// typed-where-touched. Unknown / untouched fields live in [`rest`] and
 /// round-trip losslessly.
+///
+/// [`rest`]: ChatRequest::rest
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatRequest {
     /// The conversation so far, kept as raw [`Value`]s.

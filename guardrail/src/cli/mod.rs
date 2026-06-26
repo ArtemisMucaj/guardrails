@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use clap::{ArgAction, Parser};
 
-use crate::domain::guardrails::Guardrails;
+use crate::application::Guardrails;
 
 #[derive(Parser, Debug, Clone)]
 #[command(

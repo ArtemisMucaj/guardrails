@@ -20,7 +20,7 @@ pub enum Validation {
 /// problem found (unknown tool name, or arguments that are not a JSON object),
 /// otherwise [`Validation::Valid`]. An empty `calls` slice is vacuously valid.
 ///
-/// [`decode`]: crate::decode::decode_response
+/// [`decode`]: crate::domain::decode::decode_response
 pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
     for call in calls {
         let Some(tool) = tools.iter().find(|tool| tool.function.name == call.name) else {

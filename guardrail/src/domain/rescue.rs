@@ -15,6 +15,7 @@ pub trait RescueParser: Send + Sync {
 /// The parsers tried, in order.
 pub fn default_parsers() -> Vec<Box<dyn RescueParser>> {
     vec![
+        Box::new(Lfm),
         Box::new(Mistral),
         Box::new(Rehearsal),
         Box::new(QwenCoder),
@@ -137,6 +138,43 @@ fn parse_tagged(text: &str, tag: &str) -> Option<Vec<ToolCall>> {
 }
 
 // ── Parsers ─────────────────────────────────────────────────────────────────
+
+/// LiquidAI LFM2 / LFM2.5: tool calls wrapped in `<|tool_call_start|>` …
+/// `<|tool_call_end|>`. The inner payload is either a Python list of call
+/// expressions — `[get_weather(location="Paris"), get_time(zone="UTC")]` — or,
+/// when the model is asked to "Output function calls as JSON", a JSON
+/// object/array. Natural-language text may follow the closing token; the rescue
+/// path drops it when re-emitting canonical `tool_calls`, matching every other
+/// parser here.
+pub struct Lfm;
+const LFM_CALL_START: &str = "<|tool_call_start|>";
+const LFM_CALL_END: &str = "<|tool_call_end|>";
+impl RescueParser for Lfm {
+    fn name(&self) -> &'static str {
+        "lfm"
+    }
+    fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>> {
+        let start = text.find(LFM_CALL_START)?;
+        let after = &text[start + LFM_CALL_START.len()..];
+        // Prefer the explicit closing token; tolerate its absence by cutting at
+        // the next special token (e.g. `<|im_end|>`), so a truncated or
+        // differently-wrapped turn still yields the call span.
+        let inner = match after.find(LFM_CALL_END) {
+            Some(end) => &after[..end],
+            None => after.split("<|").next().unwrap_or(after),
+        }
+        .trim();
+
+        // JSON mode first (cheaper and unambiguous): a single object or an array
+        // of `{name, arguments|parameters}`. Fall back to Pythonic call syntax.
+        if let Some(v) = first_json_value(inner) {
+            if let Some(calls) = tool_calls_from_value(&v) {
+                return Some(calls);
+            }
+        }
+        parse_pythonic_calls(inner)
+    }
+}
 
 /// Mistral: `[TOOL_CALLS]` followed by a JSON list/object, or the flatter
 /// `[TOOL_CALLS]name{args}` form.
@@ -357,12 +395,386 @@ impl RescueParser for BareJson {
     }
 }
 
+// ── Pythonic call parsing (LFM) ─────────────────────────────────────────────
+
+/// Parse a Python call expression — `name(k=v, ...)`, optionally a list of them
+/// `[name(...), name2(...)]` — into tool calls. Keyword arguments become the
+/// call's JSON-object arguments; Python literals (`True`/`False`/`None`,
+/// numbers, strings, lists, dicts) are coerced to their JSON equivalents.
+///
+/// This is a small dedicated parser rather than `eval`/`literal_eval`: the
+/// payload is a *call*, which neither accepts, and we must not execute it.
+/// Returns `None` on any malformed input so the caller passes content through
+/// untouched instead of fabricating a call.
+fn parse_pythonic_calls(s: &str) -> Option<Vec<ToolCall>> {
+    let mut p = PyParser::new(s);
+    p.skip_ws();
+    let calls = if p.peek() == Some('[') {
+        p.bump();
+        let mut calls = Vec::new();
+        p.skip_ws();
+        if p.peek() != Some(']') {
+            loop {
+                calls.push(p.parse_call()?);
+                p.skip_ws();
+                match p.peek() {
+                    Some(',') => {
+                        p.bump();
+                        p.skip_ws();
+                        // Allow a trailing comma before the closing bracket.
+                        if p.peek() == Some(']') {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        p.expect(']')?;
+        calls
+    } else {
+        vec![p.parse_call()?]
+    };
+    p.skip_ws();
+    // The whole payload must be calls; trailing junk means we misread it.
+    if !p.at_end() {
+        return None;
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// A cursor over the Pythonic payload, parsed character by character.
+struct PyParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl PyParser {
+    fn new(s: &str) -> Self {
+        Self {
+            chars: s.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.chars.len()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, c: char) -> Option<()> {
+        (self.bump() == Some(c)).then_some(())
+    }
+
+    /// `ident ( arg, arg, ... )`.
+    fn parse_call(&mut self) -> Option<ToolCall> {
+        self.skip_ws();
+        let name = self.parse_ident()?;
+        if name.is_empty() {
+            return None;
+        }
+        self.skip_ws();
+        self.expect('(')?;
+        let mut args = serde_json::Map::new();
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            loop {
+                let (key, value) = self.parse_keyword_arg()?;
+                args.insert(key, value);
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                        self.skip_ws();
+                        // Allow a trailing comma before the closing paren.
+                        if self.peek() == Some(')') {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(')')?;
+        Some(ToolCall {
+            id: None,
+            name,
+            arguments: Value::Object(args).to_string(),
+        })
+    }
+
+    /// `key=value`. Only keyword arguments are supported: without parameter
+    /// names, positional values cannot be mapped into a JSON object.
+    fn parse_keyword_arg(&mut self) -> Option<(String, Value)> {
+        let key = self.parse_ident()?;
+        if key.is_empty() {
+            return None;
+        }
+        self.skip_ws();
+        self.expect('=')?;
+        self.skip_ws();
+        let value = self.parse_value()?;
+        Some((key, value))
+    }
+
+    fn parse_ident(&mut self) -> Option<String> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+            self.pos += 1;
+        }
+        (self.pos > start).then(|| self.chars[start..self.pos].iter().collect())
+    }
+
+    fn parse_value(&mut self) -> Option<Value> {
+        match self.peek()? {
+            '"' | '\'' => self.parse_string().map(Value::String),
+            '[' => self.parse_list(),
+            '{' => self.parse_dict(),
+            c if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            _ => self.parse_keyword(),
+        }
+    }
+
+    /// A quoted string with the common Python escapes.
+    fn parse_string(&mut self) -> Option<String> {
+        let quote = self.bump()?;
+        let mut out = String::new();
+        loop {
+            match self.bump()? {
+                c if c == quote => return Some(out),
+                '\\' => match self.bump()? {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '\\' => out.push('\\'),
+                    '\'' => out.push('\''),
+                    '"' => out.push('"'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                },
+                c => out.push(c),
+            }
+        }
+    }
+
+    fn parse_number(&mut self) -> Option<Value> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')
+        {
+            self.pos += 1;
+        }
+        let raw: String = self.chars[start..self.pos].iter().collect();
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .filter(Value::is_number)
+    }
+
+    /// `True` / `False` / `None`, mapped to JSON `true` / `false` / `null`.
+    fn parse_keyword(&mut self) -> Option<Value> {
+        match self.parse_ident()?.as_str() {
+            "True" => Some(Value::Bool(true)),
+            "False" => Some(Value::Bool(false)),
+            "None" => Some(Value::Null),
+            _ => None,
+        }
+    }
+
+    fn parse_list(&mut self) -> Option<Value> {
+        self.expect('[')?;
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() != Some(']') {
+            loop {
+                items.push(self.parse_value()?);
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                        self.skip_ws();
+                        // Allow a trailing comma before the closing bracket.
+                        if self.peek() == Some(']') {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect(']')?;
+        Some(Value::Array(items))
+    }
+
+    fn parse_dict(&mut self) -> Option<Value> {
+        self.expect('{')?;
+        let mut map = serde_json::Map::new();
+        self.skip_ws();
+        if self.peek() != Some('}') {
+            loop {
+                // JSON object keys must be strings; a non-string Python key is
+                // stringified via its JSON rendering.
+                let key = match self.parse_value()? {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                self.skip_ws();
+                self.expect(':')?;
+                self.skip_ws();
+                let value = self.parse_value()?;
+                map.insert(key, value);
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                        self.skip_ws();
+                        // Allow a trailing comma before the closing brace.
+                        if self.peek() == Some('}') {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.expect('}')?;
+        Some(Value::Object(map))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn one(calls: &[ToolCall]) -> (&str, &str) {
         (calls[0].name.as_str(), calls[0].arguments.as_str())
+    }
+
+    #[test]
+    fn lfm_pythonic_single_call() {
+        let text = "<|tool_call_start|>[get_weather(location=\"Paris\")]<|tool_call_end|>Checking the weather in Paris.<|im_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("get_weather", "{\"location\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn lfm_pythonic_multiple_calls() {
+        let text =
+            "<|tool_call_start|>[get_weather(location=\"Paris\"), get_time(zone=\"UTC\")]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, "{\"location\":\"Paris\"}");
+        assert_eq!(calls[1].name, "get_time");
+        assert_eq!(calls[1].arguments, "{\"zone\":\"UTC\"}");
+    }
+
+    #[test]
+    fn lfm_pythonic_single_call_without_list_brackets() {
+        let text = "<|tool_call_start|>get_weather(location=\"Paris\")<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("get_weather", "{\"location\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn lfm_pythonic_coerces_argument_types() {
+        let text = "<|tool_call_start|>[f(n=3, ratio=1.5, ok=True, off=False, nothing=None, tags=[\"a\", \"b\"], opts={\"deep\": 1})]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["n"], json!(3));
+        assert_eq!(args["ratio"], json!(1.5));
+        assert_eq!(args["ok"], json!(true));
+        assert_eq!(args["off"], json!(false));
+        assert_eq!(args["nothing"], Value::Null);
+        assert_eq!(args["tags"], json!(["a", "b"]));
+        assert_eq!(args["opts"], json!({"deep": 1}));
+    }
+
+    #[test]
+    fn lfm_pythonic_trailing_commas() {
+        // Python permits trailing commas in calls, lists, and dicts.
+        let text =
+            "<|tool_call_start|>[f(x=1,), g(items=[\"a\",], opts={\"k\": 1,}),]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, "{\"x\":1}");
+        let args: Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(args["items"], json!(["a"]));
+        assert_eq!(args["opts"], json!({"k": 1}));
+    }
+
+    #[test]
+    fn lfm_pythonic_no_args() {
+        let text = "<|tool_call_start|>[list_files()]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("list_files", "{}"));
+    }
+
+    #[test]
+    fn lfm_pythonic_single_quoted_string_with_escape() {
+        let text = "<|tool_call_start|>[say(text='it\\'s fine')]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("say", "{\"text\":\"it's fine\"}"));
+    }
+
+    #[test]
+    fn lfm_json_mode() {
+        // With "Output function calls as JSON" the payload is JSON, not Pythonic.
+        let text = "<|tool_call_start|>[{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("get_weather", "{\"location\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn lfm_tolerates_missing_end_token() {
+        let text = "<|tool_call_start|>[get_weather(location=\"Paris\")]<|im_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("get_weather", "{\"location\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn lfm_absent_token_is_not_rescued() {
+        assert!(Lfm
+            .try_parse("Just some prose about get_weather(location).")
+            .is_none());
+    }
+
+    #[test]
+    fn lfm_malformed_payload_is_not_fabricated() {
+        // A truncated call must not yield a bogus tool call.
+        let text = "<|tool_call_start|>[get_weather(location=<|tool_call_end|>";
+        assert!(Lfm.try_parse(text).is_none());
+    }
+
+    #[test]
+    fn rescue_dispatches_lfm() {
+        let (parser, calls) =
+            rescue("<|tool_call_start|>[get_weather(location=\"Paris\")]<|tool_call_end|>")
+                .unwrap();
+        assert_eq!(parser, "lfm");
+        assert_eq!(calls[0].name, "get_weather");
     }
 
     #[test]

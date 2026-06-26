@@ -97,12 +97,254 @@ fn tool_call_from_value(v: &Value) -> Option<ToolCall> {
     })
 }
 
-/// Parse the first JSON value out of `s`, ignoring any trailing text.
+/// Parse the first JSON value out of `s`, ignoring any trailing text. Strict
+/// parsing is tried first; on failure a lenient [`repair_json`] pass fixes the
+/// quirks small models commonly emit (single quotes, unquoted keys, literal
+/// newlines in strings, trailing commas, clipped braces) before a second
+/// attempt. The repair only runs on the failure path, so well-formed JSON is
+/// never rewritten.
 fn first_json_value(s: &str) -> Option<Value> {
+    strict_first_json_value(s).or_else(|| strict_first_json_value(&repair_json(s)))
+}
+
+/// Strict variant: the first JSON value out of `s`, ignoring any trailing text.
+fn strict_first_json_value(s: &str) -> Option<Value> {
     serde_json::Deserializer::from_str(s)
         .into_iter::<Value>()
         .next()?
         .ok()
+}
+
+// ── Lenient JSON repair ──────────────────────────────────────────────────────
+
+/// Best-effort repair of *almost*-JSON emitted by small local models, run only
+/// as a fallback after strict parsing fails. Each pass is string-aware so
+/// content inside a string literal is never rewritten. The passes, in order:
+///
+/// 1. single-quoted strings → double-quoted (only when no `"` is present),
+/// 2. literal newlines/tabs/carriage returns inside strings → `\n`/`\t`/`\r`,
+/// 3. unquoted object keys → quoted,
+/// 4. trailing commas before `}`/`]` removed,
+/// 5. unbalanced/clipped braces, brackets, and a dangling string closed.
+fn repair_json(s: &str) -> String {
+    let s = convert_single_quotes(s);
+    let s = escape_literal_controls(&s);
+    let s = quote_unquoted_keys(&s);
+    let s = strip_trailing_commas(&s);
+    balance_delimiters(&s)
+}
+
+/// Replace single quotes with double quotes, but only when the payload contains
+/// no double quotes at all — otherwise an apostrophe inside a valid string would
+/// be corrupted.
+///
+/// Backslash escapes are respected so an escaped apostrophe survives: `\'`
+/// becomes a literal `'` (JSON strings don't escape apostrophes) rather than a
+/// stray `\"` that would change the value. Other escape sequences pass through
+/// unchanged, and an unescaped `'` is treated as a string delimiter.
+fn convert_single_quotes(s: &str) -> String {
+    if s.contains('"') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('\'') => out.push('\''),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            '\'' => out.push('"'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Escape raw control characters that appear inside string literals (illegal in
+/// JSON) without touching the same characters in the surrounding structure.
+fn escape_literal_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if !in_string {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+            continue;
+        }
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push(c);
+                escaped = true;
+            }
+            '"' => {
+                out.push(c);
+                in_string = false;
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Quote bare identifier keys (`{name: ...}` → `{"name": ...}`). A bareword is
+/// treated as a key only in key position — directly after `{` or `,` — and only
+/// when the next non-space character is `:`, so value-position barewords like
+/// `true`/`false`/`null` are left for the JSON parser to interpret.
+fn quote_unquoted_keys(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last_sig: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+                last_sig = Some('"');
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c.is_whitespace() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if (c.is_ascii_alphabetic() || c == '_') && matches!(last_sig, Some('{') | Some(',')) {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ':' {
+                out.push('"');
+                out.push_str(&word);
+                out.push('"');
+            } else {
+                out.push_str(&word);
+            }
+            last_sig = Some('"');
+            continue;
+        }
+        out.push(c);
+        last_sig = Some(c);
+        i += 1;
+    }
+    out
+}
+
+/// Drop a comma that is immediately followed (ignoring whitespace) by a closing
+/// `}` or `]`, outside of any string literal.
+fn strip_trailing_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some('}') | Some(']')) {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Close a dangling string and any open `{`/`[` left unterminated by a truncated
+/// response, appending the matching closers in nesting order.
+fn balance_delimiters(s: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = s.to_string();
+    if in_string {
+        out.push('"');
+    }
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
 }
 
 /// Collect the inner text of every `<tag>...</tag>` pair in `text`.
@@ -389,8 +631,12 @@ impl RescueParser for BareJson {
     fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>> {
         // Require the entire response to be JSON. Accepting a valid prefix would
         // let prose that merely starts with a tool-shaped example be re-emitted
-        // as real tool_calls.
-        let v: Value = serde_json::from_str(text.trim()).ok()?;
+        // as real tool_calls. The repair fallback is applied to the whole string
+        // too, preserving that all-or-nothing requirement.
+        let trimmed = text.trim();
+        let v: Value = serde_json::from_str(trimmed)
+            .or_else(|_| serde_json::from_str(&repair_json(trimmed)))
+            .ok()?;
         tool_calls_from_value(&v)
     }
 }
@@ -907,5 +1153,81 @@ mod tests {
         let canonical = crate::domain::decode::canonical_tool_calls(&calls);
         assert_eq!(canonical[0]["function"]["name"], "f");
         assert_eq!(canonical[0]["function"]["arguments"], "{\"a\":1}");
+    }
+
+    // ── Lenient JSON repair ──────────────────────────────────────────────────
+
+    #[test]
+    fn repair_strips_trailing_commas() {
+        let v = first_json_value("{\"a\": 1, \"b\": [1, 2,],}").unwrap();
+        assert_eq!(v, json!({"a": 1, "b": [1, 2]}));
+    }
+
+    #[test]
+    fn repair_quotes_unquoted_keys() {
+        let v = first_json_value("{name: \"Edit\", input: {filePath: \"x.rs\"}}").unwrap();
+        assert_eq!(v, json!({"name": "Edit", "input": {"filePath": "x.rs"}}));
+    }
+
+    #[test]
+    fn repair_converts_single_quotes() {
+        let v = first_json_value("{'name': 'Edit', 'input': {'a': 1}}").unwrap();
+        assert_eq!(v, json!({"name": "Edit", "input": {"a": 1}}));
+    }
+
+    #[test]
+    fn repair_leaves_value_barewords_for_the_parser() {
+        // true/false/null in value position must not be quoted into strings.
+        let v = first_json_value("{ok: true, missing: null, n: 3}").unwrap();
+        assert_eq!(v, json!({"ok": true, "missing": null, "n": 3}));
+    }
+
+    #[test]
+    fn repair_escapes_literal_newline_in_string() {
+        let v = first_json_value("{\"text\": \"line1\nline2\"}").unwrap();
+        assert_eq!(v, json!({"text": "line1\nline2"}));
+    }
+
+    #[test]
+    fn repair_balances_clipped_braces() {
+        let v = first_json_value("{\"name\": \"Edit\", \"input\": {\"a\": 1").unwrap();
+        assert_eq!(v, json!({"name": "Edit", "input": {"a": 1}}));
+    }
+
+    #[test]
+    fn repair_preserves_escaped_apostrophe_when_converting_single_quotes() {
+        // `\'` is a literal apostrophe, not a string delimiter — converting it to
+        // a bare `"` would silently change the value from `it's` to `it"s`.
+        let v = first_json_value("{'text': 'it\\'s fine'}").unwrap();
+        assert_eq!(v, json!({"text": "it's fine"}));
+    }
+
+    #[test]
+    fn repair_does_not_touch_apostrophes_in_double_quoted_strings() {
+        // A payload that already uses double quotes is left to the strict parser;
+        // single-quote conversion must not corrupt an apostrophe.
+        let v = first_json_value("{\"msg\": \"it's fine\"}").unwrap();
+        assert_eq!(v, json!({"msg": "it's fine"}));
+    }
+
+    #[test]
+    fn fenced_json_with_quirks_is_rescued() {
+        let text = "```json\n{name: 'f', arguments: {city: 'Paris',}}\n```";
+        let calls = FencedJson.try_parse(text).unwrap();
+        assert_eq!(one(&calls), ("f", "{\"city\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn bare_json_with_quirks_is_rescued() {
+        let calls = BareJson
+            .try_parse("{name: \"get_weather\", arguments: {city: \"Paris\",}}")
+            .unwrap();
+        assert_eq!(one(&calls), ("get_weather", "{\"city\":\"Paris\"}"));
+    }
+
+    #[test]
+    fn repair_does_not_fabricate_calls_from_prose() {
+        // Prose must still fail to parse as a tool call after repair.
+        assert!(rescue("I'm not sure which tool to use, can you clarify?").is_none());
     }
 }

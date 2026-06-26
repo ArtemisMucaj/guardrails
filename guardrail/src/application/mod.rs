@@ -25,7 +25,7 @@ use crate::domain::model::ChatRequest;
 use crate::domain::rescue;
 use crate::domain::respond;
 use crate::domain::retry::ErrorTracker;
-use crate::domain::validate::{validate, Validation};
+use crate::domain::validate::{coerce_arguments, repair_argument_names, validate, Validation};
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
 #[async_trait::async_trait]
@@ -119,24 +119,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         };
 
         if let Some(request) = guarded {
-            if state.guardrails.any_active() {
-                return guardrail_loop(&state, &target, &parts.headers, request).await;
-            }
-            return match state
-                .port
-                .post(&target, &parts.headers, body_bytes.to_vec())
-                .await
-            {
-                Ok((status, headers, bytes)) => {
-                    if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
-                        inspect_response(&body, &request, state.guardrails);
-                    } else {
-                        warn!("tool-enabled response was not JSON; forwarding unverified");
-                    }
-                    bytes_response(status, headers, bytes)
-                }
-                Err(resp) => resp,
-            };
+            return guardrail_loop(&state, &target, &parts.headers, request).await;
         }
 
         state
@@ -157,19 +140,18 @@ async fn guardrail_loop(
     let g = state.guardrails;
     // Only own the `respond` tool when the client hasn't defined one itself;
     // otherwise we'd hijack the client's real tool calls as final text.
-    let respond_active = g.respond
-        && !request
-            .tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|t| t.function.name == respond::RESPOND);
+    let respond_active = !request
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|t| t.function.name == respond::RESPOND);
     if respond_active {
         request.push_tool(respond::respond_tool());
     }
     let tools = request.tools.clone().unwrap_or_default();
 
-    let mut tracker = ErrorTracker::new(if g.retry { g.max_retries } else { 0 });
+    let mut tracker = ErrorTracker::new(g.max_retries);
     let mut last_text: Option<String> = None;
 
     loop {
@@ -198,7 +180,7 @@ async fn guardrail_loop(
             ModelOutput::ToolCalls(calls) => Some((calls, false)),
             ModelOutput::Text(text) => {
                 last_text = Some(text.clone());
-                match g.rescue.then(|| rescue::rescue(&text)).flatten() {
+                match rescue::rescue(&text) {
                     Some((parser, calls)) => {
                         info!(parser, count = calls.len(), "rescued tool calls from text");
                         Some((calls, true))
@@ -208,7 +190,7 @@ async fn guardrail_loop(
             }
         };
 
-        let Some((calls, rescued)) = calls else {
+        let Some((mut calls, rescued)) = calls else {
             return bytes_response(status, out_headers, bytes);
         };
 
@@ -225,9 +207,25 @@ async fn guardrail_loop(
             }
         }
 
+        // Repair tool-call arguments before validating, so a fixable mistake
+        // costs a local rewrite rather than a corrective retry. Any change forces
+        // re-emission from `calls` so the fix reaches the client (a native,
+        // otherwise-unmodified response forwards raw bytes). Names are repaired
+        // first (fill a missing required field from a wrongly-styled key), then
+        // types (coerce the now-correctly-named value).
+        let mut repaired = false;
+        if repair_argument_names(&mut calls, &tools) {
+            info!("repaired tool-call argument names to declared schema keys");
+            repaired = true;
+        }
+        if coerce_arguments(&mut calls, &tools) {
+            info!("coerced mistyped tool-call arguments to declared types");
+            repaired = true;
+        }
+
         match validate(&calls, &tools) {
             Validation::Valid => {
-                return if rescued {
+                return if rescued || repaired {
                     json_response(
                         status,
                         out_headers,
@@ -238,7 +236,7 @@ async fn guardrail_loop(
                 };
             }
             Validation::NeedsRetry(nudge) => {
-                if g.retry && tracker.can_retry() {
+                if tracker.can_retry() {
                     tracker.record_retry();
                     warn!(attempt = tracker.attempts(), %nudge, "tool call invalid; retrying");
                     request
@@ -273,29 +271,4 @@ fn bytes_response(status: StatusCode, headers: HeaderMap, bytes: Vec<u8>) -> Res
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
-}
-
-fn inspect_response(body: &Value, request: &ChatRequest, guardrails: Guardrails) {
-    match decode_response(body) {
-        ModelOutput::ToolCalls(calls) => {
-            let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-            info!(count = calls.len(), tool_calls = ?names, "decoded native tool_calls");
-            match validate(&calls, request.tools.as_deref().unwrap_or(&[])) {
-                Validation::Valid => info!("tool calls valid"),
-                Validation::NeedsRetry(nudge) => warn!(%nudge, "tool calls invalid (log-only)"),
-            }
-        }
-        ModelOutput::Text(text) if guardrails.rescue => match rescue::rescue(&text) {
-            Some((parser, calls)) => {
-                let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-                info!(parser, count = calls.len(), tool_calls = ?names, "rescued tool calls from text (log-only)");
-                match validate(&calls, request.tools.as_deref().unwrap_or(&[])) {
-                    Validation::Valid => info!("rescued tool calls valid"),
-                    Validation::NeedsRetry(nudge) => warn!(%nudge, "rescued tool calls invalid"),
-                }
-            }
-            None => debug!(len = text.len(), "model returned text, no tool calls"),
-        },
-        ModelOutput::Text(_) => debug!("model returned text; rescue disabled"),
-    }
 }

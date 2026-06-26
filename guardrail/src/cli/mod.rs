@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use clap::{ArgAction, Parser};
+use clap::Parser;
 
 use crate::application::Guardrails;
 
@@ -32,33 +32,16 @@ pub struct Config {
     #[arg(long, env = "GUARDRAIL_READ_TIMEOUT_SECS", default_value_t = 300)]
     pub read_timeout_secs: u64,
 
-    /// Rescue malformed tool calls from model text. On by default; pass
-    /// `--rescue false` (or `GUARDRAIL_RESCUE=false`) to disable.
-    #[arg(long, env = "GUARDRAIL_RESCUE", default_value_t = true, action = ArgAction::Set)]
-    pub rescue: bool,
-
-    /// Inject the synthetic `respond` tool and unwrap it to text. On by default;
-    /// `--respond false` disables.
-    #[arg(long, env = "GUARDRAIL_RESPOND", default_value_t = true, action = ArgAction::Set)]
-    pub respond: bool,
-
-    /// Retry the backend with a corrective nudge when a tool call fails
-    /// validation. On by default; `--retry false` disables.
-    #[arg(long, env = "GUARDRAIL_RETRY", default_value_t = true, action = ArgAction::Set)]
-    pub retry: bool,
-
     /// Maximum corrective retries before falling back to the model's last text.
+    /// Set to `0` to disable retries while keeping the other repairs.
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
 }
 
 impl Config {
-    /// Collect the per-guardrail toggles into the runtime [`Guardrails`] set.
+    /// Build the runtime [`Guardrails`] configuration.
     pub fn guardrails(&self) -> Guardrails {
         Guardrails {
-            rescue: self.rescue,
-            respond: self.respond,
-            retry: self.retry,
             max_retries: self.max_retries,
         }
     }

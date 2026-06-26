@@ -1,10 +1,11 @@
-//! Milestone 3 acceptance: log-only inspection must not alter responses.
+//! The guardrail loop must not alter responses it has nothing to fix.
 //!
 //! When a request carries tools and is non-streamed, the proxy buffers the
-//! response to decode + validate it (logging the outcome). These tests assert
-//! that path still forwards the body unchanged — both for a well-formed native
-//! `tool_calls` response and for a response the decoder can't make sense of.
-//! Correctness of decode/validate themselves is covered by their unit tests.
+//! response to decode + validate it. These tests assert it forwards the body
+//! unchanged when there is nothing to repair — both for a well-formed native
+//! `tool_calls` response (re-emitted as the original bytes) and for a response
+//! the decoder can't make sense of (passed through unverified). Correctness of
+//! decode/validate themselves is covered by their unit tests.
 
 use std::net::SocketAddr;
 

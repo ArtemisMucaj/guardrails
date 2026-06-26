@@ -1,10 +1,71 @@
 //! HTTP connector — POST, stream, and filter headers for the backend.
+//!
+//! This is the infrastructure layer: it depends inward on the application's
+//! `BackendPort` and provides the concrete `reqwest`-backed adapter that
+//! implements it.
 
 use axum::{
     body::Body,
-    http::{header::CONNECTION, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header::CONNECTION, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+
+use crate::application::BackendPort;
+
+/// Concrete backend adapter that delegates to a `reqwest::Client`.
+#[derive(Clone)]
+pub struct Backend {
+    client: reqwest::Client,
+}
+
+impl Backend {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendPort for Backend {
+    async fn post(
+        &self,
+        target: &str,
+        headers: &HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
+        post_backend(&self.client, target, headers, body).await
+    }
+
+    async fn forward(
+        &self,
+        method: Method,
+        target: &str,
+        headers: &HeaderMap,
+        body: bytes::Bytes,
+    ) -> Response {
+        let builder = self
+            .client
+            .request(method.clone(), target)
+            .headers(forward_headers(headers));
+        let builder = if method == Method::POST || method == Method::PUT || method == Method::PATCH
+        {
+            builder.body(body.to_vec())
+        } else {
+            builder.body(Vec::<u8>::new())
+        };
+        let resp = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, target = %target, "backend request failed");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("backend request failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
+        relay_response(resp)
+    }
+}
 
 /// Headers that are connection-specific and must not be forwarded across a
 /// proxy hop (RFC 9110 §7.6.1).

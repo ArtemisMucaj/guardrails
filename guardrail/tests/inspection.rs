@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 
-use guardrail::application::Backend;
+use guardrail::connector::Backend;
 use guardrail::{build_app, AppState};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

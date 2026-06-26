@@ -1,5 +1,11 @@
 //! Application layer — port definition, axum router, shared state, and the
 //! guardrail loop.
+//!
+//! This layer owns the `BackendPort` abstraction but never depends on the
+//! concrete HTTP infrastructure: the adapter implementing the port lives in the
+//! `connector` layer, which depends inward on this trait.
+
+use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
@@ -42,63 +48,6 @@ pub trait BackendPort: Send + Sync {
     ) -> Response;
 }
 
-/// Concrete backend that delegates to a `reqwest::Client`.
-#[derive(Clone)]
-pub struct Backend {
-    client: reqwest::Client,
-}
-
-impl Backend {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl BackendPort for Backend {
-    async fn post(
-        &self,
-        target: &str,
-        headers: &HeaderMap,
-        body: Vec<u8>,
-    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
-        crate::connector::post_backend(&self.client, target, headers, body).await
-    }
-
-    async fn forward(
-        &self,
-        method: axum::http::Method,
-        target: &str,
-        headers: &HeaderMap,
-        body: bytes::Bytes,
-    ) -> Response {
-        let builder = self
-            .client
-            .request(method.clone(), target)
-            .headers(crate::connector::forward_headers(headers));
-        let builder = if method == axum::http::Method::POST
-            || method == axum::http::Method::PUT
-            || method == axum::http::Method::PATCH
-        {
-            builder.body(body.to_vec())
-        } else {
-            builder.body(Vec::<u8>::new())
-        };
-        let resp = match builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, target = %target, "backend request failed");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("backend request failed: {e}"),
-                )
-                    .into_response();
-            }
-        };
-        crate::connector::relay_response(resp)
-    }
-}
-
 /// Upper bound on a request body the proxy will buffer.
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
@@ -106,15 +55,15 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 pub struct AppState {
     pub backend_url: String,
     pub guardrails: Guardrails,
-    pub port: Backend,
+    pub port: Arc<dyn BackendPort>,
 }
 
 impl AppState {
-    pub fn new(port: Backend, backend_url: impl Into<String>) -> Self {
+    pub fn new(port: impl BackendPort + 'static, backend_url: impl Into<String>) -> Self {
         Self {
             backend_url: backend_url.into().trim_end_matches('/').to_string(),
             guardrails: Guardrails::default(),
-            port,
+            port: Arc::new(port),
         }
     }
 

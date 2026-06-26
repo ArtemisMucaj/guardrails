@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use guardrail::application::Backend;
+use guardrail::connector::Backend;
 use guardrail::{build_app, AppState, Guardrails};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};

@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use clap::Parser;
-use guardrail::application::{AppState, Backend};
+use guardrail::application::AppState;
 use guardrail::cli::{shutdown_signal, Config};
+use guardrail::connector::Backend;
 use tracing::info;
 
 #[tokio::main]

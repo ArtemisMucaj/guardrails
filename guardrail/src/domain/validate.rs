@@ -51,6 +51,90 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
     Validation::Valid
 }
 
+/// Coerce obviously-mistyped scalar arguments to the type the tool's JSON
+/// schema declares, in place. Small models routinely emit `"123"`/`"true"` for
+/// a number/boolean field, or a bare scalar where a string is wanted; fixing
+/// these here is cheaper and more reliable than spending a corrective retry on a
+/// one-character mismatch.
+///
+/// Only unambiguous scalar reinterpretations are applied — a stringified number,
+/// integer, or boolean parsed back to its type, or a scalar rendered as the
+/// declared string. Anything else is left untouched for [`validate`] to flag.
+/// Returns whether any call's arguments changed, so the caller can re-emit the
+/// repaired form to the client instead of forwarding the original bytes.
+pub fn coerce_arguments(calls: &mut [ToolCall], tools: &[Tool]) -> bool {
+    let mut changed = false;
+    for call in calls.iter_mut() {
+        let Some(tool) = tools.iter().find(|tool| tool.function.name == call.name) else {
+            continue;
+        };
+        let Some(properties) = parameter_properties(tool) else {
+            continue;
+        };
+        let Some(mut arguments) = arguments_object(&call.arguments) else {
+            continue;
+        };
+        let mut call_changed = false;
+        for (key, value) in arguments.iter_mut() {
+            let Some(declared) = properties
+                .get(key)
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if type_matches(declared, value) {
+                continue;
+            }
+            if let Some(fixed) = coerce_scalar(declared, value) {
+                *value = fixed;
+                call_changed = true;
+            }
+        }
+        if call_changed {
+            call.arguments = Value::Object(arguments).to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Reinterpret a single scalar `value` as the schema-declared `type`, returning
+/// the coerced value only when the reinterpretation is unambiguous. Containers
+/// and `null` are never coerced — `None` leaves the value for validation to
+/// flag.
+fn coerce_scalar(declared: &str, value: &Value) -> Option<Value> {
+    match declared {
+        "string" => match value {
+            Value::Number(n) => Some(Value::String(n.to_string())),
+            Value::Bool(b) => Some(Value::String(b.to_string())),
+            _ => None,
+        },
+        "integer" => value
+            .as_str()?
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|n| Value::Number(n.into())),
+        "number" => {
+            let text = value.as_str()?.trim();
+            if let Ok(i) = text.parse::<i64>() {
+                return Some(Value::Number(i.into()));
+            }
+            text.parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number)
+        }
+        "boolean" => match value.as_str()?.trim() {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Arguments must be a JSON object (`{...}`). A bare string, array, number, or
 /// invalid JSON all fail.
 fn arguments_object(arguments: &str) -> Option<Map<String, Value>> {
@@ -252,5 +336,74 @@ mod tests {
         };
         // The unknown-name problem comes first in the slice.
         assert!(nudge.contains("bad_name"));
+    }
+
+    // ── Argument coercion ────────────────────────────────────────────────────
+
+    fn typed_tool(properties: Value) -> Tool {
+        serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": { "type": "object", "properties": properties }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn coerces_stringified_scalars_and_makes_validation_pass() {
+        let tools = [typed_tool(json!({
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "enabled": {"type": "boolean"}
+        }))];
+        let mut calls = [call(
+            "f",
+            "{\"count\":\"3\",\"ratio\":\"1.5\",\"enabled\":\"true\"}",
+        )];
+
+        // Before coercion the stringified scalars fail validation.
+        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+
+        assert!(coerce_arguments(&mut calls, &tools));
+        assert_eq!(calls[0].arguments, "{\"count\":3,\"enabled\":true,\"ratio\":1.5}");
+        assert_eq!(validate(&calls, &tools), Validation::Valid);
+    }
+
+    #[test]
+    fn coerces_scalar_to_declared_string() {
+        let tools = [typed_tool(json!({"id": {"type": "string"}}))];
+        let mut calls = [call("f", "{\"id\":123}")];
+        assert!(coerce_arguments(&mut calls, &tools));
+        assert_eq!(calls[0].arguments, "{\"id\":\"123\"}");
+        assert_eq!(validate(&calls, &tools), Validation::Valid);
+    }
+
+    #[test]
+    fn coercion_reports_no_change_when_types_already_match() {
+        let tools = [typed_tool(json!({"count": {"type": "integer"}}))];
+        let mut calls = [call("f", "{\"count\":3}")];
+        assert!(!coerce_arguments(&mut calls, &tools));
+    }
+
+    #[test]
+    fn coercion_leaves_unparseable_and_container_values_alone() {
+        let tools = [typed_tool(json!({
+            "count": {"type": "integer"},
+            "items": {"type": "string"}
+        }))];
+        // "abc" is not an integer; an array is not "obviously" the intended string.
+        let mut calls = [call("f", "{\"count\":\"abc\",\"items\":[1,2]}")];
+        assert!(!coerce_arguments(&mut calls, &tools));
+        // Still invalid, so the retry path is preserved for genuine mismatches.
+        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+    }
+
+    #[test]
+    fn coercion_skips_unknown_tools_and_non_object_arguments() {
+        let tools = [typed_tool(json!({"count": {"type": "integer"}}))];
+        let mut calls = [call("other", "{\"count\":\"3\"}"), call("f", "not json")];
+        assert!(!coerce_arguments(&mut calls, &tools));
     }
 }

@@ -306,6 +306,46 @@ async fn native_invalid_tool_call_exhaustion_does_not_forward_tool_call() {
 }
 
 #[tokio::test]
+async fn stringified_native_argument_is_coerced_without_a_retry() {
+    let backend = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    // A typed tool whose `count` is an integer; the model stringifies it.
+    let request = json!({
+        "model": "local-model",
+        "messages": [{"role": "user", "content": "count things"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "tally",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"]
+                }
+            }
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Sequence {
+            calls: calls.clone(),
+            bodies: vec![native_tool_response("tally", json!({"count": "3"}))],
+        })
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn(&backend.uri(), Guardrails::default()).await;
+    let got = post(&proxy, &request).await;
+
+    // Coerced in place and re-emitted from parsed calls — no retry round-trip.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "tally");
+    assert_eq!(call["function"]["arguments"], "{\"count\":3}");
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
 async fn all_toggles_off_is_passthrough() {
     let backend = MockServer::start().await;
     let content = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>";

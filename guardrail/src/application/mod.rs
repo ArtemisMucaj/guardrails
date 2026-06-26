@@ -25,7 +25,7 @@ use crate::domain::model::ChatRequest;
 use crate::domain::rescue;
 use crate::domain::respond;
 use crate::domain::retry::ErrorTracker;
-use crate::domain::validate::{validate, Validation};
+use crate::domain::validate::{coerce_arguments, validate, Validation};
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
 #[async_trait::async_trait]
@@ -208,7 +208,7 @@ async fn guardrail_loop(
             }
         };
 
-        let Some((calls, rescued)) = calls else {
+        let Some((mut calls, rescued)) = calls else {
             return bytes_response(status, out_headers, bytes);
         };
 
@@ -225,9 +225,19 @@ async fn guardrail_loop(
             }
         }
 
+        // Repair obviously-mistyped scalar arguments before validating, so a
+        // stringified number/boolean costs a coercion rather than a retry. Tied
+        // to the retry guardrail: disabling retries opts out of this repair too.
+        // Any change forces re-emission from `calls` so the fix reaches the
+        // client (a native, otherwise-unmodified response forwards raw bytes).
+        let coerced = g.retry && coerce_arguments(&mut calls, &tools);
+        if coerced {
+            info!("coerced mistyped tool-call arguments to declared types");
+        }
+
         match validate(&calls, &tools) {
             Validation::Valid => {
-                return if rescued {
+                return if rescued || coerced {
                     json_response(
                         status,
                         out_headers,

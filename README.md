@@ -16,10 +16,16 @@ and repaired before the response reaches the client.
 - Recovers tool calls from model text formats such as Qwen, Qwen-Coder, Hermes,
   Llama, Mistral, LiquidAI LFM2 / LFM2.5 (Pythonic or JSON calls wrapped in
   `<|tool_call_start|>` / `<|tool_call_end|>`), fenced JSON, and bare JSON.
+- Repairs almost-JSON tool calls as a fallback when strict parsing fails:
+  single-quoted strings, unquoted keys, literal newlines inside strings,
+  trailing commas, and braces/brackets clipped by truncation.
 - Validates tool names and JSON-object arguments against the request's declared
   tools.
 - Checks required JSON-schema argument fields, preventing calls such as `Edit`
   without a required `filePath`.
+- Coerces obviously-mistyped scalar arguments to the declared schema type (for
+  example a stringified `"3"` for an `integer` field), repairing them in place
+  instead of spending a retry.
 - Retries invalid tool calls with a corrective nudge, then falls back safely
   instead of forwarding invalid tool calls to the client.
 - Optionally injects a synthetic `respond` tool so models can return a final text

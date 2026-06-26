@@ -346,6 +346,47 @@ async fn stringified_native_argument_is_coerced_without_a_retry() {
 }
 
 #[tokio::test]
+async fn wrongly_styled_native_argument_key_is_repaired_without_a_retry() {
+    let backend = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    // The model emits snake_case `file_path` for a schema that declares
+    // camelCase `filePath`; the proxy should rebind it in place.
+    let request = json!({
+        "model": "local-model",
+        "messages": [{"role": "user", "content": "edit the file"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string"}},
+                    "required": ["filePath"]
+                }
+            }
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Sequence {
+            calls: calls.clone(),
+            bodies: vec![native_tool_response("Edit", json!({"file_path": "/tmp/x.rs"}))],
+        })
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn(&backend.uri(), Guardrails::default()).await;
+    let got = post(&proxy, &request).await;
+
+    // Renamed in place and re-emitted from parsed calls — no retry round-trip.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "Edit");
+    assert_eq!(call["function"]["arguments"], "{\"filePath\":\"/tmp/x.rs\"}");
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
 async fn all_toggles_off_is_passthrough() {
     let backend = MockServer::start().await;
     let content = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>";

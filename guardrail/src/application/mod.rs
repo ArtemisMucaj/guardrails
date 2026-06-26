@@ -25,7 +25,7 @@ use crate::domain::model::ChatRequest;
 use crate::domain::rescue;
 use crate::domain::respond;
 use crate::domain::retry::ErrorTracker;
-use crate::domain::validate::{coerce_arguments, validate, Validation};
+use crate::domain::validate::{coerce_arguments, repair_argument_names, validate, Validation};
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
 #[async_trait::async_trait]
@@ -225,19 +225,28 @@ async fn guardrail_loop(
             }
         }
 
-        // Repair obviously-mistyped scalar arguments before validating, so a
-        // stringified number/boolean costs a coercion rather than a retry. Tied
-        // to the retry guardrail: disabling retries opts out of this repair too.
-        // Any change forces re-emission from `calls` so the fix reaches the
-        // client (a native, otherwise-unmodified response forwards raw bytes).
-        let coerced = g.retry && coerce_arguments(&mut calls, &tools);
-        if coerced {
-            info!("coerced mistyped tool-call arguments to declared types");
+        // Repair tool-call arguments before validating, so a fixable mistake
+        // costs a local rewrite rather than a corrective retry. Tied to the
+        // retry guardrail: disabling retries opts out of these repairs too. Any
+        // change forces re-emission from `calls` so the fix reaches the client
+        // (a native, otherwise-unmodified response forwards raw bytes). Names are
+        // repaired first (fill a missing required field from a wrongly-styled
+        // key), then types (coerce the now-correctly-named value).
+        let mut repaired = false;
+        if g.retry {
+            if repair_argument_names(&mut calls, &tools) {
+                info!("repaired tool-call argument names to declared schema keys");
+                repaired = true;
+            }
+            if coerce_arguments(&mut calls, &tools) {
+                info!("coerced mistyped tool-call arguments to declared types");
+                repaired = true;
+            }
         }
 
         match validate(&calls, &tools) {
             Validation::Valid => {
-                return if rescued || coerced {
+                return if rescued || repaired {
                     json_response(
                         status,
                         out_headers,

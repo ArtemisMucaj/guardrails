@@ -51,6 +51,109 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
     Validation::Valid
 }
 
+/// Repair argument keys that name a declared property in a different casing or
+/// separator style — `file_path` / `filepath` / `FilePath` for a schema's
+/// `filePath`. Small models routinely emit snake_case where the schema is
+/// camelCase (or vice-versa); rebinding the value to the declared name is
+/// cheaper than spending a corrective retry.
+///
+/// Renaming a key reassigns which parameter a value binds to, so this is
+/// deliberately conservative and only acts where the intent is unambiguous:
+///
+/// - it only fills a *missing required* property (an otherwise-valid call is
+///   never touched);
+/// - only unknown keys (not matching any declared property) are rename sources;
+/// - matching is normalization-only (case- and separator-insensitive), never
+///   fuzzy distance or synonyms;
+/// - it abstains whenever the mapping is ambiguous — an unknown key normalizing
+///   to more than one missing property, or more than one unknown key competing
+///   for the same property.
+///
+/// Returns whether any call's arguments changed, so the caller re-emits the
+/// repaired form to the client.
+pub fn repair_argument_names(calls: &mut [ToolCall], tools: &[Tool]) -> bool {
+    let mut changed = false;
+    for call in calls.iter_mut() {
+        let Some(tool) = tools.iter().find(|tool| tool.function.name == call.name) else {
+            continue;
+        };
+        let Some(properties) = parameter_properties(tool) else {
+            continue;
+        };
+        let Some(mut arguments) = arguments_object(&call.arguments) else {
+            continue;
+        };
+
+        // Rename targets: required properties not already present.
+        let missing: Vec<String> = required_parameters(tool)
+            .into_iter()
+            .filter(|req| !arguments.contains_key(*req))
+            .map(str::to_string)
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+
+        // Rename sources: keys that name no declared property.
+        let unknown: Vec<String> = arguments
+            .keys()
+            .filter(|key| !properties.contains_key(key.as_str()))
+            .cloned()
+            .collect();
+        if unknown.is_empty() {
+            continue;
+        }
+
+        // Resolve source -> target by normalized equality, abstaining when a
+        // source matches more than one missing property.
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for source in &unknown {
+            let norm = normalize_key(source);
+            let mut hits = missing
+                .iter()
+                .filter(|target| normalize_key(target.as_str()) == norm);
+            if let Some(target) = hits.next() {
+                if hits.next().is_none() {
+                    renames.push((source.clone(), target.clone()));
+                }
+            }
+        }
+
+        let mut call_changed = false;
+        for (source, target) in &renames {
+            // Abstain when more than one source competes for the same property.
+            if renames.iter().filter(|(_, t)| t == target).count() != 1 {
+                continue;
+            }
+            // Targets are missing by construction, so a rename never overwrites
+            // a present value; the guard keeps that invariant explicit.
+            if arguments.contains_key(target.as_str()) {
+                continue;
+            }
+            if let Some(value) = arguments.remove(source.as_str()) {
+                arguments.insert(target.clone(), value);
+                call_changed = true;
+            }
+        }
+
+        if call_changed {
+            call.arguments = Value::Object(arguments).to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Normalize an argument key for style-insensitive comparison: lowercased with
+/// `_`, `-`, and spaces removed, so `file_path`, `File-Path`, and `filePath`
+/// all collapse to `filepath`.
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Coerce obviously-mistyped scalar arguments to the type the tool's JSON
 /// schema declares, in place. Small models routinely emit `"123"`/`"true"` for
 /// a number/boolean field, or a bare scalar where a string is wanted; fixing
@@ -405,5 +508,106 @@ mod tests {
         let tools = [typed_tool(json!({"count": {"type": "integer"}}))];
         let mut calls = [call("other", "{\"count\":\"3\"}"), call("f", "not json")];
         assert!(!coerce_arguments(&mut calls, &tools));
+    }
+
+    // ── Argument name repair ─────────────────────────────────────────────────
+
+    fn typed_tool_req(properties: Value, required: &[&str]) -> Tool {
+        serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repairs_snake_case_key_to_declared_camel_case() {
+        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let mut calls = [call("f", "{\"file_path\":\"/tmp/x.rs\"}")];
+
+        // The wrongly-styled key leaves the required field missing.
+        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+
+        assert!(repair_argument_names(&mut calls, &tools));
+        assert_eq!(calls[0].arguments, "{\"filePath\":\"/tmp/x.rs\"}");
+        assert_eq!(validate(&calls, &tools), Validation::Valid);
+    }
+
+    #[test]
+    fn repairs_case_and_separator_variants() {
+        for variant in ["file_path", "FilePath", "File-Path", "filepath", "FILE_PATH"] {
+            let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+            let mut calls = [call("f", &format!("{{\"{variant}\":\"/x\"}}"))];
+            assert!(
+                repair_argument_names(&mut calls, &tools),
+                "expected repair for {variant:?}"
+            );
+            assert_eq!(calls[0].arguments, "{\"filePath\":\"/x\"}");
+        }
+    }
+
+    #[test]
+    fn does_not_touch_an_already_valid_call() {
+        // Required field present and an extra unknown key alongside it: the call
+        // already validates, so name repair must leave it alone.
+        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let mut calls = [call("f", "{\"filePath\":\"/x\",\"note\":\"hi\"}")];
+        assert!(!repair_argument_names(&mut calls, &tools));
+    }
+
+    #[test]
+    fn does_not_overwrite_a_present_required_key() {
+        // `filePath` is already correct; a stray `file_path` must not clobber it.
+        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let mut calls = [call("f", "{\"filePath\":\"/right\",\"file_path\":\"/wrong\"}")];
+        assert!(!repair_argument_names(&mut calls, &tools));
+    }
+
+    #[test]
+    fn abstains_when_two_unknown_keys_compete_for_one_property() {
+        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        // Both keys normalize to "filepath"; ambiguous source, so abstain.
+        let mut calls = [call("f", "{\"file_path\":\"/a\",\"filepath\":\"/b\"}")];
+        assert!(!repair_argument_names(&mut calls, &tools));
+        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+    }
+
+    #[test]
+    fn does_not_repair_a_non_required_property() {
+        // `limit` is declared but optional; an unknown `lim_it` is not rebound,
+        // because only missing *required* fields are repair targets.
+        let tools = [typed_tool_req(
+            json!({"query": {"type": "string"}, "limit": {"type": "integer"}}),
+            &["query"],
+        )];
+        let mut calls = [call("f", "{\"query\":\"x\",\"lim_it\":5}")];
+        assert!(!repair_argument_names(&mut calls, &tools));
+    }
+
+    #[test]
+    fn name_repair_then_coercion_compose() {
+        // A wrongly-styled key carrying a stringified scalar: rename fills the
+        // required field, then coercion fixes its type.
+        let tools = [typed_tool_req(json!({"maxItems": {"type": "integer"}}), &["maxItems"])];
+        let mut calls = [call("f", "{\"max_items\":\"5\"}")];
+        assert!(repair_argument_names(&mut calls, &tools));
+        assert!(coerce_arguments(&mut calls, &tools));
+        assert_eq!(calls[0].arguments, "{\"maxItems\":5}");
+        assert_eq!(validate(&calls, &tools), Validation::Valid);
+    }
+
+    #[test]
+    fn name_repair_reports_no_change_when_nothing_matches() {
+        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        // `destination` shares no normalized form with `filePath`.
+        let mut calls = [call("f", "{\"destination\":\"/x\"}")];
+        assert!(!repair_argument_names(&mut calls, &tools));
     }
 }

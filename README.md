@@ -14,7 +14,8 @@ and repaired before the response reaches the client.
   response body.
 - Normalizes valid tool calls into OpenAI's `tool_calls` shape.
 - Recovers tool calls from model text formats such as Qwen, Qwen-Coder, Hermes,
-  Llama, Mistral, fenced JSON, and bare JSON.
+  Llama, Mistral, LiquidAI LFM2 / LFM2.5 (Pythonic or JSON calls wrapped in
+  `<|tool_call_start|>` / `<|tool_call_end|>`), fenced JSON, and bare JSON.
 - Validates tool names and JSON-object arguments against the request's declared
   tools.
 - Checks required JSON-schema argument fields, preventing calls such as `Edit`

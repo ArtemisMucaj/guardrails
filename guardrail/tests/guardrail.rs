@@ -158,6 +158,29 @@ async fn malformed_text_call_is_rescued_and_re_emitted() {
     assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
 }
 
+#[tokio::test]
+async fn lfm_pythonic_tool_call_is_rescued_and_re_emitted() {
+    let backend = MockServer::start().await;
+    // LFM2.5 emits Pythonic calls wrapped in special tokens, with trailing prose.
+    let content = "<|tool_call_start|>[get_weather(location=\"Paris\")]<|tool_call_end|>Checking the weather in Paris.";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&text_response(content)))
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn(&backend.uri(), Guardrails::default()).await;
+    let got = post(&proxy, &tool_request()).await;
+
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"location\":\"Paris\"}");
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+    // No special tokens leak into the re-emitted body.
+    let body = serde_json::to_string(&got).unwrap();
+    assert!(!body.contains("<|tool_call"));
+}
+
 /// Responds with a different body on each successive call.
 struct Sequence {
     calls: Arc<AtomicUsize>,

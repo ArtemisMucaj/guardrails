@@ -421,6 +421,10 @@ fn parse_pythonic_calls(s: &str) -> Option<Vec<ToolCall>> {
                     Some(',') => {
                         p.bump();
                         p.skip_ws();
+                        // Allow a trailing comma before the closing bracket.
+                        if p.peek() == Some(']') {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -499,6 +503,10 @@ impl PyParser {
                     Some(',') => {
                         self.bump();
                         self.skip_ws();
+                        // Allow a trailing comma before the closing paren.
+                        if self.peek() == Some(')') {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -605,6 +613,10 @@ impl PyParser {
                     Some(',') => {
                         self.bump();
                         self.skip_ws();
+                        // Allow a trailing comma before the closing bracket.
+                        if self.peek() == Some(']') {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -636,6 +648,10 @@ impl PyParser {
                     Some(',') => {
                         self.bump();
                         self.skip_ws();
+                        // Allow a trailing comma before the closing brace.
+                        if self.peek() == Some('}') {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -693,6 +709,20 @@ mod tests {
         assert_eq!(args["nothing"], Value::Null);
         assert_eq!(args["tags"], json!(["a", "b"]));
         assert_eq!(args["opts"], json!({"deep": 1}));
+    }
+
+    #[test]
+    fn lfm_pythonic_trailing_commas() {
+        // Python permits trailing commas in calls, lists, and dicts.
+        let text =
+            "<|tool_call_start|>[f(x=1,), g(items=[\"a\",], opts={\"k\": 1,}),]<|tool_call_end|>";
+        let calls = Lfm.try_parse(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, "{\"x\":1}");
+        let args: Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(args["items"], json!(["a"]));
+        assert_eq!(args["opts"], json!({"k": 1}));
     }
 
     #[test]

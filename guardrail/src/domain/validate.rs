@@ -4,14 +4,44 @@ use super::decode::ToolCall;
 use super::model::Tool;
 use serde_json::{Map, Value};
 
+/// Why a batch of tool calls failed validation. Stable, low-cardinality tags
+/// suitable for grouping failure metrics by category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    /// The call named a tool that was not declared in the request.
+    UnknownTool,
+    /// The call's arguments did not parse as a JSON object.
+    BadArguments,
+    /// A required schema field was absent from the arguments.
+    MissingArgument,
+    /// An argument's value did not match its declared JSON-schema type.
+    WrongType,
+}
+
+impl ErrorCategory {
+    /// Stable snake_case tag for storage and grouping.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCategory::UnknownTool => "unknown_tool",
+            ErrorCategory::BadArguments => "bad_arguments",
+            ErrorCategory::MissingArgument => "missing_argument",
+            ErrorCategory::WrongType => "wrong_type",
+        }
+    }
+}
+
 /// Outcome of validating a batch of tool calls.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Validation {
     /// Every call names a declared tool and carries object arguments.
     Valid,
     /// At least one call is malformed but the situation is recoverable by asking
-    /// the model to try again. Carries the nudge text to feed back.
-    NeedsRetry(String),
+    /// the model to try again. Carries the failure category (for metrics) and
+    /// the nudge text to feed back.
+    NeedsRetry {
+        category: ErrorCategory,
+        nudge: String,
+    },
 }
 
 /// Validate `calls` against the set of declared tools.
@@ -24,14 +54,23 @@ pub enum Validation {
 pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
     for call in calls {
         let Some(tool) = tools.iter().find(|tool| tool.function.name == call.name) else {
-            return Validation::NeedsRetry(unknown_tool_nudge(&call.name, tools));
+            return Validation::NeedsRetry {
+                category: ErrorCategory::UnknownTool,
+                nudge: unknown_tool_nudge(&call.name, tools),
+            };
         };
         let Some(arguments) = arguments_object(&call.arguments) else {
-            return Validation::NeedsRetry(bad_arguments_nudge(&call.name));
+            return Validation::NeedsRetry {
+                category: ErrorCategory::BadArguments,
+                nudge: bad_arguments_nudge(&call.name),
+            };
         };
         for required in required_parameters(tool) {
             if !arguments.contains_key(required) {
-                return Validation::NeedsRetry(missing_argument_nudge(&call.name, required));
+                return Validation::NeedsRetry {
+                    category: ErrorCategory::MissingArgument,
+                    nudge: missing_argument_nudge(&call.name, required),
+                };
             }
         }
         if let Some(properties) = parameter_properties(tool) {
@@ -42,7 +81,10 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
                     .and_then(Value::as_str);
                 if let Some(declared) = declared {
                     if !type_matches(declared, value) {
-                        return Validation::NeedsRetry(wrong_type_nudge(&call.name, key, declared));
+                        return Validation::NeedsRetry {
+                            category: ErrorCategory::WrongType,
+                            nudge: wrong_type_nudge(&call.name, key, declared),
+                        };
                     }
                 }
             }
@@ -364,7 +406,7 @@ mod tests {
     fn unknown_tool_needs_retry_and_lists_options() {
         let calls = [call("get_wether", "{}")];
         let tools = [tool("get_weather", &[]), tool("search", &[])];
-        let Validation::NeedsRetry(nudge) = validate(&calls, &tools) else {
+        let Validation::NeedsRetry { nudge, .. } = validate(&calls, &tools) else {
             panic!("expected NeedsRetry");
         };
         assert!(nudge.contains("get_wether"));
@@ -379,7 +421,7 @@ mod tests {
             assert!(
                 matches!(
                     validate(&calls, &[tool("get_weather", &[])]),
-                    Validation::NeedsRetry(_)
+                    Validation::NeedsRetry { .. }
                 ),
                 "expected NeedsRetry for arguments {bad:?}"
             );
@@ -392,7 +434,7 @@ mod tests {
             "Edit",
             "{\"oldString\":\"old\",\"newString\":\"new\"}",
         )];
-        let Validation::NeedsRetry(nudge) = validate(
+        let Validation::NeedsRetry { nudge, .. } = validate(
             &calls,
             &[tool("Edit", &["filePath", "oldString", "newString"])],
         ) else {
@@ -420,7 +462,7 @@ mod tests {
 
         // Right key, wrong type (number instead of string).
         let calls = [call("Edit", "{\"filePath\":123}")];
-        let Validation::NeedsRetry(nudge) = validate(&calls, &tools) else {
+        let Validation::NeedsRetry { nudge, .. } = validate(&calls, &tools) else {
             panic!("expected NeedsRetry");
         };
         assert!(nudge.contains("filePath"));
@@ -434,7 +476,8 @@ mod tests {
     #[test]
     fn first_problem_wins() {
         let calls = [call("bad_name", "{}"), call("get_weather", "not json")];
-        let Validation::NeedsRetry(nudge) = validate(&calls, &[tool("get_weather", &[])]) else {
+        let Validation::NeedsRetry { nudge, .. } = validate(&calls, &[tool("get_weather", &[])])
+        else {
             panic!("expected NeedsRetry");
         };
         // The unknown-name problem comes first in the slice.
@@ -467,10 +510,16 @@ mod tests {
         )];
 
         // Before coercion the stringified scalars fail validation.
-        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+        assert!(matches!(
+            validate(&calls, &tools),
+            Validation::NeedsRetry { .. }
+        ));
 
         assert!(coerce_arguments(&mut calls, &tools));
-        assert_eq!(calls[0].arguments, "{\"count\":3,\"enabled\":true,\"ratio\":1.5}");
+        assert_eq!(
+            calls[0].arguments,
+            "{\"count\":3,\"enabled\":true,\"ratio\":1.5}"
+        );
         assert_eq!(validate(&calls, &tools), Validation::Valid);
     }
 
@@ -500,7 +549,10 @@ mod tests {
         let mut calls = [call("f", "{\"count\":\"abc\",\"items\":[1,2]}")];
         assert!(!coerce_arguments(&mut calls, &tools));
         // Still invalid, so the retry path is preserved for genuine mismatches.
-        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+        assert!(matches!(
+            validate(&calls, &tools),
+            Validation::NeedsRetry { .. }
+        ));
     }
 
     #[test]
@@ -529,11 +581,17 @@ mod tests {
 
     #[test]
     fn repairs_snake_case_key_to_declared_camel_case() {
-        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let tools = [typed_tool_req(
+            json!({"filePath": {"type": "string"}}),
+            &["filePath"],
+        )];
         let mut calls = [call("f", "{\"file_path\":\"/tmp/x.rs\"}")];
 
         // The wrongly-styled key leaves the required field missing.
-        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+        assert!(matches!(
+            validate(&calls, &tools),
+            Validation::NeedsRetry { .. }
+        ));
 
         assert!(repair_argument_names(&mut calls, &tools));
         assert_eq!(calls[0].arguments, "{\"filePath\":\"/tmp/x.rs\"}");
@@ -542,8 +600,17 @@ mod tests {
 
     #[test]
     fn repairs_case_and_separator_variants() {
-        for variant in ["file_path", "FilePath", "File-Path", "filepath", "FILE_PATH"] {
-            let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        for variant in [
+            "file_path",
+            "FilePath",
+            "File-Path",
+            "filepath",
+            "FILE_PATH",
+        ] {
+            let tools = [typed_tool_req(
+                json!({"filePath": {"type": "string"}}),
+                &["filePath"],
+            )];
             let mut calls = [call("f", &format!("{{\"{variant}\":\"/x\"}}"))];
             assert!(
                 repair_argument_names(&mut calls, &tools),
@@ -557,7 +624,10 @@ mod tests {
     fn does_not_touch_an_already_valid_call() {
         // Required field present and an extra unknown key alongside it: the call
         // already validates, so name repair must leave it alone.
-        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let tools = [typed_tool_req(
+            json!({"filePath": {"type": "string"}}),
+            &["filePath"],
+        )];
         let mut calls = [call("f", "{\"filePath\":\"/x\",\"note\":\"hi\"}")];
         assert!(!repair_argument_names(&mut calls, &tools));
     }
@@ -565,18 +635,30 @@ mod tests {
     #[test]
     fn does_not_overwrite_a_present_required_key() {
         // `filePath` is already correct; a stray `file_path` must not clobber it.
-        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
-        let mut calls = [call("f", "{\"filePath\":\"/right\",\"file_path\":\"/wrong\"}")];
+        let tools = [typed_tool_req(
+            json!({"filePath": {"type": "string"}}),
+            &["filePath"],
+        )];
+        let mut calls = [call(
+            "f",
+            "{\"filePath\":\"/right\",\"file_path\":\"/wrong\"}",
+        )];
         assert!(!repair_argument_names(&mut calls, &tools));
     }
 
     #[test]
     fn abstains_when_two_unknown_keys_compete_for_one_property() {
-        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let tools = [typed_tool_req(
+            json!({"filePath": {"type": "string"}}),
+            &["filePath"],
+        )];
         // Both keys normalize to "filepath"; ambiguous source, so abstain.
         let mut calls = [call("f", "{\"file_path\":\"/a\",\"filepath\":\"/b\"}")];
         assert!(!repair_argument_names(&mut calls, &tools));
-        assert!(matches!(validate(&calls, &tools), Validation::NeedsRetry(_)));
+        assert!(matches!(
+            validate(&calls, &tools),
+            Validation::NeedsRetry { .. }
+        ));
     }
 
     #[test]
@@ -595,7 +677,10 @@ mod tests {
     fn name_repair_then_coercion_compose() {
         // A wrongly-styled key carrying a stringified scalar: rename fills the
         // required field, then coercion fixes its type.
-        let tools = [typed_tool_req(json!({"maxItems": {"type": "integer"}}), &["maxItems"])];
+        let tools = [typed_tool_req(
+            json!({"maxItems": {"type": "integer"}}),
+            &["maxItems"],
+        )];
         let mut calls = [call("f", "{\"max_items\":\"5\"}")];
         assert!(repair_argument_names(&mut calls, &tools));
         assert!(coerce_arguments(&mut calls, &tools));
@@ -605,7 +690,10 @@ mod tests {
 
     #[test]
     fn name_repair_reports_no_change_when_nothing_matches() {
-        let tools = [typed_tool_req(json!({"filePath": {"type": "string"}}), &["filePath"])];
+        let tools = [typed_tool_req(
+            json!({"filePath": {"type": "string"}}),
+            &["filePath"],
+        )];
         // `destination` shares no normalized form with `filePath`.
         let mut calls = [call("f", "{\"destination\":\"/x\"}")];
         assert!(!repair_argument_names(&mut calls, &tools));

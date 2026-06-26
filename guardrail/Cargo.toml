@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 async-trait = "0.1"
 bytes = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 wiremock = "0.6"

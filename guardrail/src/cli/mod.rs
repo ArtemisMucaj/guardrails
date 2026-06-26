@@ -1,10 +1,12 @@
 //! CLI layer — argument parsing and process lifecycle.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::application::Guardrails;
+use crate::domain::metrics::default_db_path;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -12,6 +14,10 @@ use crate::application::Guardrails;
     about = "Transparent OpenAI chat-completions proxy with tool-call guardrails"
 )]
 pub struct Config {
+    /// Subcommand to run. When omitted, the proxy server starts.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Address the proxy listens on.
     #[arg(long, env = "GUARDRAIL_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
@@ -36,6 +42,28 @@ pub struct Config {
     /// Set to `0` to disable retries while keeping the other repairs.
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
+
+    /// Path to the SQLite failure-metrics database. Defaults to
+    /// `~/.guardrails/stats.sqlite`; one row is recorded per guarded request.
+    #[arg(long, env = "GUARDRAIL_METRICS_DB")]
+    pub metrics_db: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Print collected failure metrics as text and exit.
+    Stats {
+        /// Database to read. Defaults to `~/.guardrails/stats.sqlite`.
+        #[arg(long, env = "GUARDRAIL_METRICS_DB")]
+        metrics_db: Option<PathBuf>,
+    },
+}
+
+impl Config {
+    /// Resolve the metrics database path, applying the default home location.
+    pub fn metrics_db_path(&self) -> PathBuf {
+        self.metrics_db.clone().unwrap_or_else(default_db_path)
+    }
 }
 
 impl Config {

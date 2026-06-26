@@ -23,12 +23,13 @@ and repaired before the response reaches the client.
   tools.
 - Checks required JSON-schema argument fields, preventing calls such as `Edit`
   without a required `filePath`.
-- Coerces obviously-mistyped scalar arguments to the declared schema type (for
-  example a stringified `"3"` for an `integer` field), repairing them in place
-  instead of spending a retry.
-- Repairs argument keys that name a declared property in a different casing or
-  separator style (for example `file_path` for a schema's `filePath`), but only
-  to fill a missing required field and only when the match is unambiguous.
+- When retries are enabled, coerces obviously-mistyped scalar arguments to the
+  declared schema type (for example a stringified `"3"` for an `integer` field),
+  repairing them in place instead of spending a retry.
+- Also when retries are enabled, repairs argument keys that name a declared
+  property in a different casing or separator style (for example `file_path` for
+  a schema's `filePath`), but only to fill a missing required field and only when
+  the match is unambiguous.
 - Retries invalid tool calls with a corrective nudge, then falls back safely
   instead of forwarding invalid tool calls to the client.
 - Optionally injects a synthetic `respond` tool so models can return a final text

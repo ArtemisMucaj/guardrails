@@ -137,11 +137,32 @@ fn repair_json(s: &str) -> String {
 /// Replace single quotes with double quotes, but only when the payload contains
 /// no double quotes at all — otherwise an apostrophe inside a valid string would
 /// be corrupted.
+///
+/// Backslash escapes are respected so an escaped apostrophe survives: `\'`
+/// becomes a literal `'` (JSON strings don't escape apostrophes) rather than a
+/// stray `\"` that would change the value. Other escape sequences pass through
+/// unchanged, and an unescaped `'` is treated as a string delimiter.
 fn convert_single_quotes(s: &str) -> String {
     if s.contains('"') {
         return s.to_string();
     }
-    s.replace('\'', "\"")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('\'') => out.push('\''),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            '\'' => out.push('"'),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Escape raw control characters that appear inside string literals (illegal in
@@ -1171,6 +1192,14 @@ mod tests {
     fn repair_balances_clipped_braces() {
         let v = first_json_value("{\"name\": \"Edit\", \"input\": {\"a\": 1").unwrap();
         assert_eq!(v, json!({"name": "Edit", "input": {"a": 1}}));
+    }
+
+    #[test]
+    fn repair_preserves_escaped_apostrophe_when_converting_single_quotes() {
+        // `\'` is a literal apostrophe, not a string delimiter — converting it to
+        // a bare `"` would silently change the value from `it's` to `it"s`.
+        let v = first_json_value("{'text': 'it\\'s fine'}").unwrap();
+        assert_eq!(v, json!({"text": "it's fine"}));
     }
 
     #[test]

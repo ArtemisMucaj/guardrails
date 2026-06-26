@@ -123,24 +123,29 @@ Error categories (on `fallback_unfixed`): `unknown_tool`, `bad_arguments`,
 
 ### Viewing stats
 
-The `stats` subcommand reads the database and prints a text report — tool calls
-and success rate per model, the outcome breakdown, and the list of errors the
-guardrails could not fix (with a redacted argument snippet for triage):
+The `stats` subcommand reads the database and prints a text report in a
+**total → tool calls → errors** hierarchy per model: every guarded request
+(`total`), how many were a real tool call (`tool calls`), how many of those the
+guardrails could not fix (`errors`), the success rate over tool calls, the full
+outcome breakdown, and the triage list of unfixed errors (with a redacted
+argument snippet):
 
 ```bash
 cargo run -p guardrail -- stats
 ```
 
 ```text
-Tool calls by model
-===================
+Requests by model
+=================
 
 qwen2.5-7b
-  tool calls: 142  |  succeeded: 137  |  unfixed: 5  |  success rate: 96.5%
+  total: 168  |  tool calls: 142  |  succeeded: 137  |  errors: 5  |  success rate: 96.5%
     native_valid           110
     rescued                 18
     repaired                 9
     fallback_unfixed         5
+    respond_intercept       14
+    passthrough_no_calls    12
 
 Unfixed errors (triage list)
 ============================
@@ -149,24 +154,34 @@ Unfixed errors (triage list)
         The arguments for tool "Edit" were missing required field "filePath". … | args: {"oldString":"a","newString":"b"}
 ```
 
+`total` counts every guarded request, so it includes plain-text answers
+(`passthrough_no_calls`) and final answers routed through the synthetic
+`respond` tool (`respond_intercept`). Neither is a real tool call, so both are
+excluded from `tool calls` and from the success rate.
+
 ### Querying directly
 
-The metrics also answer the usual questions with plain SQL:
+The metrics also answer the usual questions with plain SQL. A *tool call* is one
+of `native_valid`, `rescued`, `repaired`, `recovered_after_retry`, or
+`fallback_unfixed` (the same set the report uses):
 
 ```sql
--- Tool calls total, per model.
-SELECT model, COUNT(*) AS tool_calls
+-- Total requests, and of those the real tool calls, per model.
+SELECT model,
+       COUNT(*) AS total,
+       SUM(outcome IN ('native_valid','rescued','repaired',
+                       'recovered_after_retry','fallback_unfixed')) AS tool_calls
 FROM outcomes
-WHERE outcome NOT IN ('passthrough_no_calls', 'non_json')
 GROUP BY model;
 
--- Success vs. error proportion, per model.
+-- Success vs. error proportion over tool calls, per model.
 SELECT model,
-       SUM(fixed)                  AS succeeded,
-       SUM(1 - fixed)              AS unfixed,
-       1.0 * SUM(fixed) / COUNT(*) AS success_rate
+       SUM(outcome != 'fallback_unfixed') AS succeeded,
+       SUM(outcome = 'fallback_unfixed')  AS errors,
+       1.0 * SUM(outcome != 'fallback_unfixed') / COUNT(*) AS success_rate
 FROM outcomes
-WHERE outcome NOT IN ('passthrough_no_calls', 'non_json')
+WHERE outcome IN ('native_valid','rescued','repaired',
+                  'recovered_after_retry','fallback_unfixed')
 GROUP BY model;
 
 -- Errors the guardrails could not fix, by category — the triage list.

@@ -21,7 +21,9 @@ use crate::domain::decode::{
     decode_response, response_with_text, response_with_tool_calls, ModelOutput,
 };
 pub use crate::domain::guardrails::Guardrails;
-use crate::domain::metrics::{redact_args, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder};
+use crate::domain::metrics::{
+    now_rfc3339, redact_args, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
+};
 use crate::domain::model::ChatRequest;
 use crate::domain::rescue;
 use crate::domain::respond;
@@ -178,6 +180,7 @@ async fn guardrail_loop(
                 retries: u32,
                 detail: Option<String>| {
         recorder.record(OutcomeRecord {
+            ts: now_rfc3339(),
             model: model.clone(),
             outcome,
             error_category,

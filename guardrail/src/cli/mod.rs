@@ -67,8 +67,14 @@ impl Config {
 /// Resolve when the process receives Ctrl-C (SIGINT) or, on Unix, SIGTERM.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %e, "failed to listen for Ctrl-C");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "failed to listen for Ctrl-C");
+                // Setup failed: never resolve, so select! doesn't read this as a
+                // shutdown signal and exit the server prematurely.
+                std::future::pending::<()>().await;
+            }
         }
     };
 
@@ -78,7 +84,10 @@ pub async fn shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(e) => tracing::error!(error = %e, "failed to install SIGTERM handler"),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
         }
     };
 

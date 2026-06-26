@@ -38,9 +38,10 @@ pub fn is_respond(call: &ToolCall) -> bool {
 }
 
 /// Extract the user-facing text from a `respond` call's arguments. Accepts
-/// `message` (canonical) and the `content`/`text` aliases; missing/unparseable
-/// arguments yield an empty string.
-pub fn message_text(call: &ToolCall) -> String {
+/// `message` (canonical) and the `content`/`text` aliases. Returns `None` when
+/// the arguments are unparseable or carry no recognized text field, so the
+/// caller can retry or fall back rather than emit a blank response.
+pub fn message_text(call: &ToolCall) -> Option<String> {
     serde_json::from_str::<Value>(&call.arguments)
         .ok()
         .and_then(|v| {
@@ -48,7 +49,6 @@ pub fn message_text(call: &ToolCall) -> String {
                 .iter()
                 .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -78,14 +78,23 @@ mod tests {
 
     #[test]
     fn extracts_message_and_aliases() {
-        assert_eq!(message_text(&call("respond", "{\"message\":\"hi\"}")), "hi");
-        assert_eq!(message_text(&call("respond", "{\"content\":\"yo\"}")), "yo");
-        assert_eq!(message_text(&call("respond", "{\"text\":\"sup\"}")), "sup");
+        assert_eq!(
+            message_text(&call("respond", "{\"message\":\"hi\"}")).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            message_text(&call("respond", "{\"content\":\"yo\"}")).as_deref(),
+            Some("yo")
+        );
+        assert_eq!(
+            message_text(&call("respond", "{\"text\":\"sup\"}")).as_deref(),
+            Some("sup")
+        );
     }
 
     #[test]
-    fn missing_or_bad_arguments_yield_empty() {
-        assert_eq!(message_text(&call("respond", "{}")), "");
-        assert_eq!(message_text(&call("respond", "not json")), "");
+    fn missing_or_bad_arguments_yield_none() {
+        assert_eq!(message_text(&call("respond", "{}")), None);
+        assert_eq!(message_text(&call("respond", "not json")), None);
     }
 }

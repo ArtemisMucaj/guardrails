@@ -34,6 +34,19 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
                 return Validation::NeedsRetry(missing_argument_nudge(&call.name, required));
             }
         }
+        if let Some(properties) = parameter_properties(tool) {
+            for (key, value) in &arguments {
+                let declared = properties
+                    .get(key)
+                    .and_then(|schema| schema.get("type"))
+                    .and_then(Value::as_str);
+                if let Some(declared) = declared {
+                    if !type_matches(declared, value) {
+                        return Validation::NeedsRetry(wrong_type_nudge(&call.name, key, declared));
+                    }
+                }
+            }
+        }
     }
     Validation::Valid
 }
@@ -55,6 +68,30 @@ fn required_parameters(tool: &Tool) -> Vec<&str> {
         .and_then(Value::as_array)
         .map(|required| required.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default()
+}
+
+/// The JSON-schema `properties` map declared for a tool's parameters, if any.
+fn parameter_properties(tool: &Tool) -> Option<&Map<String, Value>> {
+    tool.function
+        .rest
+        .get("parameters")?
+        .get("properties")?
+        .as_object()
+}
+
+/// Whether `value` satisfies a JSON-schema scalar/container `type`. Unknown
+/// type names are accepted (we don't reject what we don't understand).
+fn type_matches(declared: &str, value: &Value) -> bool {
+    match declared {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "null" => value.is_null(),
+        _ => true,
+    }
 }
 
 fn unknown_tool_nudge(name: &str, tools: &[Tool]) -> String {
@@ -81,6 +118,14 @@ fn missing_argument_nudge(name: &str, required: &str) -> String {
         "The arguments for tool \"{name}\" were missing required field \
          \"{required}\". Reply with a single tool call whose arguments include \
          all required fields."
+    )
+}
+
+fn wrong_type_nudge(name: &str, field: &str, expected: &str) -> String {
+    format!(
+        "The argument \"{field}\" for tool \"{name}\" had the wrong type; it \
+         must be a {expected}. Reply with a single tool call whose arguments \
+         match the declared types."
     )
 }
 
@@ -167,6 +212,36 @@ mod tests {
             panic!("expected NeedsRetry");
         };
         assert!(nudge.contains("filePath"));
+    }
+
+    #[test]
+    fn wrong_argument_type_needs_retry() {
+        let typed_tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string"}},
+                    "required": ["filePath"]
+                }
+            }
+        }))
+        .unwrap();
+
+        let tools = [typed_tool];
+
+        // Right key, wrong type (number instead of string).
+        let calls = [call("Edit", "{\"filePath\":123}")];
+        let Validation::NeedsRetry(nudge) = validate(&calls, &tools) else {
+            panic!("expected NeedsRetry");
+        };
+        assert!(nudge.contains("filePath"));
+        assert!(nudge.contains("string"));
+
+        // Correct type passes.
+        let calls = [call("Edit", "{\"filePath\":\"/tmp/x.rs\"}")];
+        assert_eq!(validate(&calls, &tools), Validation::Valid);
     }
 
     #[test]

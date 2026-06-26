@@ -42,25 +42,20 @@ impl BackendPort for Backend {
         headers: &HeaderMap,
         body: bytes::Bytes,
     ) -> Response {
-        let builder = self
+        // Forward verbatim: preserve the body for every method (some APIs send
+        // entity bodies with GET/DELETE), matching the proxy's transparency.
+        let resp = match self
             .client
-            .request(method.clone(), target)
-            .headers(forward_headers(headers));
-        let builder = if method == Method::POST || method == Method::PUT || method == Method::PATCH
+            .request(method, target)
+            .headers(forward_headers(headers))
+            .body(body.to_vec())
+            .send()
+            .await
         {
-            builder.body(body.to_vec())
-        } else {
-            builder.body(Vec::<u8>::new())
-        };
-        let resp = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, target = %target, "backend request failed");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("backend request failed: {e}"),
-                )
-                    .into_response();
+                return (StatusCode::BAD_GATEWAY, "backend request failed").into_response();
             }
         };
         relay_response(resp)
@@ -97,11 +92,7 @@ pub async fn post_backend(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, target = %target, "backend request failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("backend request failed: {e}"),
-            )
-                .into_response()
+            (StatusCode::BAD_GATEWAY, "backend request failed").into_response()
         })?;
 
     let status =

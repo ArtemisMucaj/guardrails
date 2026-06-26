@@ -43,7 +43,12 @@ pub fn rescue(text: &str) -> Option<(&'static str, Vec<ToolCall>)> {
 fn tool_calls_from_value(v: &Value) -> Option<Vec<ToolCall>> {
     match v {
         Value::Array(items) => {
-            let calls: Vec<ToolCall> = items.iter().filter_map(tool_call_from_value).collect();
+            // All-or-nothing: if any entry is malformed, reject the whole batch
+            // rather than silently dropping it before validation sees it.
+            let calls: Vec<ToolCall> = items
+                .iter()
+                .map(tool_call_from_value)
+                .collect::<Option<_>>()?;
             (!calls.is_empty()).then_some(calls)
         }
         Value::Object(map) => {
@@ -344,7 +349,10 @@ impl RescueParser for BareJson {
         "bare_json"
     }
     fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>> {
-        let v = first_json_value(text.trim())?;
+        // Require the entire response to be JSON. Accepting a valid prefix would
+        // let prose that merely starts with a tool-shaped example be re-emitted
+        // as real tool_calls.
+        let v: Value = serde_json::from_str(text.trim()).ok()?;
         tool_calls_from_value(&v)
     }
 }

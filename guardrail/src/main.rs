@@ -27,9 +27,22 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(Backend::new(client), &cfg.backend).with_guardrails(guardrails);
     let app = guardrail::build_app(state);
 
+    // The backend URL is operator-controlled and may embed basic-auth
+    // credentials or token-bearing query params; log only scheme/host/port.
+    let backend_for_log = reqwest::Url::parse(&cfg.backend)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+                None => format!("{}://{}", url.scheme(), host),
+            })
+        })
+        .unwrap_or_else(|| "<redacted>".to_string());
+
     info!(
         listen = %cfg.listen,
-        backend = %cfg.backend,
+        backend = %backend_for_log,
         ?guardrails,
         "guardrail proxy starting"
     );

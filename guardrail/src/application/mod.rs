@@ -106,9 +106,17 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             }
         };
 
-        let guarded = serde_json::from_slice::<ChatRequest>(&body_bytes)
-            .ok()
-            .filter(|r| r.has_tools() && !r.stream());
+        // Only chat-completions POSTs are eligible for guardrails; other routes
+        // whose bodies happen to deserialize as a ChatRequest must pass through.
+        let guarded = if parts.method == axum::http::Method::POST
+            && parts.uri.path() == "/v1/chat/completions"
+        {
+            serde_json::from_slice::<ChatRequest>(&body_bytes)
+                .ok()
+                .filter(|r| r.has_tools() && !r.stream())
+        } else {
+            None
+        };
 
         if let Some(request) = guarded {
             if state.guardrails.any_active() {
@@ -147,7 +155,16 @@ async fn guardrail_loop(
     mut request: ChatRequest,
 ) -> Response {
     let g = state.guardrails;
-    if g.respond {
+    // Only own the `respond` tool when the client hasn't defined one itself;
+    // otherwise we'd hijack the client's real tool calls as final text.
+    let respond_active = g.respond
+        && !request
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.function.name == respond::RESPOND);
+    if respond_active {
         request.push_tool(respond::respond_tool());
     }
     let tools = request.tools.clone().unwrap_or_default();
@@ -195,9 +212,15 @@ async fn guardrail_loop(
             return bytes_response(status, out_headers, bytes);
         };
 
-        if g.respond {
-            if let Some(r) = calls.iter().find(|c| respond::is_respond(c)) {
-                let text = respond::message_text(r);
+        if respond_active {
+            // Intercept only when the respond call carries usable text. Missing
+            // or malformed arguments fall through to validation, which retries
+            // against the injected respond tool's required `message` field.
+            if let Some(text) = calls
+                .iter()
+                .find(|c| respond::is_respond(c))
+                .and_then(respond::message_text)
+            {
                 return json_response(status, out_headers, &response_with_text(&value, &text));
             }
         }

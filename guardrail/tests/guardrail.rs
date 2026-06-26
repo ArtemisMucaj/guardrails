@@ -387,24 +387,27 @@ async fn wrongly_styled_native_argument_key_is_repaired_without_a_retry() {
 }
 
 #[tokio::test]
-async fn all_toggles_off_is_passthrough() {
+async fn zero_max_retries_disables_the_retry_loop_but_keeps_repairs() {
     let backend = MockServer::start().await;
-    let content = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>";
+    let calls = Arc::new(AtomicUsize::new(0));
+    // An always-invalid tool name: rescue recovers the call, validation keeps
+    // failing, and with no retry budget the loop falls back immediately instead
+    // of re-asking the backend.
+    let bad = "<tool_call>{\"name\": \"nope\", \"arguments\": {}}</tool_call>";
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&text_response(content)))
+        .respond_with(Sequence {
+            calls: calls.clone(),
+            bodies: vec![text_response(bad)],
+        })
         .mount(&backend)
         .await;
 
-    let off = Guardrails {
-        rescue: false,
-        respond: false,
-        retry: false,
-        max_retries: 0,
-    };
-    let proxy = spawn(&backend.uri(), off).await;
+    let proxy = spawn(&backend.uri(), Guardrails { max_retries: 0 }).await;
     let got = post(&proxy, &tool_request()).await;
 
-    // No rescue: the malformed text is forwarded unchanged.
-    assert_eq!(got, text_response(content));
+    // No retries → exactly one backend call, then fall back to the last text.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(got["choices"][0]["finish_reason"], "stop");
+    assert_eq!(got["choices"][0]["message"]["content"], bad);
 }

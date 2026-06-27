@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.6.0...v0.7.0) (2026-06-27)
+
+
+### Features
+
+* **metrics:** record streaming and non-tool requests as passthroughs ([#15](https://github.com/ArtemisMucaj/guardrails/issues/15)) ([2564258](https://github.com/ArtemisMucaj/guardrails/commit/2564258b14c70435aa8bfabfdb8e3d89446f540b))
+
 ## [0.6.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.5.0...v0.6.0) (2026-06-27)
 
 

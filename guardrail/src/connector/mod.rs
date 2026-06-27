@@ -35,6 +35,95 @@ impl BackendPort for Backend {
         post_backend(&self.client, target, headers, body).await
     }
 
+    async fn stream_post(
+        &self,
+        target: &str,
+        headers: &HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<(StatusCode, HeaderMap, tokio::sync::mpsc::Receiver<Option<String>>, bool), Response> {
+        use futures_util::StreamExt;
+
+        let resp = self
+            .client
+            .post(target)
+            .headers(forward_headers(headers))
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, target = %target, "backend stream request failed");
+                (StatusCode::BAD_GATEWAY, "backend request failed").into_response()
+            })?;
+
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let out_headers = copy_response_headers(resp.headers());
+
+        // Peek at the content-type to decide whether to stream or buffer.
+        let is_sse = out_headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Option<String>>(256);
+
+        if is_sse {
+            // True streaming path: read bytes as they arrive, split into lines,
+            // send each line down the channel immediately.
+            let mut byte_stream = resp.bytes_stream();
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                while let Some(chunk) = byte_stream.next().await {
+                    let Ok(bytes) = chunk else { break };
+                    let Ok(text) = std::str::from_utf8(&bytes) else { break };
+                    buf.push_str(text);
+                    // Emit complete lines as they accumulate.
+                    while let Some(pos) = buf.find('\n') {
+                        let line = buf[..pos].trim_end_matches('\r').to_string();
+                        buf = buf[pos + 1..].to_string();
+                        if tx.send(Some(line)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                // Flush any remaining partial line.
+                if !buf.is_empty() {
+                    let _ = tx.send(Some(buf)).await;
+                }
+                let _ = tx.send(None).await; // EOF sentinel
+            });
+        } else {
+            // Backend returned JSON or non-SSE — buffer it, convert, then feed
+            // the synthetic lines into the channel from a background task.
+            let text = resp.text().await.map_err(|e| {
+                tracing::error!(error = %e, "failed to read backend response body");
+                (StatusCode::BAD_GATEWAY, "failed to read backend response").into_response()
+            })?;
+            let trimmed = text.trim_start();
+            let sse = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                json_to_sse(&text)
+            } else {
+                // Non-JSON, non-SSE — forward verbatim via the error path.
+                return Err(crate::connector::bytes_response(
+                    status,
+                    out_headers,
+                    text.into_bytes(),
+                ));
+            };
+            tokio::spawn(async move {
+                for line in sse.lines() {
+                    if tx.send(Some(line.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = tx.send(None).await;
+            });
+        }
+
+        Ok((status, out_headers, rx, is_sse))
+    }
+
     async fn forward(
         &self,
         method: Method,
@@ -75,6 +164,38 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
     "host",
 ];
+
+/// Wrap a plain JSON chat-completion body into a minimal synthetic SSE stream.
+/// Used when a backend ignores `stream: true` and returns JSON directly.
+fn json_to_sse(json: &str) -> String {
+    // Convert `chat.completion` → `chat.completion.chunk` and
+    // `message` → `delta` so the assembler sees a normal chunk stream.
+    let mut sse = String::with_capacity(json.len() + 32);
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "object".to_string(),
+                serde_json::Value::String("chat.completion.chunk".to_string()),
+            );
+            if let Some(choices) = obj.get_mut("choices").and_then(serde_json::Value::as_array_mut) {
+                for choice in choices.iter_mut() {
+                    if let Some(c) = choice.as_object_mut() {
+                        if let Some(msg) = c.remove("message") {
+                            c.insert("delta".to_string(), msg);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(s) = serde_json::to_string(&value) {
+            sse.push_str("data: ");
+            sse.push_str(&s);
+            sse.push_str("\n\n");
+        }
+    }
+    sse.push_str("data: [DONE]\n\n");
+    sse
+}
 
 /// POST a body to the backend and return the status, filtered response headers,
 /// and the fully-buffered body. Errors are mapped to a client-facing response.

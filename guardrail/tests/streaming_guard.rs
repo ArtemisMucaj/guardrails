@@ -153,10 +153,11 @@ async fn streaming_native_tool_call_is_guarded_and_re_emitted_as_sse() {
     assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
     assert!(done, "stream terminates with [DONE]");
 
-    // The upstream call was forced to buffered mode so the loop could inspect it.
+    // The upstream call is always sent with stream: true so text can be
+    // forwarded live; the proxy assembles tool calls from the SSE chunks.
     let upstream = seen.lock().unwrap();
     assert_eq!(upstream.len(), 1);
-    assert_eq!(upstream[0]["stream"], json!(false));
+    assert_eq!(upstream[0]["stream"], json!(true));
 
     // It is recorded as a guarded tool call, not a streamed passthrough.
     let m = wait_for_model_stats(&db);

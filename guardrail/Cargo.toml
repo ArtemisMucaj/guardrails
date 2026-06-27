@@ -21,6 +21,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+tokio-stream = "0.1"
 async-trait = "0.1"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -33,7 +33,10 @@ pub enum Outcome {
     RespondIntercept,
     /// Retries exhausted and the call was still invalid — the guardrails could
     /// not fix it. This is the population worth triaging.
-    FallbackUnfixed,
+    RetriesExhausted,
+    /// A write-only tool was called on a file that already exists. The model
+    /// was instructed to read the file first and use the edit tool instead.
+    WriteRefused,
     /// The model returned plain text with no tool call to validate.
     PassthroughNoCalls,
     /// A streaming request that declared no tools, forwarded live and unguarded.
@@ -64,7 +67,8 @@ impl Outcome {
             Outcome::Repaired => "repaired",
             Outcome::RecoveredAfterRetry => "recovered_after_retry",
             Outcome::RespondIntercept => "respond_intercept",
-            Outcome::FallbackUnfixed => "fallback_unfixed",
+            Outcome::RetriesExhausted => "retries_exhausted",
+            Outcome::WriteRefused => "write_refused",
             Outcome::PassthroughNoCalls => "passthrough_no_calls",
             Outcome::StreamedPassthrough => "streamed_passthrough",
             Outcome::NonToolPassthrough => "non_tool_passthrough",
@@ -79,12 +83,13 @@ impl Outcome {
     /// path is the model's final *text* answer, not a tool call) and the
     /// no-call outcomes. This is the denominator for the success rate, and is
     /// also formatted into the stats SQL so the two never drift.
-    pub const TOOL_CALL_TAGS: [&'static str; 5] = [
+    pub const TOOL_CALL_TAGS: [&'static str; 6] = [
         "native_valid",
         "rescued",
         "repaired",
         "recovered_after_retry",
-        "fallback_unfixed",
+        "retries_exhausted",
+        "write_refused",
     ];
 
     /// Whether this outcome is a real tool call against a client-declared tool
@@ -93,10 +98,10 @@ impl Outcome {
         Self::TOOL_CALL_TAGS.contains(&self.as_str())
     }
 
-    /// Whether the guardrails produced a usable result. Only `FallbackUnfixed`
-    /// represents an error the guardrails failed to resolve.
+    /// Whether the guardrails produced a usable result. `RetriesExhausted` and
+    /// `WriteRefused` both represent failures the guardrails could not resolve.
     pub fn fixed(self) -> bool {
-        !matches!(self, Outcome::FallbackUnfixed)
+        !matches!(self, Outcome::RetriesExhausted | Outcome::WriteRefused)
     }
 }
 
@@ -108,7 +113,7 @@ pub struct OutcomeRecord {
     pub ts: String,
     pub model: String,
     pub outcome: Outcome,
-    /// Failure category, present only on `FallbackUnfixed`.
+    /// Failure category, present only on `RetriesExhausted`.
     pub error_category: Option<ErrorCategory>,
     /// Rescue parser name, present only on `Rescued`.
     pub parser: Option<String>,
@@ -236,7 +241,7 @@ mod tests {
     #[test]
     fn tool_call_outcomes_are_distinguished_from_passthrough() {
         assert!(Outcome::NativeValid.is_tool_call());
-        assert!(Outcome::FallbackUnfixed.is_tool_call());
+        assert!(Outcome::RetriesExhausted.is_tool_call());
         assert!(!Outcome::PassthroughNoCalls.is_tool_call());
         assert!(!Outcome::StreamedPassthrough.is_tool_call());
         assert!(!Outcome::NonToolPassthrough.is_tool_call());
@@ -258,7 +263,7 @@ mod tests {
         assert!(Outcome::Rescued.fixed());
         assert!(Outcome::Repaired.fixed());
         assert!(Outcome::RecoveredAfterRetry.fixed());
-        assert!(!Outcome::FallbackUnfixed.fixed());
+        assert!(!Outcome::RetriesExhausted.fixed());
     }
 
     #[test]
@@ -465,7 +470,7 @@ mod sqlite {
                 "SELECT model, \
                     COUNT(*), \
                     SUM(CASE WHEN outcome IN ({in_list}) THEN 1 ELSE 0 END), \
-                    SUM(CASE WHEN outcome = 'fallback_unfixed' THEN 1 ELSE 0 END) \
+                    SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END) \
                  FROM outcomes GROUP BY model ORDER BY model"
             );
             let mut stmt = conn.prepare(&query)?;
@@ -660,7 +665,7 @@ mod sqlite {
             recorder.record(OutcomeRecord {
                 ts: now_rfc3339(),
                 model: "qwen2.5".into(),
-                outcome: Outcome::FallbackUnfixed,
+                outcome: Outcome::RetriesExhausted,
                 error_category: Some(ErrorCategory::MissingArgument),
                 parser: None,
                 tool_name: Some("Edit".into()),
@@ -687,12 +692,12 @@ mod sqlite {
 
             let (outcome, category, fixed): (String, Option<String>, i64) = conn
                 .query_row(
-                    "SELECT outcome, error_category, fixed FROM outcomes WHERE outcome = 'fallback_unfixed'",
+                    "SELECT outcome, error_category, fixed FROM outcomes WHERE outcome = 'retries_exhausted'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(outcome, "fallback_unfixed");
+            assert_eq!(outcome, "retries_exhausted");
             assert_eq!(category.as_deref(), Some("missing_argument"));
             assert_eq!(fixed, 0);
 
@@ -709,7 +714,7 @@ mod sqlite {
             // 2 real tool calls (1 of which is unfixed), plus a respond and a
             // plain-text passthrough that must NOT count as tool calls.
             recorder.record(rec("m", Outcome::NativeValid));
-            recorder.record(rec("m", Outcome::FallbackUnfixed));
+            recorder.record(rec("m", Outcome::RetriesExhausted));
             recorder.record(rec("m", Outcome::RespondIntercept));
             recorder.record(rec("m", Outcome::PassthroughNoCalls));
             drop(recorder); // flushes

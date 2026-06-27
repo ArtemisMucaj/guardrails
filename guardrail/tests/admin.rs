@@ -98,7 +98,7 @@ async fn stats_returns_the_metrics_rollup_as_json() {
         error_category: Some(ErrorCategory::MissingArgument),
         detail: Some("missing filePath | args: {}".into()),
         retries: 2,
-        ..rec("m", Outcome::FallbackUnfixed)
+        ..rec("m", Outcome::RetriesExhausted)
     });
     recorder.record(rec("m", Outcome::RespondIntercept));
     recorder.record(rec("m", Outcome::PassthroughNoCalls));

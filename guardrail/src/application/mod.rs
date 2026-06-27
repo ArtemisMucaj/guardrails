@@ -537,7 +537,23 @@ fn completion_to_sse(value: &Value) -> Vec<u8> {
         if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
             for choice in choices {
                 if let Some(choice_obj) = choice.as_object_mut() {
-                    if let Some(message) = choice_obj.remove("message") {
+                    if let Some(mut message) = choice_obj.remove("message") {
+                        // Add index to each tool_calls entry in the delta so streaming
+                        // clients can merge them properly per OpenAI spec.
+                        if let Some(message_obj) = message.as_object_mut() {
+                            if let Some(tool_calls) = message_obj.get_mut("tool_calls") {
+                                if let Some(calls_array) = tool_calls.as_array_mut() {
+                                    for (i, call) in calls_array.iter_mut().enumerate() {
+                                        if let Some(call_obj) = call.as_object_mut() {
+                                            call_obj.insert(
+                                                "index".to_string(),
+                                                Value::Number(i.into()),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         choice_obj.insert("delta".to_string(), message);
                     }
                 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
     Router,
@@ -120,11 +120,9 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             }
         };
 
-        // Chat-completions POSTs are parsed once and split three ways: guarded
-        // (non-streaming, tool-enabled) requests enter the loop; streaming and
-        // non-tool requests are forwarded unchanged but still recorded, so stats
-        // reflects all chat traffic — not only the guarded slice. Other routes
-        // (e.g. GET /v1/models) forward without a metrics row.
+        // Chat-completions POSTs are parsed once and dispatched by whether they
+        // declared tools — the only requests that can produce a tool call to
+        // guard. Other routes (e.g. GET /v1/models) forward without a metrics row.
         let chat_request = if parts.method == axum::http::Method::POST
             && parts.uri.path() == "/v1/chat/completions"
         {
@@ -133,13 +131,30 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             None
         };
 
-        if let Some(request) = chat_request {
-            if request.has_tools() && !request.stream() {
-                return guardrail_loop(&state, &target, &parts.headers, request).await;
+        if let Some(mut request) = chat_request {
+            if request.has_tools() {
+                // Tool-enabled requests are guarded whether or not the client
+                // asked to stream. A streamed response cannot be inspected chunk
+                // by chunk, so force the upstream call to buffered mode, run the
+                // loop on the whole response, and re-emit the guarded result as
+                // SSE below — the client's `stream: true` contract is preserved,
+                // it just no longer streams token by token on tool-calling turns.
+                let client_stream = request.stream();
+                if client_stream {
+                    request
+                        .rest
+                        .insert("stream".to_string(), Value::Bool(false));
+                }
+                let result = guardrail_loop(&state, &target, &parts.headers, request).await;
+                return if client_stream {
+                    result.into_sse_response()
+                } else {
+                    result.into_json_response()
+                };
             }
-            // Forwarded unguarded: the proxy does not buffer or inspect SSE, and a
-            // request with no tools has no tool call to check. Record why so the
-            // bulk of real (usually streamed) traffic is visible in stats.
+            // No tools means no tool call to guard. Record why the request was
+            // forwarded unguarded so the bulk of real (often streamed) traffic is
+            // visible in stats instead of an empty report.
             let outcome = if request.stream() {
                 Outcome::StreamedPassthrough
             } else {
@@ -171,7 +186,7 @@ async fn guardrail_loop(
     target: &str,
     headers: &HeaderMap,
     mut request: ChatRequest,
-) -> Response {
+) -> GuardResult {
     let g = state.guardrails;
     // Only own the `respond` tool when the client hasn't defined one itself;
     // otherwise we'd hijack the client's real tool calls as final text.
@@ -225,7 +240,9 @@ async fn guardrail_loop(
                     tracker.attempts(),
                     None,
                 );
-                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                return GuardResult::Ready(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+                );
             }
         };
 
@@ -240,7 +257,7 @@ async fn guardrail_loop(
                     tracker.attempts(),
                     None,
                 );
-                return resp;
+                return GuardResult::Ready(resp);
             }
         };
 
@@ -249,7 +266,11 @@ async fn guardrail_loop(
             Err(e) => {
                 warn!(error = %e, "backend response was not JSON; forwarding unverified");
                 emit(Outcome::NonJson, None, None, None, tracker.attempts(), None);
-                return bytes_response(status, out_headers, bytes);
+                return GuardResult::Verbatim {
+                    status,
+                    headers: out_headers,
+                    bytes,
+                };
             }
         };
 
@@ -278,7 +299,11 @@ async fn guardrail_loop(
                 tracker.attempts(),
                 None,
             );
-            return bytes_response(status, out_headers, bytes);
+            return GuardResult::Verbatim {
+                status,
+                headers: out_headers,
+                bytes,
+            };
         };
 
         if respond_active {
@@ -298,7 +323,11 @@ async fn guardrail_loop(
                     tracker.attempts(),
                     None,
                 );
-                return json_response(status, out_headers, &response_with_text(&value, &text));
+                return GuardResult::Rebuilt {
+                    status,
+                    headers: out_headers,
+                    value: response_with_text(&value, &text),
+                };
             }
         }
 
@@ -343,13 +372,17 @@ async fn guardrail_loop(
                     None,
                 );
                 return if rescued || repaired {
-                    json_response(
+                    GuardResult::Rebuilt {
                         status,
-                        out_headers,
-                        &response_with_tool_calls(&value, &calls),
-                    )
+                        headers: out_headers,
+                        value: response_with_tool_calls(&value, &calls),
+                    }
                 } else {
-                    bytes_response(status, out_headers, bytes)
+                    GuardResult::Verbatim {
+                        status,
+                        headers: out_headers,
+                        bytes,
+                    }
                 };
             }
             Validation::NeedsRetry {
@@ -388,15 +421,131 @@ async fn guardrail_loop(
                     tracker.attempts(),
                     detail,
                 );
-                return match &last_text {
-                    Some(text) => {
-                        json_response(status, out_headers, &response_with_text(&value, text))
-                    }
-                    None => json_response(status, out_headers, &response_with_text(&value, &nudge)),
+                let text = last_text.as_deref().unwrap_or(&nudge);
+                return GuardResult::Rebuilt {
+                    status,
+                    headers: out_headers,
+                    value: response_with_text(&value, text),
                 };
             }
         }
     }
+}
+
+/// The terminal result of the guardrail loop, kept renderer-agnostic so the same
+/// guarded outcome can be returned either as a normal JSON body (non-streaming
+/// clients) or re-emitted as a single SSE chunk (clients that asked to stream).
+enum GuardResult {
+    /// Backend bytes returned as-is for a JSON client (byte-for-byte: a native
+    /// valid call, a plain-text passthrough, or a non-JSON body). For a streaming
+    /// client these bytes — JSON whenever the loop classified a result — are
+    /// re-encoded as SSE; a non-JSON body is forwarded unchanged.
+    Verbatim {
+        status: StatusCode,
+        headers: HeaderMap,
+        bytes: Vec<u8>,
+    },
+    /// A chat-completion value the loop rebuilt (rescued/repaired tool calls, a
+    /// `respond` unwrap, or a fallback to text). Serialized to JSON or to SSE.
+    Rebuilt {
+        status: StatusCode,
+        headers: HeaderMap,
+        value: Value,
+    },
+    /// A response already built (a backend error passed through, or an internal
+    /// error). Returned verbatim to either kind of client.
+    Ready(Response),
+}
+
+impl GuardResult {
+    /// Render for a non-streaming client: the same bytes/JSON the loop has always
+    /// returned.
+    fn into_json_response(self) -> Response {
+        match self {
+            GuardResult::Verbatim {
+                status,
+                headers,
+                bytes,
+            } => bytes_response(status, headers, bytes),
+            GuardResult::Rebuilt {
+                status,
+                headers,
+                value,
+            } => json_response(status, headers, &value),
+            GuardResult::Ready(response) => response,
+        }
+    }
+
+    /// Render for a client that asked to stream: the guarded chat-completion is
+    /// re-emitted as one SSE chunk followed by `[DONE]`, so the client still
+    /// receives an `text/event-stream` response even though the upstream call was
+    /// buffered to allow guarding.
+    fn into_sse_response(self) -> Response {
+        match self {
+            GuardResult::Rebuilt {
+                status,
+                headers,
+                value,
+            } => sse_response(status, headers, &value),
+            GuardResult::Verbatim {
+                status,
+                headers,
+                bytes,
+            } => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) => sse_response(status, headers, &value),
+                // A non-JSON body could not be guarded; forward it untouched
+                // rather than wrap something we did not parse.
+                Err(_) => bytes_response(status, headers, bytes),
+            },
+            GuardResult::Ready(response) => response,
+        }
+    }
+}
+
+/// Re-emit a buffered chat-completion as a streamed response: one
+/// `chat.completion.chunk` carrying the whole message as a `delta`, then the
+/// terminating `[DONE]` event. The upstream was forced to buffered mode so the
+/// guardrails could inspect the full response; this hands the guarded result
+/// back over the SSE contract the client expects.
+fn sse_response(status: StatusCode, mut headers: HeaderMap, value: &Value) -> Response {
+    let body = completion_to_sse(value);
+    // The buffered upstream reply was `application/json` with its own length; the
+    // re-encoded SSE body is a different size and media type, so drop the stale
+    // content-length and announce the event stream.
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    let mut response = Response::new(axum::body::Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+/// Convert a `chat.completion` object into the bytes of a minimal SSE stream:
+/// the object is relabelled `chat.completion.chunk` and each choice's `message`
+/// is moved to `delta`, then framed as a single `data:` event plus `[DONE]`.
+/// Lenient OpenAI-compatible clients accept a complete delta in one chunk.
+fn completion_to_sse(value: &Value) -> Vec<u8> {
+    let mut chunk = value.clone();
+    if let Some(obj) = chunk.as_object_mut() {
+        obj.insert(
+            "object".to_string(),
+            Value::String("chat.completion.chunk".to_string()),
+        );
+        if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
+            for choice in choices {
+                if let Some(choice_obj) = choice.as_object_mut() {
+                    if let Some(message) = choice_obj.remove("message") {
+                        choice_obj.insert("delta".to_string(), message);
+                    }
+                }
+            }
+        }
+    }
+    let chunk = serde_json::to_string(&chunk).unwrap_or_else(|_| "{}".to_string());
+    format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
 }
 
 fn json_response(status: StatusCode, headers: HeaderMap, value: &Value) -> Response {

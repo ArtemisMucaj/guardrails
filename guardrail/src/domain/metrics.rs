@@ -36,9 +36,11 @@ pub enum Outcome {
     FallbackUnfixed,
     /// The model returned plain text with no tool call to validate.
     PassthroughNoCalls,
-    /// A streaming request, forwarded unguarded. The proxy does not buffer or
-    /// inspect SSE, so the call is never guarded — but the request is still
-    /// recorded so streamed traffic (the bulk of real client load) is visible.
+    /// A streaming request that declared no tools, forwarded live and unguarded.
+    /// With no declared tool there is no tool call to validate; recording it
+    /// keeps streamed chat traffic visible. (Streaming requests that *do* declare
+    /// tools are buffered and guarded like any other tool request — see the
+    /// proxy's dispatch — so they never land here.)
     StreamedPassthrough,
     /// A non-streaming request that declared no tools, forwarded unguarded.
     /// There was no tool call to check, but it is recorded so the report

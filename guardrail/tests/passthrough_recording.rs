@@ -52,7 +52,7 @@ fn wait_for_model_stats(db: &Path) -> ModelStats {
 }
 
 #[tokio::test]
-async fn streaming_tool_request_is_recorded_as_streamed_passthrough() {
+async fn streaming_non_tool_request_is_recorded_as_streamed_passthrough() {
     let backend = MockServer::start().await;
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
                data: [DONE]\n\n";
@@ -65,15 +65,15 @@ async fn streaming_tool_request_is_recorded_as_streamed_passthrough() {
     let db = temp_db("stream");
     let proxy = spawn_proxy_with_recorder(&backend.uri(), &db).await;
 
-    // A streaming request that *does* carry tools: the proxy can't guard a
-    // stream, so it forwards unchanged and records the passthrough.
+    // A streaming request with no tools: there is nothing to guard, so the proxy
+    // forwards it live and records the passthrough. (Streaming requests that *do*
+    // declare tools are buffered and guarded instead — see streaming_guard.rs.)
     let resp = reqwest::Client::new()
         .post(format!("{proxy}/v1/chat/completions"))
         .json(&serde_json::json!({
             "model": "m",
             "messages": [],
-            "stream": true,
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+            "stream": true
         }))
         .send()
         .await
@@ -84,10 +84,7 @@ async fn streaming_tool_request_is_recorded_as_streamed_passthrough() {
     let m = wait_for_model_stats(&db);
     assert_eq!(m.model, "m");
     assert_eq!(m.total, 1);
-    assert_eq!(
-        m.tool_calls, 0,
-        "a streamed call is not a guarded tool call"
-    );
+    assert_eq!(m.tool_calls, 0, "a streamed chat turn is not a tool call");
     assert_eq!(m.errors, 0);
     assert_eq!(m.success_rate(), None);
     assert_eq!(m.by_outcome, vec![("streamed_passthrough".to_string(), 1)]);

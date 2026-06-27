@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.4.0...v0.5.0) (2026-06-27)
+
+
+### Features
+
+* **metrics:** fix the metrics DB path, drop the override knob ([#11](https://github.com/ArtemisMucaj/guardrails/issues/11)) ([041f555](https://github.com/ArtemisMucaj/guardrails/commit/041f555bd838c7942bd4fa4729cbd05e703d83c6))
+
 ## [0.4.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.3.0...v0.4.0) (2026-06-27)
 
 

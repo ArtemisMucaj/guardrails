@@ -10,8 +10,12 @@ and repaired before the response reaches the client.
 
 ## What It Does
 
-- Forwards non-tool and streaming requests without rewriting the request or
-  response body.
+- Forwards requests that declare no tools — including streamed ones — without
+  rewriting the request or response body.
+- Guards tool-enabled requests even when the client asked to stream: the upstream
+  call is buffered so the response can be checked, then the guarded result is
+  re-emitted to the client as SSE (the `stream: true` contract is preserved; a
+  tool-calling turn just no longer streams token by token).
 - Normalizes valid tool calls into OpenAI's `tool_calls` shape.
 - Recovers tool calls from model text formats such as Qwen, Qwen-Coder, Hermes,
   Llama, Mistral, LiquidAI LFM2 / LFM2.5 (Pythonic or JSON calls wrapped in
@@ -40,10 +44,10 @@ and repaired before the response reaches the client.
 OpenAI client -> guardrail proxy -> LM Studio or another OpenAI-compatible server
 ```
 
-For requests without tools, or requests with `stream: true`, guardrails forwards
-bytes directly.
+Requests that declare no tools are forwarded bytes-for-bytes, streamed or not —
+there is no tool call to check.
 
-For tool-enabled, non-streaming requests, guardrails runs this loop:
+Tool-enabled requests run this loop, whether or not the client asked to stream:
 
 ```text
 backend response -> decode -> rescue -> validate -> retry or return
@@ -51,7 +55,9 @@ backend response -> decode -> rescue -> validate -> retry or return
 
 Valid native tool calls pass through unchanged. Rescued tool calls are re-emitted
 in canonical OpenAI format. Invalid calls are retried up to the configured retry
-budget.
+budget. When the client asked to stream, the upstream call is sent in buffered
+(non-streaming) mode so the whole response can be inspected, and the guarded
+result is re-emitted as a single SSE chunk followed by `[DONE]`.
 
 ## Install And Run
 
@@ -94,8 +100,12 @@ cargo run -p guardrail -- --max-retries 0
 
 ## Failure Metrics
 
-Metrics are always on. The proxy records one row per guarded request to the
-`outcomes` table in `~/.guardrails/guardrails.sql`. The database is a general
+Metrics are always on. The proxy records one row per chat-completions request
+to the `outcomes` table in `~/.guardrails/guardrails.sql`: tool-enabled requests
+(streamed or not) get their terminal guarded outcome, while requests that declare
+no tools — which have no tool call to check — are recorded as passthroughs, so
+the report reflects all chat traffic instead of being empty for clients that only
+ever stream. The database is a general
 SQLite file — `outcomes` is created with `CREATE TABLE IF NOT EXISTS`, so other
 tables can live alongside it. Recording happens on a background writer thread, so
 it never blocks the proxy's response path, and the database uses WAL mode so you
@@ -117,6 +127,8 @@ Outcomes:
 | `respond_intercept` | Synthetic `respond` tool carried the final text. | 1 |
 | `fallback_unfixed` | Retries exhausted, still invalid — the errors to triage. | 0 |
 | `passthrough_no_calls` | Model returned plain text, no tool call to check. | 1 |
+| `streamed_passthrough` | Streaming request with no tools, forwarded live (nothing to guard). | 1 |
+| `non_tool_passthrough` | Non-streaming request with no tools, forwarded unguarded. | 1 |
 | `non_json` | Backend response was not JSON; forwarded unverified. | 1 |
 
 Error categories (on `fallback_unfixed`): `unknown_tool`, `bad_arguments`,
@@ -155,10 +167,12 @@ Errors (triage list)
         The arguments for tool "Edit" were missing required field "filePath". … | args: {"oldString":"a","newString":"b"}
 ```
 
-`total` counts every guarded request, so it includes plain-text answers
-(`passthrough_no_calls`) and final answers routed through the synthetic
-`respond` tool (`respond_intercept`). Neither is a real tool call, so both are
-excluded from `tool calls` and from the success rate.
+`total` counts every chat-completions request the proxy saw, so it includes
+plain-text answers (`passthrough_no_calls`), final answers routed through the
+synthetic `respond` tool (`respond_intercept`), and the streaming / non-tool
+requests forwarded unguarded (`streamed_passthrough`, `non_tool_passthrough`).
+None of these is a real tool call, so all are excluded from `tool calls` and
+from the success rate.
 
 The sink is abstracted behind a `Recorder` trait, so an OpenTelemetry / OTLP
 exporter can be added later as a second implementation without changing the

@@ -17,7 +17,7 @@ async fn spawn_admin(db_path: std::path::PathBuf) -> String {
         proxy_listen: "127.0.0.1:8080".into(),
         admin_listen: "127.0.0.1:8081".into(),
         max_retries: 2,
-        metrics_db: db_path.display().to_string(),
+        database: db_path.display().to_string(),
     };
     let app = build_admin_app(AdminState::new(db_path, info));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,7 +83,7 @@ async fn stats_for_a_missing_database_is_empty() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["per_model"].as_array().unwrap().len(), 0);
-    assert_eq!(body["unfixed"].as_array().unwrap().len(), 0);
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -127,9 +127,9 @@ async fn stats_returns_the_metrics_rollup_as_json() {
         .any(|o| o["outcome"] == "native_valid" && o["count"] == 1));
 
     // The single unfixed error is surfaced for triage.
-    let unfixed = &body["unfixed"][0];
-    assert_eq!(unfixed["model"], "m");
-    assert_eq!(unfixed["tool_name"], "Edit");
-    assert_eq!(unfixed["error_category"], "missing_argument");
-    assert_eq!(unfixed["count"], 1);
+    let err = &body["errors"][0];
+    assert_eq!(err["model"], "m");
+    assert_eq!(err["tool_name"], "Edit");
+    assert_eq!(err["error_category"], "missing_argument");
+    assert_eq!(err["count"], 1);
 }

@@ -261,7 +261,7 @@ mod tests {
     }
 }
 
-pub use sqlite::{default_db_path, ModelStats, SqliteRecorder, Stats, UnfixedError};
+pub use sqlite::{default_db_path, ErrorGroup, ModelStats, SqliteRecorder, Stats};
 
 mod sqlite {
     use std::path::Path;
@@ -389,9 +389,10 @@ mod sqlite {
         }
     }
 
-    /// One group of unfixed errors awaiting triage.
+    /// One group of identical errors the guardrails could not fix, awaiting
+    /// triage.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct UnfixedError {
+    pub struct ErrorGroup {
         pub model: String,
         pub error_category: Option<String>,
         pub tool_name: Option<String>,
@@ -399,11 +400,11 @@ mod sqlite {
         pub count: i64,
     }
 
-    /// A full read of the metrics database for the `stats` command.
+    /// A full read of the guardrails database for the `stats` command.
     #[derive(Debug, Clone, Default)]
     pub struct Stats {
         pub per_model: Vec<ModelStats>,
-        pub unfixed: Vec<UnfixedError>,
+        pub errors: Vec<ErrorGroup>,
     }
 
     impl Stats {
@@ -476,15 +477,16 @@ mod sqlite {
                 }
             }
 
-            // Unfixed errors, grouped for triage, most frequent first.
+            // Errors the guardrails could not fix, grouped for triage, most
+            // frequent first.
             let mut stmt = conn.prepare(
                 "SELECT model, error_category, tool_name, detail, COUNT(*) AS n \
                  FROM outcomes WHERE fixed = 0 \
                  GROUP BY model, error_category, tool_name, detail \
                  ORDER BY n DESC, model",
             )?;
-            let unfixed = stmt.query_map([], |r| {
-                Ok(UnfixedError {
+            let errors = stmt.query_map([], |r| {
+                Ok(ErrorGroup {
                     model: r.get(0)?,
                     error_category: r.get(1)?,
                     tool_name: r.get(2)?,
@@ -492,9 +494,9 @@ mod sqlite {
                     count: r.get(4)?,
                 })
             })?;
-            let unfixed: Vec<UnfixedError> = unfixed.collect::<rusqlite::Result<_>>()?;
+            let errors: Vec<ErrorGroup> = errors.collect::<rusqlite::Result<_>>()?;
 
-            Ok(Self { per_model, unfixed })
+            Ok(Self { per_model, errors })
         }
 
         /// Render a plain-text report for the CLI.
@@ -528,12 +530,12 @@ mod sqlite {
                 }
             }
 
-            out.push_str("\nUnfixed errors (triage list)\n");
-            out.push_str("============================\n");
-            if self.unfixed.is_empty() {
+            out.push_str("\nErrors (triage list)\n");
+            out.push_str("====================\n");
+            if self.errors.is_empty() {
                 out.push_str("  none — every tool call was delivered valid.\n");
             } else {
-                for e in &self.unfixed {
+                for e in &self.errors {
                     let _ = writeln!(
                         out,
                         "\n  [{}x] {} / {} / {}",

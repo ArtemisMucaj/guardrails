@@ -57,9 +57,9 @@ pub enum Command {
 }
 
 impl Config {
-    /// Path to the SQLite failure-metrics database, fixed at
+    /// Path to the SQLite guardrails database, fixed at
     /// `~/.guardrails/guardrails.sql`.
-    pub fn metrics_db_path(&self) -> PathBuf {
+    pub fn database_path(&self) -> PathBuf {
         default_db_path()
     }
 }

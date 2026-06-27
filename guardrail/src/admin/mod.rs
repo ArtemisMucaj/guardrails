@@ -7,7 +7,7 @@
 //! description of how the running proxy is configured.
 //!
 //! It is deliberately decoupled from the request hot path. Every `/stats` read
-//! goes straight to the SQLite metrics database — the same single source of
+//! goes straight to the SQLite guardrails database — the same single source of
 //! truth the `stats` CLI subcommand reads — so the admin server holds no
 //! in-memory counters that could drift from the proxy, and querying it never
 //! contends with the proxy's response path (the database runs in WAL mode, so
@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::domain::metrics::{ModelStats, Stats, UnfixedError};
+use crate::domain::metrics::{ErrorGroup, ModelStats, Stats};
 
 /// Static description of the running proxy, surfaced at `/info` so an embedding
 /// UI can show what it is connected to without parsing logs. Holds nothing
@@ -45,8 +45,8 @@ pub struct AdminInfo {
     pub admin_listen: String,
     /// Maximum corrective retries per guarded request.
     pub max_retries: u32,
-    /// Filesystem path of the SQLite metrics database the stats are read from.
-    pub metrics_db: String,
+    /// Filesystem path of the SQLite guardrails database the stats are read from.
+    pub database: String,
 }
 
 /// Shared state for the admin router: where to read metrics from, and the
@@ -122,10 +122,10 @@ async fn stats(State(state): State<AdminState>) -> Response {
     match Stats::read(&state.db_path) {
         Ok(stats) => Json(StatsResponse::from(stats)).into_response(),
         Err(e) => {
-            error!(error = %e, "admin: failed to read metrics database");
+            error!(error = %e, "admin: failed to read guardrails database");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to read metrics database" })),
+                Json(json!({ "error": "failed to read guardrails database" })),
             )
                 .into_response()
         }
@@ -141,7 +141,7 @@ async fn stats(State(state): State<AdminState>) -> Response {
 #[derive(Serialize)]
 struct StatsResponse {
     per_model: Vec<ModelStatsDto>,
-    unfixed: Vec<UnfixedErrorDto>,
+    errors: Vec<ErrorGroupDto>,
 }
 
 #[derive(Serialize)]
@@ -164,7 +164,7 @@ struct OutcomeCount {
 }
 
 #[derive(Serialize)]
-struct UnfixedErrorDto {
+struct ErrorGroupDto {
     model: String,
     error_category: Option<String>,
     tool_name: Option<String>,
@@ -176,7 +176,7 @@ impl From<Stats> for StatsResponse {
     fn from(s: Stats) -> Self {
         Self {
             per_model: s.per_model.into_iter().map(ModelStatsDto::from).collect(),
-            unfixed: s.unfixed.into_iter().map(UnfixedErrorDto::from).collect(),
+            errors: s.errors.into_iter().map(ErrorGroupDto::from).collect(),
         }
     }
 }
@@ -202,8 +202,8 @@ impl From<ModelStats> for ModelStatsDto {
     }
 }
 
-impl From<UnfixedError> for UnfixedErrorDto {
-    fn from(e: UnfixedError) -> Self {
+impl From<ErrorGroup> for ErrorGroupDto {
+    fn from(e: ErrorGroup) -> Self {
         Self {
             model: e.model,
             error_category: e.error_category,

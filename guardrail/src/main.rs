@@ -38,13 +38,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Metrics are always on; they record to `~/.guardrails/guardrails.sql`. A
     // failure to open the database must not stop the proxy.
-    let metrics_path = cfg.metrics_db_path();
+    let db_path = cfg.database_path();
     let recorder: guardrail::domain::metrics::SharedRecorder = match SqliteRecorder::open(
-        &metrics_path,
+        &db_path,
     ) {
         Ok(recorder) => Arc::new(recorder),
         Err(e) => {
-            tracing::warn!(error = %e, path = %metrics_path.display(), "metrics disabled: could not open database");
+            tracing::warn!(error = %e, path = %db_path.display(), "metrics disabled: could not open database");
             Arc::new(guardrail::domain::metrics::NoopRecorder)
         }
     };
@@ -80,9 +80,9 @@ async fn main() -> anyhow::Result<()> {
             proxy_listen: cfg.listen.to_string(),
             admin_listen: admin_addr.to_string(),
             max_retries: guardrails.max_retries,
-            metrics_db: metrics_path.display().to_string(),
+            database: db_path.display().to_string(),
         };
-        let admin_app = build_admin_app(AdminState::new(metrics_path, info));
+        let admin_app = build_admin_app(AdminState::new(db_path, info));
         let admin = axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal());
 
         info!(admin_listen = %admin_addr, "admin server starting");

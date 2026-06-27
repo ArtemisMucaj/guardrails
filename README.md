@@ -128,8 +128,8 @@ The `stats` subcommand reads the database and prints a text report in a
 **total → tool calls → errors** hierarchy per model: every guarded request
 (`total`), how many were a real tool call (`tool calls`), how many of those the
 guardrails could not fix (`errors`), the success rate over tool calls, the full
-outcome breakdown, and the triage list of unfixed errors (with a redacted
-argument snippet):
+outcome breakdown, and the triage list of errors (with a redacted argument
+snippet):
 
 ```bash
 cargo run -p guardrail -- stats
@@ -148,8 +148,8 @@ qwen2.5-7b
     respond_intercept       14
     passthrough_no_calls    12
 
-Unfixed errors (triage list)
-============================
+Errors (triage list)
+====================
 
   [3x] qwen2.5-7b / missing_argument / Edit
         The arguments for tool "Edit" were missing required field "filePath". … | args: {"oldString":"a","newString":"b"}
@@ -186,11 +186,11 @@ authenticated.
 | Method & path | Returns |
 | --- | --- |
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
-| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `metrics_db` path. |
+| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
 | `GET /` | Lists the available endpoints. |
 
-`GET /stats` reads the SQLite database on each request — the same source the
+`GET /stats` reads the guardrails database on each request — the same source the
 `stats` subcommand reads — so the response is always current and the admin
 server holds no in-memory counters that could drift from the proxy. Because the
 database runs in WAL mode, these reads never block the proxy's writes.
@@ -211,7 +211,7 @@ database runs in WAL mode, these reads never block the proxy's writes.
       ]
     }
   ],
-  "unfixed": [
+  "errors": [
     {
       "model": "qwen2.5-7b",
       "error_category": "missing_argument",

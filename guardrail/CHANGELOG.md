@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.3.0...v0.4.0) (2026-06-27)
+
+
+### Features
+
+* **metrics:** record per-model tool-call outcomes to local SQLite ([#9](https://github.com/ArtemisMucaj/guardrails/issues/9)) ([096f9b8](https://github.com/ArtemisMucaj/guardrails/commit/096f9b806221387f4959df7e8c9016cd790d227b))
+
 ## [0.3.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.2.0...v0.3.0) (2026-06-26)
 
 

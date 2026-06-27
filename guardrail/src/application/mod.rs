@@ -196,13 +196,31 @@ async fn guardrail_loop(
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "failed to serialize guardrail request");
+                emit(
+                    Outcome::InternalError,
+                    None,
+                    None,
+                    None,
+                    tracker.attempts(),
+                    None,
+                );
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         };
 
         let (status, out_headers, bytes) = match state.port.post(target, headers, body).await {
             Ok(parts) => parts,
-            Err(resp) => return resp,
+            Err(resp) => {
+                emit(
+                    Outcome::BackendError,
+                    None,
+                    None,
+                    None,
+                    tracker.attempts(),
+                    None,
+                );
+                return resp;
+            }
         };
 
         let value: Value = match serde_json::from_slice(&bytes) {
@@ -313,7 +331,11 @@ async fn guardrail_loop(
                     bytes_response(status, out_headers, bytes)
                 };
             }
-            Validation::NeedsRetry { category, nudge } => {
+            Validation::NeedsRetry {
+                category,
+                nudge,
+                offending,
+            } => {
                 if tracker.can_retry() {
                     tracker.record_retry();
                     warn!(attempt = tracker.attempts(), %nudge, "tool call invalid; retrying");
@@ -325,8 +347,10 @@ async fn guardrail_loop(
                 warn!("tool call invalid and retries exhausted; falling back");
                 // The guardrails could not fix this call. Capture the category,
                 // the offending tool, and a redacted argument snippet so it can be
-                // triaged and fixed in the tool later.
-                let offending = calls.first();
+                // triaged and fixed in the tool later. `validate` stops at the
+                // first invalid call, so attribute the row to *that* call (which
+                // may not be the first) rather than `calls.first()`.
+                let offending = calls.get(offending);
                 let detail = offending.map(|c| {
                     let snippet = redact_args(&c.arguments);
                     if snippet.is_empty() {

@@ -36,11 +36,13 @@ pub enum Validation {
     /// Every call names a declared tool and carries object arguments.
     Valid,
     /// At least one call is malformed but the situation is recoverable by asking
-    /// the model to try again. Carries the failure category (for metrics) and
-    /// the nudge text to feed back.
+    /// the model to try again. Carries the failure category (for metrics), the
+    /// nudge text to feed back, and the index of the offending call (so metrics
+    /// attribute the failure to the right tool, not just the first call).
     NeedsRetry {
         category: ErrorCategory,
         nudge: String,
+        offending: usize,
     },
 }
 
@@ -52,17 +54,19 @@ pub enum Validation {
 ///
 /// [`decode`]: crate::domain::decode::decode_response
 pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
-    for call in calls {
+    for (offending, call) in calls.iter().enumerate() {
         let Some(tool) = tools.iter().find(|tool| tool.function.name == call.name) else {
             return Validation::NeedsRetry {
                 category: ErrorCategory::UnknownTool,
                 nudge: unknown_tool_nudge(&call.name, tools),
+                offending,
             };
         };
         let Some(arguments) = arguments_object(&call.arguments) else {
             return Validation::NeedsRetry {
                 category: ErrorCategory::BadArguments,
                 nudge: bad_arguments_nudge(&call.name),
+                offending,
             };
         };
         for required in required_parameters(tool) {
@@ -70,6 +74,7 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
                 return Validation::NeedsRetry {
                     category: ErrorCategory::MissingArgument,
                     nudge: missing_argument_nudge(&call.name, required),
+                    offending,
                 };
             }
         }
@@ -84,6 +89,7 @@ pub fn validate(calls: &[ToolCall], tools: &[Tool]) -> Validation {
                         return Validation::NeedsRetry {
                             category: ErrorCategory::WrongType,
                             nudge: wrong_type_nudge(&call.name, key, declared),
+                            offending,
                         };
                     }
                 }
@@ -482,6 +488,22 @@ mod tests {
         };
         // The unknown-name problem comes first in the slice.
         assert!(nudge.contains("bad_name"));
+    }
+
+    #[test]
+    fn offending_index_points_at_the_failing_call_not_the_first() {
+        // First call is valid; the second is the bad one. Metrics must attribute
+        // the failure to index 1, not 0.
+        let calls = [
+            call("get_weather", "{\"city\":\"Paris\"}"),
+            call("unknown_tool", "{}"),
+        ];
+        let Validation::NeedsRetry { offending, .. } =
+            validate(&calls, &[tool("get_weather", &[])])
+        else {
+            panic!("expected NeedsRetry");
+        };
+        assert_eq!(offending, 1);
     }
 
     // ── Argument coercion ────────────────────────────────────────────────────

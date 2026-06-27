@@ -38,6 +38,11 @@ pub enum Outcome {
     PassthroughNoCalls,
     /// The backend response was not JSON and was forwarded unverified.
     NonJson,
+    /// The backend request itself failed (connection refused, timeout, …); the
+    /// proxy never received a response to guard.
+    BackendError,
+    /// The proxy could not serialize the (re)built request — an internal error.
+    InternalError,
 }
 
 impl Outcome {
@@ -52,6 +57,8 @@ impl Outcome {
             Outcome::FallbackUnfixed => "fallback_unfixed",
             Outcome::PassthroughNoCalls => "passthrough_no_calls",
             Outcome::NonJson => "non_json",
+            Outcome::BackendError => "backend_error",
+            Outcome::InternalError => "internal_error",
         }
     }
 
@@ -121,20 +128,48 @@ impl Recorder for NoopRecorder {
 /// Shared handle to whichever recorder the proxy is running with.
 pub type SharedRecorder = Arc<dyn Recorder>;
 
-/// Truncate a tool-call argument string to a bounded, single-line snippet so the
-/// stored `detail` stays small and never carries unbounded model output.
+/// Build a privacy-preserving, single-line snippet of a tool call's arguments
+/// for triage.
+///
+/// Argument *values* can carry secrets or PII, and metrics are always on, so
+/// values are never stored verbatim. A JSON object is reduced to its keys with
+/// each value replaced by a type/size tag (`<str:LEN>`, `<number>`, `<array:N>`,
+/// …); anything that does not parse as a JSON object becomes a bare
+/// `<non-object: N chars>` marker. Knowing which fields were present and their
+/// shape is what makes a fallback row actionable — the concrete values are not.
 pub fn redact_args(arguments: &str) -> String {
     const MAX: usize = 200;
-    let flattened: String = arguments
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let trimmed = flattened.trim();
-    if trimmed.chars().count() > MAX {
-        let head: String = trimmed.chars().take(MAX).collect();
+    let snippet = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(map)) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", redact_value(value)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        // Not an object (or unparseable): keep only a length marker, never the
+        // raw text — the `bad_arguments` case routinely lands here.
+        _ => format!("<non-object: {} chars>", arguments.chars().count()),
+    };
+    if snippet.chars().count() > MAX {
+        let head: String = snippet.chars().take(MAX).collect();
         format!("{head}…")
     } else {
-        trimmed.to_string()
+        snippet
+    }
+}
+
+/// A non-revealing tag describing a JSON value's type and size (never its
+/// contents).
+fn redact_value(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(_) => "<bool>".to_string(),
+        Value::Number(_) => "<number>".to_string(),
+        Value::String(s) => format!("<str:{}>", s.chars().count()),
+        Value::Array(a) => format!("<array:{}>", a.len()),
+        Value::Object(o) => format!("<object:{}>", o.len()),
     }
 }
 
@@ -192,6 +227,8 @@ mod tests {
         assert!(Outcome::FallbackUnfixed.is_tool_call());
         assert!(!Outcome::PassthroughNoCalls.is_tool_call());
         assert!(!Outcome::NonJson.is_tool_call());
+        assert!(!Outcome::BackendError.is_tool_call());
+        assert!(!Outcome::InternalError.is_tool_call());
     }
 
     #[test]
@@ -203,13 +240,24 @@ mod tests {
     }
 
     #[test]
-    fn redact_args_flattens_and_bounds() {
-        assert_eq!(redact_args("  {\"a\":1}\n "), "{\"a\":1}");
-        assert!(!redact_args("line1\nline2").contains('\n'));
-        let long = "x".repeat(500);
-        let out = redact_args(&long);
-        assert!(out.ends_with('…'));
-        assert_eq!(out.chars().count(), 201); // 200 + ellipsis
+    fn redact_args_keeps_shape_but_never_values() {
+        // Object: keys are kept (sorted by serde_json's BTreeMap), values become
+        // type/size tags. "/etc/secret" is 11 chars.
+        assert_eq!(
+            redact_args("{\"filePath\":\"/etc/secret\",\"count\":3}"),
+            "{count: <number>, filePath: <str:11>}"
+        );
+        // The raw secret value never appears in the snippet.
+        assert!(!redact_args("{\"token\":\"sk-abc123xyz\"}").contains("sk-abc123xyz"));
+        // Non-object (or unparseable) input is reduced to a length marker, with
+        // no raw content and no newlines.
+        let r = redact_args("not json, has a secret\nvalue");
+        assert!(r.starts_with("<non-object:"));
+        assert!(!r.contains("secret"));
+        assert!(!r.contains('\n'));
+        // Output stays bounded.
+        let long = format!("{{\"k\":\"{}\"}}", "x".repeat(500));
+        assert!(redact_args(&long).chars().count() <= 201);
     }
 }
 

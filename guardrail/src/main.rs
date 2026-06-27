@@ -20,10 +20,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::parse();
 
-    // `stats` reads the database and prints a report instead of starting the proxy.
+    // `stats` reads the database and prints a report instead of starting the
+    // proxy. Honor an override given either after the subcommand
+    // (`stats --metrics-db X`) or before it (`--metrics-db X stats`).
     if let Some(Command::Stats { metrics_db }) = &cfg.command {
         let path = metrics_db
             .clone()
+            .or_else(|| cfg.metrics_db.clone())
             .unwrap_or_else(guardrail::domain::metrics::default_db_path);
         print!("{}", Stats::read(&path)?.render());
         return Ok(());

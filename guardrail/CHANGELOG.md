@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.5.0...v0.6.0) (2026-06-27)
+
+
+### Features
+
+* **admin:** expose a read-only admin HTTP server on a separate port ([#13](https://github.com/ArtemisMucaj/guardrails/issues/13)) ([c2a708b](https://github.com/ArtemisMucaj/guardrails/commit/c2a708b6d10fd4b9e5754e29a7ca7ab78a9de875))
+
 ## [0.5.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.4.0...v0.5.0) (2026-06-27)
 
 

@@ -83,7 +83,7 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
-| `--metrics-db` | `GUARDRAIL_METRICS_DB` | `~/.guardrails/stats.sqlite` | Path to the SQLite failure-metrics database. One row is recorded per guarded request. |
+| `--metrics-db` | `GUARDRAIL_METRICS_DB` | `~/.guardrails/guardrails.sql` | Path to the SQLite database that holds the failure-metrics table. One row is recorded per guarded request. |
 
 Rescue, the synthetic `respond` tool, and the deterministic argument repairs
 are always on. The only knob is the retry budget:
@@ -94,11 +94,13 @@ cargo run -p guardrail -- --max-retries 0
 
 ## Failure Metrics
 
-Metrics are always on. The proxy records one row per guarded request to
-`~/.guardrails/stats.sqlite` (override with `--metrics-db` or
-`GUARDRAIL_METRICS_DB`). Recording happens on a background writer thread, so it
-never blocks the proxy's response path, and the database uses WAL mode so you can
-query it while the proxy runs.
+Metrics are always on. The proxy records one row per guarded request to the
+`outcomes` table in `~/.guardrails/guardrails.sql` (override with `--metrics-db`
+or `GUARDRAIL_METRICS_DB`). The database is a general SQLite file — `outcomes`
+is created with `CREATE TABLE IF NOT EXISTS`, so other tables can live alongside
+it. Recording happens on a background writer thread, so it never blocks the
+proxy's response path, and the database uses WAL mode so you can query it while
+the proxy runs.
 
 Each row captures the request's `model`, the terminal `outcome`, an
 `error_category` (for unfixed errors), the rescue `parser`, the offending

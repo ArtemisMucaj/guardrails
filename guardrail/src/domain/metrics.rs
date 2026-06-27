@@ -341,7 +341,7 @@ mod sqlite {
         }
     }
 
-    /// Default metrics database path: `~/.guardrails/stats.sqlite`. The
+    /// Default database path: `~/.guardrails/guardrails.sql`. The
     /// `.guardrails` directory is created if absent. Falls back to the current
     /// directory when no home directory can be determined.
     pub fn default_db_path() -> std::path::PathBuf {
@@ -353,7 +353,7 @@ mod sqlite {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             error!(error = %e, dir = %dir.display(), "failed to create metrics directory");
         }
-        dir.join("stats.sqlite")
+        dir.join("guardrails.sql")
     }
 
     /// Per-model rollup, in the total → tool calls → errors hierarchy.

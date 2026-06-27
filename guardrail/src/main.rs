@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     let guardrails = cfg.guardrails();
 
-    // Metrics are always on; they record to `~/.guardrails/stats.sqlite` unless
+    // Metrics are always on; they record to `~/.guardrails/guardrails.sql` unless
     // a path is given. A failure to open the database must not stop the proxy.
     let metrics_path = cfg.metrics_db_path();
     let recorder: guardrail::domain::metrics::SharedRecorder = match SqliteRecorder::open(

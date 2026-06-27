@@ -44,7 +44,7 @@ pub struct Config {
     pub max_retries: u32,
 
     /// Path to the SQLite failure-metrics database. Defaults to
-    /// `~/.guardrails/stats.sqlite`; one row is recorded per guarded request.
+    /// `~/.guardrails/guardrails.sql`; one row is recorded per guarded request.
     #[arg(long, env = "GUARDRAIL_METRICS_DB")]
     pub metrics_db: Option<PathBuf>,
 }
@@ -53,7 +53,7 @@ pub struct Config {
 pub enum Command {
     /// Print collected failure metrics as text and exit.
     Stats {
-        /// Database to read. Defaults to `~/.guardrails/stats.sqlite`.
+        /// Database to read. Defaults to `~/.guardrails/guardrails.sql`.
         #[arg(long, env = "GUARDRAIL_METRICS_DB")]
         metrics_db: Option<PathBuf>,
     },

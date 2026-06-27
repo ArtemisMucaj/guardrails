@@ -83,7 +83,6 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
-| `--metrics-db` | `GUARDRAIL_METRICS_DB` | `~/.guardrails/guardrails.sql` | Path to the SQLite database that holds the failure-metrics table. One row is recorded per guarded request. |
 
 Rescue, the synthetic `respond` tool, and the deterministic argument repairs
 are always on. The only knob is the retry budget:
@@ -95,12 +94,11 @@ cargo run -p guardrail -- --max-retries 0
 ## Failure Metrics
 
 Metrics are always on. The proxy records one row per guarded request to the
-`outcomes` table in `~/.guardrails/guardrails.sql` (override with `--metrics-db`
-or `GUARDRAIL_METRICS_DB`). The database is a general SQLite file — `outcomes`
-is created with `CREATE TABLE IF NOT EXISTS`, so other tables can live alongside
-it. Recording happens on a background writer thread, so it never blocks the
-proxy's response path, and the database uses WAL mode so you can query it while
-the proxy runs.
+`outcomes` table in `~/.guardrails/guardrails.sql`. The database is a general
+SQLite file — `outcomes` is created with `CREATE TABLE IF NOT EXISTS`, so other
+tables can live alongside it. Recording happens on a background writer thread, so
+it never blocks the proxy's response path, and the database uses WAL mode so you
+can query it while the proxy runs.
 
 Each row captures the request's `model`, the terminal `outcome`, an
 `error_category` (for unfixed errors), the rescue `parser`, the offending
@@ -160,39 +158,6 @@ Unfixed errors (triage list)
 (`passthrough_no_calls`) and final answers routed through the synthetic
 `respond` tool (`respond_intercept`). Neither is a real tool call, so both are
 excluded from `tool calls` and from the success rate.
-
-### Querying directly
-
-The metrics also answer the usual questions with plain SQL. A *tool call* is one
-of `native_valid`, `rescued`, `repaired`, `recovered_after_retry`, or
-`fallback_unfixed` (the same set the report uses):
-
-```sql
--- Total requests, and of those the real tool calls, per model.
-SELECT model,
-       COUNT(*) AS total,
-       SUM(outcome IN ('native_valid','rescued','repaired',
-                       'recovered_after_retry','fallback_unfixed')) AS tool_calls
-FROM outcomes
-GROUP BY model;
-
--- Success vs. error proportion over tool calls, per model.
-SELECT model,
-       SUM(outcome != 'fallback_unfixed') AS succeeded,
-       SUM(outcome = 'fallback_unfixed')  AS errors,
-       1.0 * SUM(outcome != 'fallback_unfixed') / COUNT(*) AS success_rate
-FROM outcomes
-WHERE outcome IN ('native_valid','rescued','repaired',
-                  'recovered_after_retry','fallback_unfixed')
-GROUP BY model;
-
--- Errors the guardrails could not fix, by category — the triage list.
-SELECT model, error_category, tool_name, detail, COUNT(*) AS n
-FROM outcomes
-WHERE fixed = 0
-GROUP BY model, error_category, tool_name, detail
-ORDER BY n DESC;
-```
 
 The sink is abstracted behind a `Recorder` trait, so an OpenTelemetry / OTLP
 exporter can be added later as a second implementation without changing the

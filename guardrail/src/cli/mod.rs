@@ -22,6 +22,12 @@ pub struct Config {
     #[arg(long, env = "GUARDRAIL_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
 
+    /// Address for the read-only admin server (stats, health, info), on a
+    /// separate port from the proxy. Disabled unless set; bind to a loopback
+    /// address (e.g. `127.0.0.1:8081`) so the metrics are not exposed off-host.
+    #[arg(long, env = "GUARDRAIL_ADMIN_LISTEN")]
+    pub admin_listen: Option<SocketAddr>,
+
     /// Base URL of the OpenAI-compatible backend.
     #[arg(
         long,
@@ -51,9 +57,9 @@ pub enum Command {
 }
 
 impl Config {
-    /// Path to the SQLite failure-metrics database, fixed at
+    /// Path to the SQLite guardrails database, fixed at
     /// `~/.guardrails/guardrails.sql`.
-    pub fn metrics_db_path(&self) -> PathBuf {
+    pub fn database_path(&self) -> PathBuf {
         default_db_path()
     }
 }

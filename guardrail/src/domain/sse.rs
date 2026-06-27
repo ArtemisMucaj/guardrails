@@ -11,6 +11,7 @@
 
 use tokio::sync::mpsc;
 use serde_json::Value;
+use tracing::warn;
 
 use super::decode::ToolCall;
 
@@ -31,6 +32,17 @@ pub enum AssembledResponse {
     ToolCalls { calls: Vec<ToolCall>, template: Value },
     /// No native tool calls; accumulated text was parsed by a rescue parser.
     Rescued { parser: &'static str, calls: Vec<ToolCall>, template: Value },
+}
+
+fn fill_slots(slots: &mut Vec<CallSlot>, tool_calls: &[Value]) {
+    for tc in tool_calls {
+        let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if slots.len() <= index { slots.resize_with(index + 1, CallSlot::default); }
+        let slot = &mut slots[index];
+        if let Some(id) = tc.get("id").and_then(Value::as_str) { slot.id = Some(id.to_string()); }
+        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) { slot.name = name.to_string(); }
+        if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) { slot.arguments.push_str(args); }
+    }
 }
 
 /// Parse a single `data:` SSE line into a JSON value.
@@ -102,14 +114,7 @@ where
         {
             signal(false, &kind_tx); // fire early — caller knows it's tool calls
             has_tool_calls = true;
-            for tc in tool_calls {
-                let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if slots.len() <= index { slots.resize_with(index + 1, CallSlot::default); }
-                let slot = &mut slots[index];
-                if let Some(id) = tc.get("id").and_then(Value::as_str) { slot.id = Some(id.to_string()); }
-                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) { slot.name = name.to_string(); }
-                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) { slot.arguments.push_str(args); }
-            }
+            fill_slots(&mut slots, tool_calls);
             template = chunk;
             continue;
         }
@@ -135,8 +140,13 @@ where
 
     if has_tool_calls && !slots.is_empty() {
         // kind was already signalled false (early) on first tool-call delta.
-        let calls = slots.into_iter()
-            .filter(|s| !s.name.is_empty())
+        let (named, unnamed): (Vec<_>, Vec<_>) = slots.into_iter().partition(|s| !s.name.is_empty());
+        if !unnamed.is_empty() {
+            // Incomplete delta stream — the backend never sent a function name
+            // for these slots. Log so it is visible; validation will reject.
+            warn!(dropped = unnamed.len(), "tool call without a function name can't be validated");
+        }
+        let calls = named.into_iter()
             .map(|s| ToolCall {
                 id: s.id,
                 name: s.name,
@@ -176,14 +186,7 @@ where
 
         if let Some(tool_calls) = delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array) {
             has_tool_calls = true;
-            for tc in tool_calls {
-                let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if slots.len() <= index { slots.resize_with(index + 1, CallSlot::default); }
-                let slot = &mut slots[index];
-                if let Some(id) = tc.get("id").and_then(Value::as_str) { slot.id = Some(id.to_string()); }
-                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) { slot.name = name.to_string(); }
-                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) { slot.arguments.push_str(args); }
-            }
+            fill_slots(&mut slots, tool_calls);
             template = chunk;
             continue;
         }
@@ -200,7 +203,11 @@ where
     }
 
     if has_tool_calls && !slots.is_empty() {
-        let calls = slots.into_iter().filter(|s| !s.name.is_empty()).map(|s| ToolCall {
+        let (named, unnamed): (Vec<_>, Vec<_>) = slots.into_iter().partition(|s| !s.name.is_empty());
+        if !unnamed.is_empty() {
+            warn!(dropped = unnamed.len(), "tool call without a function name can't be validated");
+        }
+        let calls = named.into_iter().map(|s| ToolCall {
             id: s.id, name: s.name,
             arguments: if s.arguments.is_empty() { "{}".to_string() } else { s.arguments },
         }).collect();

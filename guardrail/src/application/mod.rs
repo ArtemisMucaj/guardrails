@@ -194,7 +194,7 @@ async fn guardrail_loop(
     // - passthrough_tx/passthrough_rx: used when the backend returns a non-SSE/non-JSON
     //   body that must be forwarded verbatim (can't go through the SSE channel).
     let (body_tx, body_rx) = mpsc::channel::<String>(1024);
-    let (passthrough_tx, mut passthrough_rx) = mpsc::channel::<Response>(1);
+    let (passthrough_tx, mut passthrough_rx) = tokio::sync::oneshot::channel::<Response>();
 
     let port = state.port.clone();
     let recorder = state.recorder.clone();
@@ -212,16 +212,12 @@ async fn guardrail_loop(
     if client_wants_stream {
         // Return the SSE body immediately — the guardrail task fills it live.
         // Passthrough (non-JSON backend) is a degenerate case for streaming clients;
-        // we drop the oneshot and the passthrough is silently discarded.
+        // we drop the receiver and the passthrough is silently discarded.
         drop(passthrough_rx);
         sse_channel_response(StatusCode::OK, HeaderMap::new(), body_rx)
     } else {
-        // For non-streaming clients, the guardrail task might send a verbatim
-        // passthrough response (non-JSON/non-SSE backend) or SSE chunks.
-        // We race: passthrough_rx fires if the backend returned something raw;
-        // drain_rx completes when the task finishes writing SSE chunks.
-        // Wait for the guardrail task to finish (body_tx drop closes body_rx).
-        // Then check if it sent a passthrough response or wrote SSE chunks.
+        // For non-streaming clients, wait for the guardrail task to finish,
+        // then check if it sent a verbatim passthrough or SSE chunks.
         let sse_body = drain_rx(body_rx).await;
         match passthrough_rx.try_recv() {
             Ok(resp) => resp,
@@ -249,7 +245,7 @@ async fn run_guardrail(
     g: Guardrails,
     model: String,
     body_tx: mpsc::Sender<String>,
-    passthrough_tx: mpsc::Sender<Response>,
+    passthrough_tx: tokio::sync::oneshot::Sender<Response>,
 ) {
     let mut tracker = ErrorTracker::new(g.max_retries);
 
@@ -279,7 +275,7 @@ async fn run_guardrail(
             Ok((_status, _resp_headers, rx, native)) => (rx, native),
             Err(passthrough_resp) => {
                 // Non-JSON/non-SSE backend response — forward verbatim.
-                let _ = passthrough_tx.send(passthrough_resp).await;
+                let _ = passthrough_tx.send(passthrough_resp);
                 return;
             }
         };
@@ -389,7 +385,6 @@ async fn run_guardrail(
 
 /// Send a chat-completion value as an SSE chunk into the body channel.
 async fn send_value(tx: &mpsc::Sender<String>, value: &Value) {
-    // Ensure the value is a proper object before converting to SSE.
     let effective = if value.is_object() {
         value.clone()
     } else {
@@ -399,13 +394,12 @@ async fn send_value(tx: &mpsc::Sender<String>, value: &Value) {
             "choices": []
         })
     };
-    let chunk = to_sse_chunk(&effective);
+    let chunk = to_sse_chunk(effective);
     let _ = tx.send(chunk).await;
 }
 
 /// Convert a `chat.completion` JSON value to a single SSE `data:` line.
-fn to_sse_chunk(value: &Value) -> String {
-    let mut chunk = value.clone();
+fn to_sse_chunk(mut chunk: Value) -> String {
     if let Some(obj) = chunk.as_object_mut() {
         obj.insert("object".to_string(), Value::String("chat.completion.chunk".to_string()));
         if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
@@ -496,7 +490,7 @@ fn sse_chunks_to_json(sse: &str) -> Value {
 
     // Convert the last SSE chunk (which has `delta`) into a buffered response
     // (which needs `message`). We do this by converting delta→message.
-    let mut out = last_chunk.clone();
+    let mut out = last_chunk;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("object".to_string(), Value::String("chat.completion".to_string()));
         if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {

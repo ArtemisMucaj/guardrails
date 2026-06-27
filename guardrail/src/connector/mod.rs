@@ -80,8 +80,9 @@ impl BackendPort for Backend {
                     buf.push_str(text);
                     // Emit complete lines as they accumulate.
                     while let Some(pos) = buf.find('\n') {
-                        let line = buf[..pos].trim_end_matches('\r').to_string();
-                        buf = buf[pos + 1..].to_string();
+                        let end = if pos > 0 && buf.as_bytes()[pos - 1] == b'\r' { pos - 1 } else { pos };
+                        let line = buf[..end].to_string();
+                        buf.drain(..=pos);
                         if tx.send(Some(line)).await.is_err() {
                             return;
                         }
@@ -170,7 +171,7 @@ const HOP_BY_HOP: &[&str] = &[
 fn json_to_sse(json: &str) -> String {
     // Convert `chat.completion` → `chat.completion.chunk` and
     // `message` → `delta` so the assembler sees a normal chunk stream.
-    let mut sse = String::with_capacity(json.len() + 32);
+    let mut sse = String::new();
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) {
         if let Some(obj) = value.as_object_mut() {
             obj.insert(

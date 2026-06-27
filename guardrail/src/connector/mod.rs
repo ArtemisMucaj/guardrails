@@ -135,7 +135,7 @@ pub fn forward_headers(src: &HeaderMap) -> HeaderMap {
     let connection = connection_header_names(src);
     let mut out = HeaderMap::with_capacity(src.len());
     for (name, value) in src.iter() {
-        if should_strip_header(name, &connection) {
+        if should_strip_header(name, &connection) || name == "content-length" {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -209,6 +209,22 @@ mod tests {
         assert!(out.get("host").is_none());
         assert!(out.get("connection").is_none());
         assert_eq!(out.get("authorization").unwrap(), "Bearer t");
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn forward_headers_strips_content_length() {
+        // The guardrail loop rewrites (and usually grows) the request body before
+        // forwarding — it injects the synthetic `respond` tool and may re-emit
+        // repaired calls. Forwarding the client's original Content-Length would
+        // truncate the rewritten body at the backend, so it must be dropped and
+        // recomputed from the actual bytes by the HTTP client.
+        let src = header_map(&[
+            ("content-length", "42"),
+            ("content-type", "application/json"),
+        ]);
+        let out = forward_headers(&src);
+        assert!(out.get("content-length").is_none());
         assert_eq!(out.get("content-type").unwrap(), "application/json");
     }
 

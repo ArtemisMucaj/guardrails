@@ -21,11 +21,16 @@ use crate::domain::decode::{
     decode_response, response_with_text, response_with_tool_calls, ModelOutput,
 };
 pub use crate::domain::guardrails::Guardrails;
+use crate::domain::metrics::{
+    now_rfc3339, redact_args, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
+};
 use crate::domain::model::ChatRequest;
 use crate::domain::rescue;
 use crate::domain::respond;
 use crate::domain::retry::ErrorTracker;
-use crate::domain::validate::{coerce_arguments, repair_argument_names, validate, Validation};
+use crate::domain::validate::{
+    coerce_arguments, repair_argument_names, validate, ErrorCategory, Validation,
+};
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
 #[async_trait::async_trait]
@@ -56,6 +61,7 @@ pub struct AppState {
     pub backend_url: String,
     pub guardrails: Guardrails,
     pub port: Arc<dyn BackendPort>,
+    pub recorder: SharedRecorder,
 }
 
 impl AppState {
@@ -64,11 +70,19 @@ impl AppState {
             backend_url: backend_url.into().trim_end_matches('/').to_string(),
             guardrails: Guardrails::default(),
             port: Arc::new(port),
+            recorder: Arc::new(NoopRecorder),
         }
     }
 
     pub fn with_guardrails(mut self, guardrails: Guardrails) -> Self {
         self.guardrails = guardrails;
+        self
+    }
+
+    /// Install the sink that terminal outcomes are recorded to. Defaults to a
+    /// no-op recorder (metrics off).
+    pub fn with_recorder(mut self, recorder: SharedRecorder) -> Self {
+        self.recorder = recorder;
         self
     }
 }
@@ -154,28 +168,71 @@ async fn guardrail_loop(
     let mut tracker = ErrorTracker::new(g.max_retries);
     let mut last_text: Option<String> = None;
 
+    // One terminal outcome is recorded per guarded request. `record` borrows the
+    // request's model and the loop-local retry count; building it at each return
+    // keeps the metrics next to the decision that produced them.
+    let model = request.model.clone();
+    let recorder = state.recorder.clone();
+    let emit = |outcome: Outcome,
+                error_category: Option<ErrorCategory>,
+                parser: Option<String>,
+                tool_name: Option<String>,
+                retries: u32,
+                detail: Option<String>| {
+        recorder.record(OutcomeRecord {
+            ts: now_rfc3339(),
+            model: model.clone(),
+            outcome,
+            error_category,
+            parser,
+            tool_name,
+            retries,
+            detail,
+        });
+    };
+
     loop {
         let body = match serde_json::to_vec(&request) {
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "failed to serialize guardrail request");
+                emit(
+                    Outcome::InternalError,
+                    None,
+                    None,
+                    None,
+                    tracker.attempts(),
+                    None,
+                );
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         };
 
         let (status, out_headers, bytes) = match state.port.post(target, headers, body).await {
             Ok(parts) => parts,
-            Err(resp) => return resp,
+            Err(resp) => {
+                emit(
+                    Outcome::BackendError,
+                    None,
+                    None,
+                    None,
+                    tracker.attempts(),
+                    None,
+                );
+                return resp;
+            }
         };
 
         let value: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "backend response was not JSON; forwarding unverified");
+                emit(Outcome::NonJson, None, None, None, tracker.attempts(), None);
                 return bytes_response(status, out_headers, bytes);
             }
         };
 
+        let mut rescued_parser: Option<&'static str> = None;
         let calls = match decode_response(&value) {
             ModelOutput::ToolCalls(calls) => Some((calls, false)),
             ModelOutput::Text(text) => {
@@ -183,6 +240,7 @@ async fn guardrail_loop(
                 match rescue::rescue(&text) {
                     Some((parser, calls)) => {
                         info!(parser, count = calls.len(), "rescued tool calls from text");
+                        rescued_parser = Some(parser);
                         Some((calls, true))
                     }
                     None => None,
@@ -191,6 +249,14 @@ async fn guardrail_loop(
         };
 
         let Some((mut calls, rescued)) = calls else {
+            emit(
+                Outcome::PassthroughNoCalls,
+                None,
+                None,
+                None,
+                tracker.attempts(),
+                None,
+            );
             return bytes_response(status, out_headers, bytes);
         };
 
@@ -203,6 +269,14 @@ async fn guardrail_loop(
                 .find(|c| respond::is_respond(c))
                 .and_then(respond::message_text)
             {
+                emit(
+                    Outcome::RespondIntercept,
+                    None,
+                    None,
+                    Some(respond::RESPOND.to_string()),
+                    tracker.attempts(),
+                    None,
+                );
                 return json_response(status, out_headers, &response_with_text(&value, &text));
             }
         }
@@ -225,6 +299,28 @@ async fn guardrail_loop(
 
         match validate(&calls, &tools) {
             Validation::Valid => {
+                // Classify how the call became valid: a retry that finally landed
+                // outranks the deterministic repairs, which outrank a plain
+                // rescue, which outranks an untouched native call.
+                let attempts = tracker.attempts();
+                let outcome = if attempts > 0 {
+                    Outcome::RecoveredAfterRetry
+                } else if repaired {
+                    Outcome::Repaired
+                } else if rescued {
+                    Outcome::Rescued
+                } else {
+                    Outcome::NativeValid
+                };
+                let tool_name = calls.first().map(|c| c.name.clone());
+                emit(
+                    outcome,
+                    None,
+                    rescued_parser.map(str::to_string),
+                    tool_name,
+                    attempts,
+                    None,
+                );
                 return if rescued || repaired {
                     json_response(
                         status,
@@ -235,7 +331,11 @@ async fn guardrail_loop(
                     bytes_response(status, out_headers, bytes)
                 };
             }
-            Validation::NeedsRetry(nudge) => {
+            Validation::NeedsRetry {
+                category,
+                nudge,
+                offending,
+            } => {
                 if tracker.can_retry() {
                     tracker.record_retry();
                     warn!(attempt = tracker.attempts(), %nudge, "tool call invalid; retrying");
@@ -245,6 +345,28 @@ async fn guardrail_loop(
                     continue;
                 }
                 warn!("tool call invalid and retries exhausted; falling back");
+                // The guardrails could not fix this call. Capture the category,
+                // the offending tool, and a redacted argument snippet so it can be
+                // triaged and fixed in the tool later. `validate` stops at the
+                // first invalid call, so attribute the row to *that* call (which
+                // may not be the first) rather than `calls.first()`.
+                let offending = calls.get(offending);
+                let detail = offending.map(|c| {
+                    let snippet = redact_args(&c.arguments);
+                    if snippet.is_empty() {
+                        nudge.clone()
+                    } else {
+                        format!("{nudge} | args: {snippet}")
+                    }
+                });
+                emit(
+                    Outcome::FallbackUnfixed,
+                    Some(category),
+                    None,
+                    offending.map(|c| c.name.clone()),
+                    tracker.attempts(),
+                    detail,
+                );
                 return match &last_text {
                     Some(text) => {
                         json_response(status, out_headers, &response_with_text(&value, text))

@@ -21,13 +21,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::parse();
 
     // `stats` reads the database and prints a report instead of starting the
-    // proxy. Honor an override given either after the subcommand
-    // (`stats --metrics-db X`) or before it (`--metrics-db X stats`).
-    if let Some(Command::Stats { metrics_db }) = &cfg.command {
-        let path = metrics_db
-            .clone()
-            .or_else(|| cfg.metrics_db.clone())
-            .unwrap_or_else(guardrail::domain::metrics::default_db_path);
+    // proxy.
+    if let Some(Command::Stats {}) = &cfg.command {
+        let path = guardrail::domain::metrics::default_db_path();
         print!("{}", Stats::read(&path)?.render());
         return Ok(());
     }
@@ -39,8 +35,8 @@ async fn main() -> anyhow::Result<()> {
 
     let guardrails = cfg.guardrails();
 
-    // Metrics are always on; they record to `~/.guardrails/guardrails.sql` unless
-    // a path is given. A failure to open the database must not stop the proxy.
+    // Metrics are always on; they record to `~/.guardrails/guardrails.sql`. A
+    // failure to open the database must not stop the proxy.
     let metrics_path = cfg.metrics_db_path();
     let recorder: guardrail::domain::metrics::SharedRecorder = match SqliteRecorder::open(
         &metrics_path,

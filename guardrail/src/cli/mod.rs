@@ -42,27 +42,19 @@ pub struct Config {
     /// Set to `0` to disable retries while keeping the other repairs.
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
-
-    /// Path to the SQLite failure-metrics database. Defaults to
-    /// `~/.guardrails/guardrails.sql`; one row is recorded per guarded request.
-    #[arg(long, env = "GUARDRAIL_METRICS_DB")]
-    pub metrics_db: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Print collected failure metrics as text and exit.
-    Stats {
-        /// Database to read. Defaults to `~/.guardrails/guardrails.sql`.
-        #[arg(long, env = "GUARDRAIL_METRICS_DB")]
-        metrics_db: Option<PathBuf>,
-    },
+    Stats {},
 }
 
 impl Config {
-    /// Resolve the metrics database path, applying the default home location.
+    /// Path to the SQLite failure-metrics database, fixed at
+    /// `~/.guardrails/guardrails.sql`.
     pub fn metrics_db_path(&self) -> PathBuf {
-        self.metrics_db.clone().unwrap_or_else(default_db_path)
+        default_db_path()
     }
 }
 

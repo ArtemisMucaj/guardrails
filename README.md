@@ -94,8 +94,12 @@ cargo run -p guardrail -- --max-retries 0
 
 ## Failure Metrics
 
-Metrics are always on. The proxy records one row per guarded request to the
-`outcomes` table in `~/.guardrails/guardrails.sql`. The database is a general
+Metrics are always on. The proxy records one row per chat-completions request
+to the `outcomes` table in `~/.guardrails/guardrails.sql`: guarded
+(non-streaming, tool-enabled) requests get their terminal outcome, while
+streaming and non-tool requests — forwarded unguarded — are recorded as
+passthroughs, so the report reflects all chat traffic instead of being empty for
+clients that only ever stream. The database is a general
 SQLite file — `outcomes` is created with `CREATE TABLE IF NOT EXISTS`, so other
 tables can live alongside it. Recording happens on a background writer thread, so
 it never blocks the proxy's response path, and the database uses WAL mode so you
@@ -117,6 +121,8 @@ Outcomes:
 | `respond_intercept` | Synthetic `respond` tool carried the final text. | 1 |
 | `fallback_unfixed` | Retries exhausted, still invalid — the errors to triage. | 0 |
 | `passthrough_no_calls` | Model returned plain text, no tool call to check. | 1 |
+| `streamed_passthrough` | Streaming request, forwarded unguarded (streams are not buffered or inspected). | 1 |
+| `non_tool_passthrough` | Non-streaming request with no tools, forwarded unguarded. | 1 |
 | `non_json` | Backend response was not JSON; forwarded unverified. | 1 |
 
 Error categories (on `fallback_unfixed`): `unknown_tool`, `bad_arguments`,
@@ -155,10 +161,12 @@ Errors (triage list)
         The arguments for tool "Edit" were missing required field "filePath". … | args: {"oldString":"a","newString":"b"}
 ```
 
-`total` counts every guarded request, so it includes plain-text answers
-(`passthrough_no_calls`) and final answers routed through the synthetic
-`respond` tool (`respond_intercept`). Neither is a real tool call, so both are
-excluded from `tool calls` and from the success rate.
+`total` counts every chat-completions request the proxy saw, so it includes
+plain-text answers (`passthrough_no_calls`), final answers routed through the
+synthetic `respond` tool (`respond_intercept`), and the streaming / non-tool
+requests forwarded unguarded (`streamed_passthrough`, `non_tool_passthrough`).
+None of these is a real tool call, so all are excluded from `tool calls` and
+from the success rate.
 
 The sink is abstracted behind a `Recorder` trait, so an OpenTelemetry / OTLP
 exporter can be added later as a second implementation without changing the

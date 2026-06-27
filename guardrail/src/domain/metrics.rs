@@ -36,6 +36,14 @@ pub enum Outcome {
     FallbackUnfixed,
     /// The model returned plain text with no tool call to validate.
     PassthroughNoCalls,
+    /// A streaming request, forwarded unguarded. The proxy does not buffer or
+    /// inspect SSE, so the call is never guarded — but the request is still
+    /// recorded so streamed traffic (the bulk of real client load) is visible.
+    StreamedPassthrough,
+    /// A non-streaming request that declared no tools, forwarded unguarded.
+    /// There was no tool call to check, but it is recorded so the report
+    /// reflects all chat traffic rather than only the guarded slice.
+    NonToolPassthrough,
     /// The backend response was not JSON and was forwarded unverified.
     NonJson,
     /// The backend request itself failed (connection refused, timeout, …); the
@@ -56,6 +64,8 @@ impl Outcome {
             Outcome::RespondIntercept => "respond_intercept",
             Outcome::FallbackUnfixed => "fallback_unfixed",
             Outcome::PassthroughNoCalls => "passthrough_no_calls",
+            Outcome::StreamedPassthrough => "streamed_passthrough",
+            Outcome::NonToolPassthrough => "non_tool_passthrough",
             Outcome::NonJson => "non_json",
             Outcome::BackendError => "backend_error",
             Outcome::InternalError => "internal_error",
@@ -226,9 +236,19 @@ mod tests {
         assert!(Outcome::NativeValid.is_tool_call());
         assert!(Outcome::FallbackUnfixed.is_tool_call());
         assert!(!Outcome::PassthroughNoCalls.is_tool_call());
+        assert!(!Outcome::StreamedPassthrough.is_tool_call());
+        assert!(!Outcome::NonToolPassthrough.is_tool_call());
         assert!(!Outcome::NonJson.is_tool_call());
         assert!(!Outcome::BackendError.is_tool_call());
         assert!(!Outcome::InternalError.is_tool_call());
+    }
+
+    #[test]
+    fn forwarded_passthroughs_are_not_errors() {
+        // Streaming / non-tool requests are forwarded unguarded; they are
+        // recorded for visibility, not as failures.
+        assert!(Outcome::StreamedPassthrough.fixed());
+        assert!(Outcome::NonToolPassthrough.fixed());
     }
 
     #[test]

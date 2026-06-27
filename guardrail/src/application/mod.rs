@@ -120,20 +120,41 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             }
         };
 
-        // Only chat-completions POSTs are eligible for guardrails; other routes
-        // whose bodies happen to deserialize as a ChatRequest must pass through.
-        let guarded = if parts.method == axum::http::Method::POST
+        // Chat-completions POSTs are parsed once and split three ways: guarded
+        // (non-streaming, tool-enabled) requests enter the loop; streaming and
+        // non-tool requests are forwarded unchanged but still recorded, so stats
+        // reflects all chat traffic — not only the guarded slice. Other routes
+        // (e.g. GET /v1/models) forward without a metrics row.
+        let chat_request = if parts.method == axum::http::Method::POST
             && parts.uri.path() == "/v1/chat/completions"
         {
-            serde_json::from_slice::<ChatRequest>(&body_bytes)
-                .ok()
-                .filter(|r| r.has_tools() && !r.stream())
+            serde_json::from_slice::<ChatRequest>(&body_bytes).ok()
         } else {
             None
         };
 
-        if let Some(request) = guarded {
-            return guardrail_loop(&state, &target, &parts.headers, request).await;
+        if let Some(request) = chat_request {
+            if request.has_tools() && !request.stream() {
+                return guardrail_loop(&state, &target, &parts.headers, request).await;
+            }
+            // Forwarded unguarded: the proxy does not buffer or inspect SSE, and a
+            // request with no tools has no tool call to check. Record why so the
+            // bulk of real (usually streamed) traffic is visible in stats.
+            let outcome = if request.stream() {
+                Outcome::StreamedPassthrough
+            } else {
+                Outcome::NonToolPassthrough
+            };
+            state.recorder.record(OutcomeRecord {
+                ts: now_rfc3339(),
+                model: request.model,
+                outcome,
+                error_category: None,
+                parser: None,
+                tool_name: None,
+                retries: 0,
+                detail: None,
+            });
         }
 
         state

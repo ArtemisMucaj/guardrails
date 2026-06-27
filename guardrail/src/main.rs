@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use guardrail::admin::{build_admin_app, redact_backend_url, AdminInfo, AdminState};
 use guardrail::application::AppState;
 use guardrail::cli::{shutdown_signal, Command, Config};
 use guardrail::connector::Backend;
@@ -55,28 +56,42 @@ async fn main() -> anyhow::Result<()> {
     let app = guardrail::build_app(state);
 
     // The backend URL is operator-controlled and may embed basic-auth
-    // credentials or token-bearing query params; log only scheme/host/port.
-    let backend_for_log = reqwest::Url::parse(&cfg.backend)
-        .ok()
-        .and_then(|url| {
-            let host = url.host_str()?;
-            Some(match url.port() {
-                Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-                None => format!("{}://{}", url.scheme(), host),
-            })
-        })
-        .unwrap_or_else(|| "<redacted>".to_string());
+    // credentials or token-bearing query params; expose only scheme/host/port.
+    let backend_for_log = redact_backend_url(&cfg.backend);
 
     info!(
         listen = %cfg.listen,
+        admin_listen = ?cfg.admin_listen,
         backend = %backend_for_log,
         ?guardrails,
         "guardrail proxy starting"
     );
 
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let proxy = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    // The admin server is opt-in (only when `--admin-listen` is set) and runs on
+    // its own port alongside the proxy, sharing the same shutdown signal.
+    if let Some(admin_addr) = cfg.admin_listen {
+        let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+        let info = AdminInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            backend: backend_for_log,
+            proxy_listen: cfg.listen.to_string(),
+            admin_listen: admin_addr.to_string(),
+            max_retries: guardrails.max_retries,
+            metrics_db: metrics_path.display().to_string(),
+        };
+        let admin_app = build_admin_app(AdminState::new(metrics_path, info));
+        let admin = axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal());
+
+        info!(admin_listen = %admin_addr, "admin server starting");
+        // Run both to completion; either failing surfaces its error.
+        let (proxy_res, admin_res) = tokio::join!(proxy, admin);
+        proxy_res?;
+        admin_res?;
+    } else {
+        proxy.await?;
+    }
     Ok(())
 }

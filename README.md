@@ -79,6 +79,7 @@ Every option is available as both a CLI flag and an environment variable.
 | CLI flag | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `--listen` | `GUARDRAIL_LISTEN` | `127.0.0.1:8080` | Proxy listen address. |
+| `--admin-listen` | `GUARDRAIL_ADMIN_LISTEN` | _(disabled)_ | Address for the read-only admin HTTP server (stats, health, info), on a separate port. Disabled unless set. |
 | `--backend` | `GUARDRAIL_BACKEND` | `http://127.0.0.1:1234` | Backend base URL. |
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
@@ -163,6 +164,69 @@ The sink is abstracted behind a `Recorder` trait, so an OpenTelemetry / OTLP
 exporter can be added later as a second implementation without changing the
 guardrail loop.
 
+### Admin HTTP server
+
+For programmatic access — a desktop app, a dashboard, a health check — the same
+stats are available over HTTP from a dedicated admin server on a **separate
+port** from the proxy. It is read-only (every route is a `GET`) and opt-in: pass
+`--admin-listen` to enable it.
+
+```bash
+cargo run -p guardrail -- \
+  --listen 127.0.0.1:8080 \
+  --admin-listen 127.0.0.1:8081 \
+  --backend http://127.0.0.1:1234
+```
+
+Keeping it on its own port means the model-facing proxy port only ever speaks
+the OpenAI protocol, and the admin surface can be bound, firewalled, or exposed
+to a UI independently. Bind it to a loopback address; the metrics are not
+authenticated.
+
+| Method & path | Returns |
+| --- | --- |
+| `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
+| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `metrics_db` path. |
+| `GET /stats` | The full metrics rollup as JSON (see below). |
+| `GET /` | Lists the available endpoints. |
+
+`GET /stats` reads the SQLite database on each request — the same source the
+`stats` subcommand reads — so the response is always current and the admin
+server holds no in-memory counters that could drift from the proxy. Because the
+database runs in WAL mode, these reads never block the proxy's writes.
+
+```jsonc
+{
+  "per_model": [
+    {
+      "model": "qwen2.5-7b",
+      "total": 168,
+      "tool_calls": 142,
+      "succeeded": 137,
+      "errors": 5,
+      "success_rate": 0.965,        // null when the model made no tool call
+      "by_outcome": [
+        { "outcome": "native_valid", "count": 110 },
+        { "outcome": "rescued", "count": 18 }
+      ]
+    }
+  ],
+  "unfixed": [
+    {
+      "model": "qwen2.5-7b",
+      "error_category": "missing_argument",
+      "tool_name": "Edit",
+      "detail": "… | args: {\"oldString\":\"a\"}",   // argument values redacted
+      "count": 3
+    }
+  ]
+}
+```
+
+The `detail` snippet is redacted the same way as in the CLI report: argument
+values are reduced to type/size tags, never stored or served verbatim, so the
+endpoint is safe to surface in a UI.
+
 ## Logging
 
 Logs use `tracing` and default to:
@@ -193,6 +257,7 @@ calls.
 
 ```text
 guardrail/src/application/  HTTP proxy and guardrail loop
+guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
 guardrail/src/domain/       Decode, rescue, validate, retry, and respond logic
 guardrail/tests/            End-to-end proxy tests

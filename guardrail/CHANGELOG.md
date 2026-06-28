@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.7.0...v0.8.0) (2026-06-28)
+
+
+### Features
+
+* streaming support/fix thinking blocks ([#17](https://github.com/ArtemisMucaj/guardrails/issues/17)) ([7eed7ac](https://github.com/ArtemisMucaj/guardrails/commit/7eed7ac9d1de8300e9b5f275e0d34640c6dab6d4))
+
 ## [0.7.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.6.0...v0.7.0) (2026-06-27)
 
 

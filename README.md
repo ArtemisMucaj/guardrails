@@ -125,13 +125,14 @@ Outcomes:
 | `repaired` | Made valid by deterministic argument repair. | 1 |
 | `recovered_after_retry` | Invalid, then valid after corrective retries. | 1 |
 | `respond_intercept` | Synthetic `respond` tool carried the final text. | 1 |
-| `fallback_unfixed` | Retries exhausted, still invalid — the errors to triage. | 0 |
+| `retries_exhausted` | Retries exhausted, still invalid — the errors to triage. | 0 |
+| `write_refused` | Write-only tool called on an existing file — model told to read first. | 0 |
 | `passthrough_no_calls` | Model returned plain text, no tool call to check. | 1 |
 | `streamed_passthrough` | Streaming request with no tools, forwarded live (nothing to guard). | 1 |
 | `non_tool_passthrough` | Non-streaming request with no tools, forwarded unguarded. | 1 |
 | `non_json` | Backend response was not JSON; forwarded unverified. | 1 |
 
-Error categories (on `fallback_unfixed`): `unknown_tool`, `bad_arguments`,
+Error categories (on `retries_exhausted`): `unknown_tool`, `bad_arguments`,
 `missing_argument`, `wrong_type`.
 
 ### Viewing stats
@@ -156,7 +157,7 @@ qwen2.5-7b
     native_valid           110
     rescued                 18
     repaired                 9
-    fallback_unfixed         5
+    retries_exhausted         5
     respond_intercept       14
     passthrough_no_calls    12
 

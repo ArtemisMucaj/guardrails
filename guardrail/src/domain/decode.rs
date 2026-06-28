@@ -98,9 +98,17 @@ pub fn canonical_tool_calls(calls: &[ToolCall]) -> Value {
 }
 
 /// Rebuild a response with canonical `tool_calls`, reusing `template` so id,
-/// model, usage, etc. are preserved.
+/// model, usage, etc. are preserved. The `object` field is normalised to
+/// `"chat.completion"` (not `"chat.completion.chunk"`) since the rebuilt
+/// response is always a complete, non-streaming body.
 pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
     let mut out = template.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "object".to_string(),
+            Value::String("chat.completion".to_string()),
+        );
+    }
     set_first_choice_message(
         &mut out,
         json!({
@@ -113,9 +121,16 @@ pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
     out
 }
 
-/// Rebuild a response carrying a plain assistant text message.
+/// Rebuild a response carrying a plain assistant text message. The `object`
+/// field is normalised to `"chat.completion"` (not `"chat.completion.chunk"`).
 pub fn response_with_text(template: &Value, text: &str) -> Value {
     let mut out = template.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "object".to_string(),
+            Value::String("chat.completion".to_string()),
+        );
+    }
     set_first_choice_message(
         &mut out,
         json!({ "role": "assistant", "content": text }),
@@ -135,6 +150,11 @@ fn set_first_choice_message(resp: &mut Value, message: Value, finish_reason: &st
         Some(c) => {
             c["message"] = message;
             c["finish_reason"] = json!(finish_reason);
+            // Remove streaming-only fields that don't belong in a buffered
+            // response (e.g. `delta` from SSE chunks used as templates).
+            if let Some(obj) = c.as_object_mut() {
+                obj.remove("delta");
+            }
         }
         None => {
             resp["choices"] =

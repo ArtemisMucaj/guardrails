@@ -40,6 +40,15 @@ impl ChatRequest {
             .unwrap_or(false)
     }
 
+    /// Strip fields that are only valid on streaming requests when this request
+    /// is non-streaming. Some backends (e.g. LM Studio) warn or error on
+    /// `stream_options` being present in a non-streaming request.
+    pub fn sanitize(&mut self) {
+        if !self.stream() {
+            self.rest.remove("stream_options");
+        }
+    }
+
     /// Whether the request carries any tool definitions.
     pub fn has_tools(&self) -> bool {
         self.tools.as_ref().is_some_and(|t| !t.is_empty())

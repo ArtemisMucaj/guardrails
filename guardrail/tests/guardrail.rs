@@ -253,11 +253,11 @@ async fn missing_required_tool_argument_is_retried_then_succeeds() {
 }
 
 #[tokio::test]
-async fn retry_exhaustion_falls_back_to_last_text() {
+async fn retry_exhaustion_returns_explanation() {
     let backend = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     // Always an invalid tool name; rescue recovers a call, validation keeps
-    // failing, so the loop exhausts and falls back to the last text.
+    // failing, so the loop exhausts and returns an explanation to the model.
     let bad = "<tool_call>{\"name\": \"nope\", \"arguments\": {}}</tool_call>";
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -274,7 +274,9 @@ async fn retry_exhaustion_falls_back_to_last_text() {
     // Default budget is 2 retries → 3 backend calls total.
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(got["choices"][0]["finish_reason"], "stop");
-    assert_eq!(got["choices"][0]["message"]["content"], bad);
+    let content = got["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(content.contains("could not be completed"));
+    assert!(content.contains("nope")); // nudge names the unknown tool
 }
 
 #[tokio::test]
@@ -406,8 +408,10 @@ async fn zero_max_retries_disables_the_retry_loop_but_keeps_repairs() {
     let proxy = spawn(&backend.uri(), Guardrails { max_retries: 0 }).await;
     let got = post(&proxy, &tool_request()).await;
 
-    // No retries → exactly one backend call, then fall back to the last text.
+    // No retries → exactly one backend call, then return an explanation.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(got["choices"][0]["finish_reason"], "stop");
-    assert_eq!(got["choices"][0]["message"]["content"], bad);
+    let content = got["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(content.contains("could not be completed"));
+    assert!(content.contains("nope")); // nudge names the unknown tool
 }

@@ -309,13 +309,13 @@ async fn run_guardrail(
 
             // ── Tool calls ───────────────────────────────────────────────────
             AssembledResponse::ToolCalls { .. } | AssembledResponse::Rescued { .. } => {
-                let (mut calls, template, rescued_parser): (_, _, Option<&'static str>) =
+                let (mut calls, template, rescued_parser, native_content): (_, _, Option<&'static str>, String) =
                     match assembled {
                         AssembledResponse::Rescued { parser, calls, template } => {
                             info!(parser, count = calls.len(), "rescued tool calls from text");
-                            (calls, template, Some(parser))
+                            (calls, template, Some(parser), String::new())
                         }
-                        AssembledResponse::ToolCalls { calls, template } => (calls, template, None),
+                        AssembledResponse::ToolCalls { calls, template, content } => (calls, template, None, content),
                         AssembledResponse::Text { .. } => unreachable!(),
                     };
                 let rescued = rescued_parser.is_some();
@@ -360,6 +360,26 @@ async fn run_guardrail(
                     }
 
                     Validation::NeedsRetry { category, nudge, offending } => {
+                        // Before retrying an unknown-tool error, check whether the
+                        // model also emitted a valid tool call in its text content
+                        // (e.g. Qwen XML alongside a hallucinated native tool call).
+                        // Skip if content was already forwarded live (forward_text=true):
+                        // sending a full response on top of already-streamed deltas
+                        // would corrupt the SSE stream.
+                        if matches!(category, ErrorCategory::UnknownTool) && !native_content.is_empty() && !forward_text {
+                            if let Some((parser, rescued_calls)) = crate::domain::rescue::rescue(&native_content) {
+                                let mut rescued_calls = rescued_calls;
+                                if repair_argument_names(&mut rescued_calls, &tools) {}
+                                if coerce_arguments(&mut rescued_calls, &tools) {}
+                                if matches!(validate(&rescued_calls, &tools), Validation::Valid) {
+                                    info!(parser, count = rescued_calls.len(), "rescued tool calls from content alongside invalid native call");
+                                    emit_metric(Outcome::Rescued, None, Some(parser.to_string()), rescued_calls.first().map(|c| c.name.clone()), tracker.attempts(), None);
+                                    let value = response_with_tool_calls(&template, &rescued_calls);
+                                    send_value(&body_tx, &value).await;
+                                    return;
+                                }
+                            }
+                        }
                         if tracker.can_retry() {
                             tracker.record_retry();
                             warn!(attempt = tracker.attempts(), %nudge, "tool call invalid; retrying");

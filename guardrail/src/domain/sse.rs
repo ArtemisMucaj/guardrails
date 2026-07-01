@@ -29,7 +29,9 @@ pub enum AssembledResponse {
     /// already forwarded to the client via `emit_sse`.
     Text { template: Value },
     /// Stream ended with native tool-call deltas (buffered, not forwarded).
-    ToolCalls { calls: Vec<ToolCall>, template: Value },
+    /// `content` holds any text the model also emitted alongside the tool calls
+    /// (some models emit XML in content while also producing a native tool call).
+    ToolCalls { calls: Vec<ToolCall>, template: Value, content: String },
     /// No native tool calls; accumulated text was parsed by a rescue parser.
     Rescued { parser: &'static str, calls: Vec<ToolCall>, template: Value },
 }
@@ -153,7 +155,7 @@ where
                 arguments: if s.arguments.is_empty() { "{}".to_string() } else { s.arguments },
             })
             .collect();
-        return AssembledResponse::ToolCalls { calls, template };
+        return AssembledResponse::ToolCalls { calls, template, content: accumulated_text };
     }
 
     if !accumulated_text.is_empty() {
@@ -211,7 +213,7 @@ where
             id: s.id, name: s.name,
             arguments: if s.arguments.is_empty() { "{}".to_string() } else { s.arguments },
         }).collect();
-        return AssembledResponse::ToolCalls { calls, template };
+        return AssembledResponse::ToolCalls { calls, template, content: accumulated_text };
     }
 
     if !accumulated_text.is_empty() {
@@ -330,6 +332,38 @@ mod tests {
         let sse = "data: [DONE]\n\n";
         let result = assemble(sse, |_| {});
         assert!(matches!(result, AssembledResponse::Text { .. }));
+    }
+
+    #[test]
+    fn tool_calls_carries_content_emitted_alongside_native_calls() {
+        // Some models (e.g. Qwen) emit XML in the content delta while also
+        // producing a native tool_calls delta. The assembler should carry the
+        // content through so the application layer can rescue from it if the
+        // native call fails validation.
+        let mut sse = String::new();
+        let content_chunk = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {
+                "content": "<function=bash><parameter=command>ls</parameter></function>"
+            }, "finish_reason": null}]
+        });
+        sse.push_str(&format!("data: {}\n\n", content_chunk));
+        let tc_chunk = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "root", "arguments": "{}"}}]
+            }, "finish_reason": "tool_calls"}]
+        });
+        sse.push_str(&format!("data: {}\n\n", tc_chunk));
+        sse.push_str("data: [DONE]\n\n");
+
+        let result = assemble(&sse, |_| {});
+        let AssembledResponse::ToolCalls { calls, content, .. } = result else {
+            panic!("expected ToolCalls");
+        };
+        assert_eq!(calls[0].name, "root");
+        assert!(content.contains("<function=bash>"), "content should carry the XML text");
     }
 
     #[test]

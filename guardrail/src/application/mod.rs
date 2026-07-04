@@ -81,6 +81,13 @@ pub trait BackendPort: Send + Sync {
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
+/// Answer returned when the model's reasoning fell into a repetition loop before
+/// producing any content — the thinking was cut off, so the turn has no real
+/// result to deliver.
+const REASONING_LOOP_MESSAGE: &str =
+    "The model's reasoning began repeating itself and was stopped before it \
+     produced an answer. Please try again, and consider rephrasing the request.";
+
 #[derive(Clone)]
 pub struct AppState {
     pub backend_url: String,
@@ -302,26 +309,39 @@ async fn run_guardrail(
 
         match assembled {
             // ── Pure text ────────────────────────────────────────────────────
-            AssembledResponse::Text { template, content, repetition } => {
-                if let Some(det) = repetition {
-                    emit_metric(
+            AssembledResponse::Text { template, content, repetition, reasoning } => {
+                match repetition {
+                    Some(det) => emit_metric(
                         Outcome::RepetitionDetected, None, None, None, tracker.attempts(),
-                        Some(format!("repetition: {} copies of a {}-char unit", det.repeats, det.unit_len)),
-                    );
-                } else {
-                    emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+                        Some(format!(
+                            "repetition{}: {} copies of a {}-char unit",
+                            if reasoning { " in reasoning" } else { "" },
+                            det.repeats, det.unit_len,
+                        )),
+                    ),
+                    None => emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None),
                 }
-                // When the text was forwarded live (a native SSE stream on the
-                // first attempt), the client already has it — for a detected loop
-                // the runaway tail was suppressed, for plain text every delta went
-                // out as it arrived. Otherwise nothing has been sent yet: a
-                // buffered (JSON) backend or a retry attempt assembled the whole
-                // answer silently, so emit it here (de-looped, when a loop was
-                // cut off) rather than closing the stream on an empty body.
-                if !forward_text {
+
+                if reasoning {
+                    // The loop was in the thinking tokens, so no answer content was
+                    // ever produced. The reasoning already streamed live stays, but
+                    // the turn has no result — synthesize a short explanation so the
+                    // client gets a coherent, non-empty answer instead of a stream
+                    // that just stops.
+                    let value = response_with_text(&template, REASONING_LOOP_MESSAGE);
+                    send_value(&body_tx, &value).await;
+                } else if !forward_text {
+                    // When the text was forwarded live (a native SSE stream on the
+                    // first attempt), the client already has it — a detected content
+                    // loop had its runaway tail suppressed, plain text went out
+                    // delta by delta. Otherwise nothing has been sent yet: a
+                    // buffered (JSON) backend or a retry attempt assembled the whole
+                    // answer silently, so emit it here (de-looped, when a loop was
+                    // cut off) rather than closing the stream on an empty body.
                     let value = response_with_text(&template, &content);
                     send_value(&body_tx, &value).await;
                 }
+
                 // A detected loop cuts the stream short before the backend is
                 // done. Don't drop `sse_rx` here — that resets the upstream
                 // connection mid-generation, which makes the backend abort the

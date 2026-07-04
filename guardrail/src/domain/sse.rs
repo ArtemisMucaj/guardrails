@@ -30,11 +30,14 @@ pub enum AssembledResponse {
     /// chunks were already forwarded via `emit_sse`; `content` carries the
     /// accumulated (possibly de-looped) text for backends that were buffered.
     /// `repetition` is set when a degenerate loop was detected and the tail was
-    /// cut off — see [`crate::domain::repetition`].
+    /// cut off — see [`crate::domain::repetition`]. `reasoning` is `true` when
+    /// that loop was in the model's thinking tokens (a separate `reasoning`
+    /// field) rather than in `content`, so no answer was ever produced.
     Text {
         template: Value,
         content: String,
         repetition: Option<Detection>,
+        reasoning: bool,
     },
     /// Stream ended with native tool-call deltas (buffered, not forwarded).
     /// `content` holds any text the model also emitted alongside the tool calls
@@ -75,10 +78,11 @@ pub fn parse_sse_line(line: &str) -> Option<Value> {
 /// at EOF (after rescue detection).
 ///
 /// When `repetition` is `Some` and enabled, the accumulated text is checked for
-/// a degenerate loop after each content delta. On detection the runaway tail is
-/// suppressed (not forwarded), the stream is cut short, and the returned
-/// [`AssembledResponse::Text`] carries the de-looped `content` and the
-/// [`Detection`].
+/// a degenerate loop after each content delta — and, separately, after each
+/// reasoning/thinking delta. On detection the runaway tail is suppressed (not
+/// forwarded), the stream is cut short, and the returned
+/// [`AssembledResponse::Text`] carries the de-looped `content`, the [`Detection`],
+/// and whether the loop was in the reasoning tokens.
 pub async fn assemble_stream<F>(
     rx: &mut mpsc::Receiver<Option<String>>,
     mut emit_sse: F,
@@ -93,7 +97,9 @@ where
     let mut template = Value::Null;
     let mut has_tool_calls = false;
     let mut accumulated_text = String::new();
+    let mut reasoning_text = String::new();
     let mut looped: Option<Detection> = None;
+    let mut looped_reasoning = false;
     let mut kind_fired = false;
 
     let mut signal = |is_text: bool, tx: &Option<mpsc::Sender<bool>>| {
@@ -165,7 +171,36 @@ where
             continue;
         }
 
-        // ── Passthrough (thinking, role, finish_reason, usage, etc.) ─────────
+        // ── Reasoning / thinking delta ── forward live, scan separately ──────
+        // Reasoning models stream their chain of thought in a dedicated field
+        // (`reasoning_content` for DeepSeek-R1 / vLLM, `reasoning` for others),
+        // and it is a prime place to get stuck in a loop. Scan it with its own
+        // buffer so a thinking loop is caught, but keep it out of `content` so
+        // the two never mix.
+        if let Some(reasoning) = delta
+            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            reasoning_text.push_str(reasoning);
+            template = chunk;
+            if !has_tool_calls {
+                if let Some(det) = detector.and_then(|r| repetition::detect(&reasoning_text, r)) {
+                    warn!(
+                        repeats = det.repeats,
+                        unit_len = det.unit_len,
+                        "degenerate repetition detected in reasoning; cutting off the stream"
+                    );
+                    looped = Some(det);
+                    looped_reasoning = true;
+                    break;
+                }
+                emit_sse(&format!("{line}\n\n"));
+            }
+            continue;
+        }
+
+        // ── Passthrough (role, finish_reason, usage, etc.) ───────────────────
         if !chunk.is_null() { template = chunk.clone(); }
         if !has_tool_calls { emit_sse(&format!("{line}\n\n")); }
     }
@@ -192,7 +227,12 @@ where
     // (skipping rescue, which the de-looped tail would never satisfy).
     if looped.is_some() {
         signal(true, &kind_tx);
-        return AssembledResponse::Text { template, content: accumulated_text, repetition: looped };
+        return AssembledResponse::Text {
+            template,
+            content: accumulated_text,
+            repetition: looped,
+            reasoning: looped_reasoning,
+        };
     }
 
     if !accumulated_text.is_empty() {
@@ -203,7 +243,7 @@ where
     }
 
     signal(true, &kind_tx); // pure text — signal at EOF
-    AssembledResponse::Text { template, content: accumulated_text, repetition: None }
+    AssembledResponse::Text { template, content: accumulated_text, repetition: None, reasoning: false }
 }
 
 /// Synchronous version for tests and non-streaming paths.
@@ -259,7 +299,7 @@ where
         }
     }
 
-    AssembledResponse::Text { template, content: accumulated_text, repetition: None }
+    AssembledResponse::Text { template, content: accumulated_text, repetition: None, reasoning: false }
 }
 
 #[cfg(test)]

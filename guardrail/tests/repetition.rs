@@ -272,6 +272,100 @@ async fn cutting_off_a_loop_drains_the_upstream_instead_of_resetting_it() {
 }
 
 #[tokio::test]
+async fn reasoning_token_loop_is_detected_and_answered() {
+    // A reasoning model streams its chain of thought in `reasoning_content` and
+    // gets stuck repeating a full sentence there, never reaching an answer.
+    let backend = MockServer::start().await;
+    let sentence = "Let me reconsider the constraints once more. ";
+    let mut sse = String::new();
+    for _ in 0..40 {
+        let chunk = json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"reasoning_content": sentence}, "finish_reason": null}]
+        });
+        sse.push_str(&format!("data: {chunk}\n\n"));
+    }
+    sse.push_str("data: [DONE]\n\n");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"))
+        .mount(&backend)
+        .await;
+
+    let db = temp_db("reasoning");
+    let proxy = spawn(&backend.uri(), &db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request(true))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+
+    // The client saw the thinking start, then a synthesized answer explaining the
+    // turn was stopped — not an empty stream.
+    let seen = body.matches("Let me reconsider").count();
+    assert!((2..40).contains(&seen), "reasoning should stream then be cut, saw {seen}");
+    assert!(
+        body.contains("reasoning began repeating"),
+        "the client should get the reasoning-loop explanation, got: {body}"
+    );
+
+    let m = wait_for_model_stats(&db);
+    assert_eq!(m.by_outcome, vec![("repetition_detected".to_string(), 1)]);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn buffered_reasoning_loop_with_alt_field_is_detected() {
+    // Same failure, but a buffered JSON backend and the alternate `reasoning`
+    // field name. The whole loop arrives at once and must still be caught.
+    let backend = MockServer::start().await;
+    let reasoning = format!("wait, let me check that again. {}", "still the same. ".repeat(30));
+    let body = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "reasoning": reasoning, "content": null}
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .mount(&backend)
+        .await;
+
+    let db = temp_db("reasoning-buffered");
+    let proxy = spawn(&backend.uri(), &db).await;
+
+    let got: Value = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request(false))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let content = got["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("a synthesized answer");
+    assert!(
+        content.contains("reasoning began repeating"),
+        "buffered reasoning loop should yield the explanation, got: {content}"
+    );
+
+    let m = wait_for_model_stats(&db);
+    assert_eq!(m.by_outcome, vec![("repetition_detected".to_string(), 1)]);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
 async fn detector_can_be_disabled() {
     let backend = MockServer::start().await;
     let loop_text = format!("ok. {}", "repeat me. ".repeat(40));

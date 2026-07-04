@@ -116,10 +116,18 @@ check catches both single-token runaways (`the the the …`, period 4) and
 whole-line loops (`I can't help.\nI can't help.\n…`, period = the line length),
 with no model-specific heuristics.
 
+The same check runs over the model's **reasoning/thinking tokens** (the
+`reasoning_content` field used by DeepSeek-R1 / vLLM, or the `reasoning` field
+used by others), scanned in their own buffer — a reasoning model stuck
+re-deriving the same chain of thought is caught just like a looping answer.
+
 When a loop is detected the proxy stops it: on a buffered backend it delivers the
 good prefix plus one clean copy of the repeated unit; on a live stream it stops
-forwarding the runaway tail to the client and ends the turn. Either way the
-request is recorded with the `repetition_detected` outcome.
+forwarding the runaway tail to the client and ends the turn. If the loop was in
+the reasoning tokens — so no answer content was ever produced — the proxy
+synthesizes a short message explaining the turn was stopped, rather than closing
+the stream on an empty answer. Either way the request is recorded with the
+`repetition_detected` outcome.
 
 The client's turn ends immediately, but the upstream response is **not** reset
 mid-generation — that would make the backend abort its slot and discard the KV

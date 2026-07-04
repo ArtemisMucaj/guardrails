@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             proxy_listen: cfg.listen.to_string(),
             admin_listen: admin_addr.to_string(),
             max_retries: guardrails.max_retries,
+            repetition_threshold: guardrails.repetition.min_repeats,
             database: db_path.display().to_string(),
         };
         let admin_app = build_admin_app(AdminState::new(db_path, info));

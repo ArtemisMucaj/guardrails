@@ -39,6 +39,9 @@ pub enum Outcome {
     WriteRefused,
     /// The model returned plain text with no tool call to validate.
     PassthroughNoCalls,
+    /// The model's text output fell into a degenerate repetition loop; the
+    /// runaway tail was cut off and one clean copy of the answer delivered.
+    RepetitionDetected,
     /// A streaming request that declared no tools, forwarded live and unguarded.
     /// With no declared tool there is no tool call to validate; recording it
     /// keeps streamed chat traffic visible. (Streaming requests that *do* declare
@@ -70,6 +73,7 @@ impl Outcome {
             Outcome::RetriesExhausted => "retries_exhausted",
             Outcome::WriteRefused => "write_refused",
             Outcome::PassthroughNoCalls => "passthrough_no_calls",
+            Outcome::RepetitionDetected => "repetition_detected",
             Outcome::StreamedPassthrough => "streamed_passthrough",
             Outcome::NonToolPassthrough => "non_tool_passthrough",
             Outcome::NonJson => "non_json",

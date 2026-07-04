@@ -35,6 +35,9 @@ and repaired before the response reaches the client.
   to fill a missing required field and only when the match is unambiguous.
 - Retries invalid tool calls with a corrective nudge, then falls back safely
   instead of forwarding invalid tool calls to the client.
+- Detects degenerate repetition loops in the model's text output — the same
+  token, phrase, or line emitted over and over — and cuts the runaway off,
+  delivering the good prefix plus one clean copy instead of thousands of repeats.
 - Optionally injects a synthetic `respond` tool so models can return a final text
   answer through the same tool-call path.
 
@@ -90,13 +93,40 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
+| `--repetition-threshold` | `GUARDRAIL_REPETITION_THRESHOLD` | `4` | Back-to-back copies of a repeating unit that mark the model's text as a degenerate loop, after which the runaway tail is cut off. Set to `0` to disable repetition detection. |
 
-Rescue, the synthetic `respond` tool, and the deterministic argument repairs
-are always on. The only knob is the retry budget:
+Rescue, the synthetic `respond` tool, the deterministic argument repairs, and
+repetition detection are always on. The two knobs are the retry budget and the
+repetition threshold:
 
 ```bash
-cargo run -p guardrail -- --max-retries 0
+cargo run -p guardrail -- --max-retries 0 --repetition-threshold 6
 ```
+
+## Repetition Detection
+
+Local and smaller models sometimes fall into a loop — emitting the same token,
+phrase, or line over and over until they hit a token limit. The output is
+useless and, on a streamed connection, floods the client with garbage.
+
+The proxy watches the model's accumulated text and looks at its tail for a unit
+that repeats back-to-back: the smallest period `p` such that the last
+`p × repeats` characters are the same `p`-character block repeated. That single
+check catches both single-token runaways (`the the the …`, period 4) and
+whole-line loops (`I can't help.\nI can't help.\n…`, period = the line length),
+with no model-specific heuristics.
+
+When a loop is detected the proxy stops it: on a buffered backend it delivers the
+good prefix plus one clean copy of the repeated unit; on a live stream it simply
+stops forwarding the runaway tail and ends the turn. Either way the request is
+recorded with the `repetition_detected` outcome.
+
+The detector is deliberately conservative — the repeating unit must be
+non-trivial (whitespace and runs of a single punctuation character, such as
+Markdown rules like `----`, never trip it), it must repeat at least
+`--repetition-threshold` times, and the run must span at least 40 characters — so
+ordinary prose and code stay well clear while genuine loops (which repeat dozens
+to thousands of times) are caught.
 
 ## Failure Metrics
 
@@ -125,6 +155,7 @@ Outcomes:
 | `repaired` | Made valid by deterministic argument repair. | 1 |
 | `recovered_after_retry` | Invalid, then valid after corrective retries. | 1 |
 | `respond_intercept` | Synthetic `respond` tool carried the final text. | 1 |
+| `repetition_detected` | Text output looped; the runaway tail was cut off and one clean copy delivered. | 1 |
 | `retries_exhausted` | Retries exhausted, still invalid — the errors to triage. | 0 |
 | `write_refused` | Write-only tool called on an existing file — model told to read first. | 0 |
 | `passthrough_no_calls` | Model returned plain text, no tool call to check. | 1 |
@@ -201,7 +232,7 @@ authenticated.
 | Method & path | Returns |
 | --- | --- |
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
-| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
+| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, `repetition_threshold`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
 | `GET /` | Lists the available endpoints. |
 
@@ -274,6 +305,6 @@ calls.
 guardrail/src/application/  HTTP proxy and guardrail loop
 guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
-guardrail/src/domain/       Decode, rescue, validate, retry, and respond logic
+guardrail/src/domain/       Decode, rescue, validate, retry, respond, and repetition logic
 guardrail/tests/            End-to-end proxy tests
 ```

@@ -45,6 +45,9 @@ pub struct AdminInfo {
     pub admin_listen: String,
     /// Maximum corrective retries per guarded request.
     pub max_retries: u32,
+    /// Repetition-loop threshold (back-to-back copies before the tail is cut
+    /// off); `0` means the detector is disabled.
+    pub repetition_threshold: u32,
     /// Filesystem path of the SQLite guardrails database the stats are read from.
     pub database: String,
 }

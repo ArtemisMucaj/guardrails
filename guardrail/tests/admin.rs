@@ -17,6 +17,7 @@ async fn spawn_admin(db_path: std::path::PathBuf) -> String {
         proxy_listen: "127.0.0.1:8080".into(),
         admin_listen: "127.0.0.1:8081".into(),
         max_retries: 2,
+        repetition_threshold: 4,
         database: db_path.display().to_string(),
     };
     let app = build_admin_app(AdminState::new(db_path, info));

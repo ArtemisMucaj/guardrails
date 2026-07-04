@@ -48,6 +48,12 @@ pub struct Config {
     /// Set to `0` to disable retries while keeping the other repairs.
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
+
+    /// Number of back-to-back copies of a repeating unit that marks the model's
+    /// text output as a degenerate loop, after which the runaway tail is cut off.
+    /// Set to `0` (or `1`) to disable repetition detection.
+    #[arg(long, env = "GUARDRAIL_REPETITION_THRESHOLD", default_value_t = 4)]
+    pub repetition_threshold: u32,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -69,6 +75,10 @@ impl Config {
     pub fn guardrails(&self) -> Guardrails {
         Guardrails {
             max_retries: self.max_retries,
+            repetition: crate::domain::repetition::Repetition {
+                min_repeats: self.repetition_threshold,
+                ..crate::domain::repetition::Repetition::default()
+            },
         }
     }
 }

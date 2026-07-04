@@ -3,6 +3,7 @@ pub mod guardrails;
 pub mod metrics;
 pub mod model;
 pub mod precondition;
+pub mod repetition;
 pub mod rescue;
 pub mod respond;
 pub mod retry;

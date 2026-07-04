@@ -405,7 +405,7 @@ async fn zero_max_retries_disables_the_retry_loop_but_keeps_repairs() {
         .mount(&backend)
         .await;
 
-    let proxy = spawn(&backend.uri(), Guardrails { max_retries: 0 }).await;
+    let proxy = spawn(&backend.uri(), Guardrails { max_retries: 0, ..Guardrails::default() }).await;
     let got = post(&proxy, &tool_request()).await;
 
     // No retries → exactly one backend call, then return an explanation.

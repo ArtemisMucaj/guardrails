@@ -14,6 +14,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::decode::ToolCall;
+use super::repetition::{self, Detection, Repetition};
 
 #[derive(Debug, Clone, Default)]
 struct CallSlot {
@@ -25,9 +26,16 @@ struct CallSlot {
 /// The result of processing the complete SSE stream.
 #[derive(Debug)]
 pub enum AssembledResponse {
-    /// Stream contained only text / passthrough content. All chunks were
-    /// already forwarded to the client via `emit_sse`.
-    Text { template: Value },
+    /// Stream contained only text / passthrough content. On a live stream the
+    /// chunks were already forwarded via `emit_sse`; `content` carries the
+    /// accumulated (possibly de-looped) text for backends that were buffered.
+    /// `repetition` is set when a degenerate loop was detected and the tail was
+    /// cut off — see [`crate::domain::repetition`].
+    Text {
+        template: Value,
+        content: String,
+        repetition: Option<Detection>,
+    },
     /// Stream ended with native tool-call deltas (buffered, not forwarded).
     /// `content` holds any text the model also emitted alongside the tool calls
     /// (some models emit XML in content while also producing a native tool call).
@@ -65,18 +73,27 @@ pub fn parse_sse_line(line: &str) -> Option<Value> {
 /// first tool-call delta is seen — allowing the caller to switch to buffered
 /// mode before returning a response. For text streams, `kind_tx` receives `true`
 /// at EOF (after rescue detection).
+///
+/// When `repetition` is `Some` and enabled, the accumulated text is checked for
+/// a degenerate loop after each content delta. On detection the runaway tail is
+/// suppressed (not forwarded), the stream is cut short, and the returned
+/// [`AssembledResponse::Text`] carries the de-looped `content` and the
+/// [`Detection`].
 pub async fn assemble_stream<F>(
     rx: &mut mpsc::Receiver<Option<String>>,
     mut emit_sse: F,
     kind_tx: Option<mpsc::Sender<bool>>,
+    repetition: Option<&Repetition>,
 ) -> AssembledResponse
 where
     F: FnMut(&str),
 {
+    let detector = repetition.filter(|r| r.enabled());
     let mut slots: Vec<CallSlot> = Vec::new();
     let mut template = Value::Null;
     let mut has_tool_calls = false;
     let mut accumulated_text = String::new();
+    let mut looped: Option<Detection> = None;
     let mut kind_fired = false;
 
     let mut signal = |is_text: bool, tx: &Option<mpsc::Sender<bool>>| {
@@ -128,10 +145,23 @@ where
             .filter(|s| !s.is_empty())
         {
             accumulated_text.push_str(content);
+            template = chunk;
+            // Repetition guard: if the model has fallen into a loop, cut the tail
+            // off rather than forward this delta. The good prefix already went to
+            // the client; the runaway does not.
             if !has_tool_calls {
+                if let Some(det) = detector.and_then(|r| repetition::detect(&accumulated_text, r)) {
+                    warn!(
+                        repeats = det.repeats,
+                        unit_len = det.unit_len,
+                        "degenerate repetition detected; cutting off the stream"
+                    );
+                    accumulated_text = repetition::truncated(&accumulated_text, &det);
+                    looped = Some(det);
+                    break;
+                }
                 emit_sse(&format!("{line}\n\n"));
             }
-            template = chunk;
             continue;
         }
 
@@ -158,6 +188,13 @@ where
         return AssembledResponse::ToolCalls { calls, template, content: accumulated_text };
     }
 
+    // A detected loop is degenerate text, not a tool call — return it directly
+    // (skipping rescue, which the de-looped tail would never satisfy).
+    if looped.is_some() {
+        signal(true, &kind_tx);
+        return AssembledResponse::Text { template, content: accumulated_text, repetition: looped };
+    }
+
     if !accumulated_text.is_empty() {
         if let Some((parser, calls)) = crate::domain::rescue::rescue(&accumulated_text) {
             signal(false, &kind_tx); // rescue = treat like tool calls
@@ -166,7 +203,7 @@ where
     }
 
     signal(true, &kind_tx); // pure text — signal at EOF
-    AssembledResponse::Text { template }
+    AssembledResponse::Text { template, content: accumulated_text, repetition: None }
 }
 
 /// Synchronous version for tests and non-streaming paths.
@@ -222,7 +259,7 @@ where
         }
     }
 
-    AssembledResponse::Text { template }
+    AssembledResponse::Text { template, content: accumulated_text, repetition: None }
 }
 
 #[cfg(test)]

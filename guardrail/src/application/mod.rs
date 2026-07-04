@@ -296,13 +296,28 @@ async fn run_guardrail(
                 }
             },
             None, // kind_tx not needed here — we use result directly
+            Some(&g.repetition),
         )
         .await;
 
         match assembled {
             // ── Pure text ────────────────────────────────────────────────────
             // Lines were already forwarded live. Just record and return.
-            AssembledResponse::Text { .. } => {
+            AssembledResponse::Text { template, content, repetition } => {
+                if let Some(det) = repetition {
+                    // The model looped. The runaway tail was never forwarded;
+                    // record it and, for buffered backends, deliver the de-looped
+                    // answer (a live stream already sent the clean prefix).
+                    emit_metric(
+                        Outcome::RepetitionDetected, None, None, None, tracker.attempts(),
+                        Some(format!("repetition: {} copies of a {}-char unit", det.repeats, det.unit_len)),
+                    );
+                    if !forward_text {
+                        let value = response_with_text(&template, &content);
+                        send_value(&body_tx, &value).await;
+                    }
+                    return;
+                }
                 emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
                 return; // body_tx drops → stream closes
             }

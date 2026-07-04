@@ -117,9 +117,15 @@ whole-line loops (`I can't help.\nI can't help.\n…`, period = the line length)
 with no model-specific heuristics.
 
 When a loop is detected the proxy stops it: on a buffered backend it delivers the
-good prefix plus one clean copy of the repeated unit; on a live stream it simply
-stops forwarding the runaway tail and ends the turn. Either way the request is
-recorded with the `repetition_detected` outcome.
+good prefix plus one clean copy of the repeated unit; on a live stream it stops
+forwarding the runaway tail to the client and ends the turn. Either way the
+request is recorded with the `repetition_detected` outcome.
+
+The client's turn ends immediately, but the upstream response is **not** reset
+mid-generation — that would make the backend abort its slot and discard the KV
+cache (and would keep the socket out of the connection pool). Instead the rest of
+the backend stream is drained in the background so the connection finishes and
+closes cleanly. The client pays no latency for this; it already has its answer.
 
 The detector is deliberately conservative — the repeating unit must be
 non-trivial (whitespace and runs of a single punctuation character, such as

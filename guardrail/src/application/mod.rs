@@ -322,6 +322,16 @@ async fn run_guardrail(
                     let value = response_with_text(&template, &content);
                     send_value(&body_tx, &value).await;
                 }
+                // A detected loop cuts the stream short before the backend is
+                // done. Don't drop `sse_rx` here — that resets the upstream
+                // connection mid-generation, which makes the backend abort the
+                // slot and discard its KV cache (and the socket can't return to
+                // the pool). Instead let the backend finish and close cleanly by
+                // draining the rest in the background; the client already has its
+                // answer, so this costs it no latency.
+                if repetition.is_some() {
+                    tokio::spawn(async move { while sse_rx.recv().await.is_some() {} });
+                }
                 return; // body_tx drops → stream closes
             }
 

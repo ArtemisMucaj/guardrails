@@ -7,12 +7,17 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::response::Response;
+use guardrail::application::BackendPort;
 use guardrail::connector::Backend;
 use guardrail::domain::metrics::{ModelStats, SqliteRecorder, Stats};
 use guardrail::{build_app, AppState};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -150,6 +155,115 @@ async fn streaming_loop_is_cut_off_mid_stream() {
     let seen = body.matches("stuck in a loop forever.").count();
     assert!(seen >= 2, "the loop should stream until detected, saw {seen}");
     assert!(seen < copies, "the runaway tail must be cut off, saw {seen} of {copies}");
+
+    let m = wait_for_model_stats(&db);
+    assert_eq!(m.by_outcome, vec![("repetition_detected".to_string(), 1)]);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A backend double that streams `lines` over a small bounded channel and flips
+/// `drained` to `true` only if every line — plus the end-of-stream sentinel — is
+/// consumed. If the proxy reset the stream mid-flight instead of draining it, a
+/// `send` would fail and `drained` would stay `false`.
+struct DrainProbe {
+    lines: Vec<String>,
+    drained: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl BackendPort for DrainProbe {
+    async fn post(
+        &self,
+        _target: &str,
+        _headers: &HeaderMap,
+        _body: Vec<u8>,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
+        unreachable!("guarded streaming requests only use stream_post")
+    }
+
+    async fn stream_post(
+        &self,
+        _target: &str,
+        _headers: &HeaderMap,
+        _body: Vec<u8>,
+    ) -> Result<(StatusCode, HeaderMap, mpsc::Receiver<Option<String>>, bool), Response> {
+        // A small buffer forces the producer to rely on the proxy actually
+        // reading — the whole point being measured.
+        let (tx, rx) = mpsc::channel::<Option<String>>(8);
+        let lines = self.lines.clone();
+        let drained = self.drained.clone();
+        tokio::spawn(async move {
+            for line in lines {
+                if tx.send(Some(line)).await.is_err() {
+                    return; // receiver dropped — the stream was reset
+                }
+            }
+            if tx.send(None).await.is_err() {
+                return;
+            }
+            drained.store(true, Ordering::SeqCst);
+        });
+        Ok((StatusCode::OK, HeaderMap::new(), rx, true))
+    }
+
+    async fn forward(
+        &self,
+        _method: Method,
+        _target: &str,
+        _headers: &HeaderMap,
+        _body: bytes::Bytes,
+    ) -> Response {
+        unreachable!("tool-enabled requests never take the forward path")
+    }
+}
+
+#[tokio::test]
+async fn cutting_off_a_loop_drains_the_upstream_instead_of_resetting_it() {
+    // The backend keeps emitting the same line long past the detection point.
+    let mut lines = Vec::new();
+    for _ in 0..200 {
+        let chunk = json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "spinning forever. "}, "finish_reason": null}]
+        });
+        lines.push(format!("data: {chunk}"));
+    }
+    let drained = Arc::new(AtomicBool::new(false));
+    let probe = DrainProbe { lines, drained: drained.clone() };
+
+    let db = temp_db("drain");
+    let recorder = Arc::new(SqliteRecorder::open(&db).unwrap());
+    let state = AppState::new(probe, "http://unused").with_recorder(recorder);
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy = format!("http://{addr}");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request(true))
+        .send()
+        .await
+        .unwrap();
+    // Drain the client side (the truncated, de-looped output).
+    let _ = resp.text().await.unwrap();
+
+    // The runaway tail was cut off for the client, but the upstream stream was
+    // consumed to its end in the background — no mid-generation reset, so the
+    // backend can finish its turn and keep its KV cache.
+    let mut ok = false;
+    for _ in 0..200 {
+        if drained.load(Ordering::SeqCst) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(ok, "the upstream stream must be drained to completion, not reset");
 
     let m = wait_for_model_stats(&db);
     assert_eq!(m.by_outcome, vec![("repetition_detected".to_string(), 1)]);

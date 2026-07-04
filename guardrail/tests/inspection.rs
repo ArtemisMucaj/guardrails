@@ -80,6 +80,81 @@ async fn native_tool_call_response_is_forwarded_unchanged() {
 }
 
 #[tokio::test]
+async fn buffered_plain_text_response_is_delivered_to_the_client() {
+    // A tool-enabled request whose backend answers in plain text (no tool call)
+    // over a buffered JSON body. The proxy has nothing to repair, but it must
+    // still deliver the model's text — not close the stream on an empty body.
+    let backend = MockServer::start().await;
+    let canned = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Paris is sunny today."}
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn_proxy(&backend.uri()).await;
+    let got: serde_json::Value = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        got["choices"][0]["message"]["content"], "Paris is sunny today.",
+        "the plain-text answer must survive the guardrail hop, got: {got}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_plain_text_reaches_a_streaming_client() {
+    // Same as above but the client asked to stream: it must receive the text as
+    // an SSE chunk, not just an immediate `[DONE]`.
+    let backend = MockServer::start().await;
+    let canned = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Streamed answer body."}
+        }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&canned))
+        .mount(&backend)
+        .await;
+
+    let proxy = spawn_proxy(&backend.uri()).await;
+    let mut req = tool_request();
+    req["stream"] = serde_json::Value::Bool(true);
+    let body = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("Streamed answer body."),
+        "the streamed body must carry the text, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn undecodable_tool_response_is_still_forwarded() {
     let backend = MockServer::start().await;
     // Not a chat-completion shape the decoder understands; must pass through

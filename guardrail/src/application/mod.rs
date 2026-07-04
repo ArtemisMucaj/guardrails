@@ -302,23 +302,26 @@ async fn run_guardrail(
 
         match assembled {
             // ── Pure text ────────────────────────────────────────────────────
-            // Lines were already forwarded live. Just record and return.
             AssembledResponse::Text { template, content, repetition } => {
                 if let Some(det) = repetition {
-                    // The model looped. The runaway tail was never forwarded;
-                    // record it and, for buffered backends, deliver the de-looped
-                    // answer (a live stream already sent the clean prefix).
                     emit_metric(
                         Outcome::RepetitionDetected, None, None, None, tracker.attempts(),
                         Some(format!("repetition: {} copies of a {}-char unit", det.repeats, det.unit_len)),
                     );
-                    if !forward_text {
-                        let value = response_with_text(&template, &content);
-                        send_value(&body_tx, &value).await;
-                    }
-                    return;
+                } else {
+                    emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
                 }
-                emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+                // When the text was forwarded live (a native SSE stream on the
+                // first attempt), the client already has it — for a detected loop
+                // the runaway tail was suppressed, for plain text every delta went
+                // out as it arrived. Otherwise nothing has been sent yet: a
+                // buffered (JSON) backend or a retry attempt assembled the whole
+                // answer silently, so emit it here (de-looped, when a loop was
+                // cut off) rather than closing the stream on an empty body.
+                if !forward_text {
+                    let value = response_with_text(&template, &content);
+                    send_value(&body_tx, &value).await;
+                }
                 return; // body_tx drops → stream closes
             }
 

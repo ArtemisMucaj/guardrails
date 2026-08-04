@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.1...v0.8.2) (2026-08-04)
+
+
+### Bug Fixes
+
+* add crate docs noting the notarized macOS release ([#25](https://github.com/ArtemisMucaj/guardrails/issues/25)) ([75b3f20](https://github.com/ArtemisMucaj/guardrails/commit/75b3f2071eb5f9e34b8bf206f10845fbf6576819))
+
 ## [0.8.1](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.0...v0.8.1) (2026-07-01)
 
 

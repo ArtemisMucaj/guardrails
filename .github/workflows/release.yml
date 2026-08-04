@@ -57,6 +57,48 @@ jobs:
       - name: Rename binary
         run: mv target/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
 
+      # Developer ID-sign + notarize the macOS binary so it runs without a
+      # Gatekeeper exception. A bare Mach-O can't be stapled, but notarizing
+      # registers it with Apple so first-run passes. The signed binary is what
+      # gets uploaded, so the later checksum covers the signed bytes.
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          codesign --force --timestamp --options runtime \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" "${{ matrix.asset_name }}"
+          codesign --verify --strict --verbose=2 "${{ matrix.asset_name }}"
+
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k "${{ matrix.asset_name }}" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

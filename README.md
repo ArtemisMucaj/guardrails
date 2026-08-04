@@ -78,6 +78,9 @@ Then point your client at:
 http://127.0.0.1:8080/v1
 ```
 
+The prebuilt macOS release binary is signed with a Developer ID and notarized
+by Apple, so it runs without a Gatekeeper exception.
+
 ## Configuration
 
 Every option is available as both a CLI flag and an environment variable.

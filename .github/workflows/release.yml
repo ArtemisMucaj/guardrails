@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+  # Manual re-trigger: GitHub occasionally fails the push-triggered run with a
+  # transient API error, leaving release-please without a chance to open the
+  # next Release PR. Dispatching re-scans main; release-please is idempotent.
+  workflow_dispatch:
 
 permissions:
   contents: read

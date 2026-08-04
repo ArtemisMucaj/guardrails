@@ -95,13 +95,26 @@ jobs:
 
           echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           ditto -c -k "${{ matrix.asset_name }}" "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --key "$RUNNER_TEMP/notary.p8" \
-            --key-id "$NOTARY_KEY_ID" \
-            --issuer "$NOTARY_ISSUER_ID" \
-            --wait
+          # Apple's notary service can be slow and its status endpoint
+          # occasionally drops the polling connection (-1009), which kills
+          # --wait. Retry the whole submit-and-wait so a transient blip doesn't
+          # fail the release; --timeout bounds each attempt.
+          notarized=false
+          for attempt in 1 2 3; do
+            if xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+              --key "$RUNNER_TEMP/notary.p8" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" \
+              --wait --timeout 30m; then
+              notarized=true
+              break
+            fi
+            echo "notarize attempt $attempt failed; retrying in 30s"
+            sleep 30
+          done
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
           security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          [ "$notarized" = true ] || { echo "notarization failed after retries"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.4](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.3...v0.8.4) (2026-08-05)
+
+
+### Bug Fixes
+
+* re-release to publish the notarized macOS binary ([#31](https://github.com/ArtemisMucaj/guardrails/issues/31)) ([c42bf30](https://github.com/ArtemisMucaj/guardrails/commit/c42bf30b420807b04f5a68923f2ecb829f7ff8c9))
+
 ## [0.8.3](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.2...v0.8.3) (2026-08-05)
 
 

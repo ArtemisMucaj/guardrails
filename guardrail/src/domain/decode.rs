@@ -12,28 +12,29 @@ pub enum ModelOutput {
     Text(String),
 }
 
-/// A single tool call. `arguments` is kept as the raw JSON-encoded string OpenAI
-/// uses (not a parsed value) so canonical re-emit is lossless; validation parses
-/// it on demand. `id` is preserved when the backend supplied one so re-emit can
+/// A single tool call.
+///
+/// Re-exported from [`openai_rs`] rather than defined here: the shape is the
+/// same one every OpenAI-compatible server uses, and keeping two identical
+/// definitions in the workspace invites them to drift. `arguments` stays the
+/// raw JSON-encoded string (not a parsed value) so canonical re-emit is
+/// lossless and the repair layer can work on almost-JSON; validation parses it
+/// on demand. `id` is preserved when the backend supplied one so re-emit can
 /// echo it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCall {
-    pub id: Option<String>,
-    pub name: String,
-    pub arguments: String,
-}
+pub use openai_rs::ToolCall;
 
-impl ToolCall {
-    /// Build a canonical OpenAI `tool_calls` entry for this call, minting a
-    /// deterministic id from `index` when the backend supplied none.
-    fn to_canonical(&self, index: usize) -> Value {
-        let id = self.id.clone().unwrap_or_else(|| format!("call_{index}"));
-        json!({
-            "id": id,
-            "type": "function",
-            "function": { "name": self.name, "arguments": self.arguments },
-        })
-    }
+/// Build a canonical OpenAI `tool_calls` entry for `call`, minting a
+/// deterministic id from `index` when the backend supplied none.
+///
+/// A free function rather than a method: `ToolCall` belongs to `openai-rs`, and
+/// this is guardrails' wire-emitting concern rather than the type's.
+fn to_canonical(call: &ToolCall, index: usize) -> Value {
+    let id = call.id.clone().unwrap_or_else(|| format!("call_{index}"));
+    json!({
+        "id": id,
+        "type": "function",
+        "function": { "name": call.name, "arguments": call.arguments },
+    })
 }
 
 /// Decode a full OpenAI chat-completion response body into [`ModelOutput`].
@@ -92,7 +93,7 @@ pub fn canonical_tool_calls(calls: &[ToolCall]) -> Value {
         calls
             .iter()
             .enumerate()
-            .map(|(i, c)| c.to_canonical(i))
+            .map(|(i, c)| to_canonical(c, i))
             .collect(),
     )
 }

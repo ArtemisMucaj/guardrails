@@ -91,9 +91,15 @@ pub trait BackendPort: Send + Sync {
 
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
+/// The live registry, swappable at runtime by the management API.
+///
+/// Read per request and replaced wholesale on a configuration change, so a
+/// model can be exposed or hidden without restarting the proxy.
+pub type SharedRegistry = Arc<tokio::sync::RwLock<Arc<Registry>>>;
+
 #[derive(Clone)]
 pub struct AppState {
-    pub registry: Arc<Registry>,
+    pub registry: SharedRegistry,
     pub guardrails: Guardrails,
     pub port: Arc<dyn BackendPort>,
     pub recorder: SharedRecorder,
@@ -111,8 +117,16 @@ impl AppState {
 
     /// State routing across several providers.
     pub fn with_registry(port: impl BackendPort + 'static, registry: Registry) -> Self {
+        Self::with_shared_registry(
+            port,
+            Arc::new(tokio::sync::RwLock::new(Arc::new(registry))),
+        )
+    }
+
+    /// State sharing a registry the management API can replace.
+    pub fn with_shared_registry(port: impl BackendPort + 'static, registry: SharedRegistry) -> Self {
         Self {
-            registry: Arc::new(registry),
+            registry,
             guardrails: Guardrails::default(),
             port: Arc::new(port),
             recorder: Arc::new(NoopRecorder),
@@ -149,7 +163,7 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
     // so the response is forwarded untouched. Tagging it would break the
     // byte-for-byte passthrough single-backend users have today, for no
     // information they do not already have.
-    if req.method() != axum::http::Method::GET || state.registry.len() == 1 {
+    if req.method() != axum::http::Method::GET || state.registry.read().await.len() == 1 {
         return proxy(State(state), req).await;
     }
     let path_and_query = req
@@ -160,9 +174,13 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
         .to_string();
     let headers = req.headers().clone();
 
+    // Snapshot the registry once so every lookup in this request sees the same
+    // configuration, even if a change lands mid-flight.
+    let registry = state.registry.read().await.clone();
+
     // Ask every provider concurrently: the response is as slow as the slowest
     // one, not the sum.
-    let lookups = state.registry.providers().map(|provider| {
+    let lookups = registry.providers().map(|provider| {
         let provider = provider.clone();
         let port = state.port.clone();
         let headers = headers.clone();
@@ -187,6 +205,11 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
                     // Tag each entry with the provider that serves it, so a
                     // client (or a UI) can tell two same-named models apart.
                     let id = model.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    // Hidden models are not advertised, so the listing and what
+                    // the proxy will actually serve agree.
+                    if registry.is_hidden(&id) {
+                        continue;
+                    }
                     if !id.is_empty() && !seen.insert(id) {
                         // An id already claimed by an earlier provider routes
                         // there, so listing it twice would misdescribe routing.
@@ -265,11 +288,34 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             None
         };
 
+        // A model the user hid is refused rather than routed. Falling back to
+        // the default provider would quietly serve something the user chose not
+        // to expose, and would disagree with what /v1/models advertises.
+        let registry = state.registry.read().await.clone();
+        if let Some(request) = chat_request.as_ref() {
+            if registry.is_hidden(&request.model) {
+                warn!(model = %request.model, "refused: model is not exposed");
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    HeaderMap::new(),
+                    &serde_json::json!({
+                        "error": {
+                            "message": format!(
+                                "The model `{}` is not exposed by this proxy.",
+                                request.model
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    }),
+                );
+            }
+        }
+
         // Route on the model, which is the only routing hint an
         // OpenAI-compatible client gives us. Requests with no parseable model
         // — every non-chat path — go to the default provider.
-        let provider = state
-            .registry
+        let provider = registry
             .resolve(chat_request.as_ref().map(|r| r.model.as_str()))
             .clone();
         let target = provider.target(&path_and_query);

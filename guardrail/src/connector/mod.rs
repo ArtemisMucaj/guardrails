@@ -42,7 +42,10 @@ impl Backend {
         self
     }
 
-    fn client_for(&self, provider: &Provider) -> &reqwest::Client {
+    /// The HTTP client used for `provider` — its own when it has one (a
+    /// credential-carrying provider), otherwise the shared client. Public so
+    /// model discovery can reuse the same auth and connection pool.
+    pub fn client_for(&self, provider: &Provider) -> &reqwest::Client {
         self.per_provider
             .get(provider.name())
             .unwrap_or(&self.client)

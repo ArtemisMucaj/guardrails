@@ -107,6 +107,39 @@ Three rules make routing predictable:
 A single bare `--backend URL` still behaves exactly as before; it is named
 `default`.
 
+### Choosing which models are exposed
+
+Configuration lives in `~/.guardrails/config.json`. CLI flags seed it on first
+run; after that the file is the source of truth, so a change made through the
+management API is not undone by whatever flags the launcher passes next time.
+It is plain JSON and meant to be hand-editable.
+
+The management API (on the admin port) reads and changes it at runtime — no
+restart:
+
+| Method & path | Does |
+| --- | --- |
+| `GET /providers` | Every provider, its discovered models, and which are exposed. |
+| `POST /providers` | Add a provider (`name`, `base_url`, optional `unversioned`). |
+| `PATCH /providers/{name}` | Set per-model exposure, `enabled`, or `expose_by_default`. |
+| `DELETE /providers/{name}` | Remove a provider. |
+
+```bash
+# Hide one model.
+curl -X PATCH http://127.0.0.1:8081/providers/remote-a \
+  -d '{"models": {"tiny-draft": false}}'
+
+# Or expose nothing except what you pick, for a server with a large catalogue.
+curl -X PATCH http://127.0.0.1:8081/providers/remote-b \
+  -d '{"expose_by_default": false, "models": {"qwen3-72b": true}}'
+```
+
+A hidden model is **not served**, not merely unlisted: it disappears from
+`GET /v1/models` and a request naming it gets `404`, so what the proxy
+advertises and what it will do agree. Exposure decisions are stored per model,
+so a model that vanishes when a backend restarts keeps whatever you chose for
+it.
+
 ### GitHub Copilot
 
 `--copilot` adds a `copilot` provider backed by a Copilot subscription. Unlike a
@@ -266,9 +299,9 @@ guardrail loop.
 
 For programmatic access — a desktop app, a dashboard, a health check — the same
 stats are available over HTTP from a dedicated admin server on a **separate
-port** from the proxy. It is opt-in: pass `--admin-listen` to enable it. Every route is a `GET`
-except `POST /copilot/login`, which starts a device flow — the one deliberate
-exception to the read-only rule, and present only with `--copilot`. A login
+port** from the proxy. It is opt-in: pass `--admin-listen` to enable it. The metrics routes are read-only; the
+management and login routes change configuration, so the server is no longer
+`GET`-only. A login
 response carries the user code and verification URL, never the token.
 
 ```bash
@@ -288,6 +321,10 @@ authenticated.
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
 | `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
+| `GET /providers` | Providers, their discovered models, and exposure. |
+| `POST /providers` | Add a provider. |
+| `PATCH /providers/{name}` | Change exposure for one provider. |
+| `DELETE /providers/{name}` | Remove a provider. |
 | `GET /copilot/login` | Current device-flow status. Only present with `--copilot`. |
 | `POST /copilot/login` | Start (or restart) the device flow; returns the `user_code` and `verification_uri`. Only present with `--copilot`. |
 | `GET /` | Lists the available endpoints. |

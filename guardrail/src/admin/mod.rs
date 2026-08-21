@@ -13,6 +13,8 @@
 //! contends with the proxy's response path (the database runs in WAL mode, so
 //! readers and the background writer do not block each other).
 
+pub mod manage;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,6 +63,9 @@ pub struct AdminState {
     /// login routes answering `404`, so the mutable surface does not exist at
     /// all unless it is needed.
     login: Option<Arc<crate::copilot::CopilotLogin>>,
+    /// Present only when the management API is enabled. `None` leaves those
+    /// routes answering `404`.
+    management: Option<Arc<manage::Management>>,
 }
 
 impl AdminState {
@@ -69,7 +74,14 @@ impl AdminState {
             db_path,
             info: Arc::new(info),
             login: None,
+            management: None,
         }
+    }
+
+    /// Enable the management API.
+    pub fn with_management(mut self, management: Arc<manage::Management>) -> Self {
+        self.management = Some(management);
+        self
     }
 
     /// Enable the Copilot device-flow login routes.
@@ -111,6 +123,14 @@ pub fn build_admin_app(state: AdminState) -> Router {
         .route("/info", get(info))
         .route("/stats", get(stats))
         .route("/copilot/login", get(copilot_login_status).post(copilot_login_start))
+        .route(
+            "/providers",
+            get(manage::list_providers).post(manage::add_provider),
+        )
+        .route(
+            "/providers/:name",
+            axum::routing::patch(manage::update_provider).delete(manage::remove_provider),
+        )
         .with_state(state)
 }
 
@@ -148,6 +168,9 @@ fn copilot_disabled() -> Response {
 /// self-describing when opened in a browser or by a new integration.
 async fn index(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let mut endpoints = vec!["/healthz", "/info", "/stats"];
+    if state.management.is_some() {
+        endpoints.push("/providers");
+    }
     // Listed only when it exists, so discovery does not advertise a route that
     // answers 404.
     if state.login.is_some() {

@@ -40,6 +40,8 @@ use crate::domain::model::ChatRequest;
 use crate::domain::provider::{Provider, DEFAULT_PROVIDER};
 use crate::domain::registry::Registry;
 use crate::domain::respond;
+use crate::domain::responses::{self, ResponsesRequest};
+use crate::domain::responses_sse::{assemble_responses_stream, AssembledResponses};
 use crate::domain::retry::ErrorTracker;
 use crate::domain::sse::{assemble_stream, AssembledResponse};
 use crate::domain::validate::{
@@ -147,9 +149,322 @@ impl AppState {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", any(proxy))
+        .route("/v1/responses", any(proxy_responses))
         .route("/v1/models", any(models))
         .fallback(any(proxy))
         .with_state(state)
+}
+
+/// `POST /v1/responses` — the Responses API, guarded.
+///
+/// The same policy as the chat path: requests declaring no tools are forwarded
+/// untouched, tool-enabled ones run the guardrail loop. Only the decoding and
+/// re-encoding differ; the guardrails in between are shared.
+async fn proxy_responses(State(state): State<AppState>, req: Request) -> Response {
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1/responses")
+        .to_string();
+
+    let span = info_span!("responses", %method, path = %path_and_query);
+    async move {
+        let (parts, body) = req.into_parts();
+        let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "failed to read request body");
+                return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+            }
+        };
+
+        let request = if parts.method == axum::http::Method::POST {
+            serde_json::from_slice::<ResponsesRequest>(&body_bytes).ok()
+        } else {
+            None
+        };
+
+        let registry = state.registry.read().await.clone();
+        if let Some(request) = request.as_ref() {
+            if registry.is_hidden(&request.model) {
+                warn!(model = %request.model, "refused: model is not exposed");
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    HeaderMap::new(),
+                    &serde_json::json!({
+                        "error": {
+                            "message": format!(
+                                "The model `{}` is not exposed by this proxy.",
+                                request.model
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "model_not_found",
+                        }
+                    }),
+                );
+            }
+        }
+
+        let provider = registry
+            .resolve(request.as_ref().map(|r| r.model.as_str()))
+            .clone();
+        let target = provider.target(&path_and_query);
+        debug!(provider = %provider.name(), target = %target, "forwarding to provider");
+
+        if let Some(request) = request {
+            if request.has_tools() {
+                let client_wants_stream = request.stream();
+                return responses_loop(
+                    &state, &provider, &target, &parts.headers, request, client_wants_stream,
+                )
+                .await;
+            }
+            let outcome = if request.stream() {
+                Outcome::StreamedPassthrough
+            } else {
+                Outcome::NonToolPassthrough
+            };
+            state.recorder.record(OutcomeRecord {
+                ts: now_rfc3339(), provider: provider.name().to_string(), model: request.model,
+                outcome, error_category: None, parser: None, tool_name: None, retries: 0,
+                detail: None,
+            });
+        }
+
+        state.port.forward(&provider, parts.method, &target, &parts.headers, body_bytes).await
+    }
+    .instrument(span)
+    .await
+}
+
+/// The guardrail loop for the Responses API.
+///
+/// Structurally the chat loop, with the Responses decode/encode at the edges.
+async fn responses_loop(
+    state: &AppState,
+    provider: &Arc<Provider>,
+    target: &str,
+    headers: &HeaderMap,
+    mut request: ResponsesRequest,
+    client_wants_stream: bool,
+) -> Response {
+    let g = state.guardrails;
+    request.rest.insert("stream".to_string(), Value::Bool(true));
+
+    let tools = request.normalized_tools();
+    let respond_active = !tools.iter().any(|t| t.function.name == respond::RESPOND);
+    if respond_active {
+        request.push_tool(respond::respond_tool());
+    }
+    let tools = request.normalized_tools();
+
+    let (body_tx, body_rx) = mpsc::channel::<String>(1024);
+    let (passthrough_tx, mut passthrough_rx) = tokio::sync::oneshot::channel::<Response>();
+
+    let port = state.port.clone();
+    let recorder = state.recorder.clone();
+    let provider = provider.clone();
+    let target = target.to_string();
+    let headers = headers.clone();
+    let model = request.model.clone();
+
+    tokio::spawn(async move {
+        run_responses_guardrail(
+            port, recorder, provider, target, headers, request, tools, respond_active, g, model,
+            body_tx, passthrough_tx,
+        )
+        .await;
+    });
+
+    if client_wants_stream {
+        drop(passthrough_rx);
+        sse_channel_response(StatusCode::OK, HeaderMap::new(), body_rx)
+    } else {
+        let sse_body = drain_rx(body_rx).await;
+        match passthrough_rx.try_recv() {
+            Ok(resp) => resp,
+            Err(_) => json_response(
+                StatusCode::OK,
+                HeaderMap::new(),
+                &responses_sse_to_json(&sse_body),
+            ),
+        }
+    }
+}
+
+/// The Responses guardrail logic, running inside a spawned task.
+#[allow(clippy::too_many_arguments)]
+async fn run_responses_guardrail(
+    port: Arc<dyn BackendPort>,
+    recorder: SharedRecorder,
+    provider: Arc<Provider>,
+    target: String,
+    headers: HeaderMap,
+    mut request: ResponsesRequest,
+    tools: Vec<crate::domain::model::Tool>,
+    respond_active: bool,
+    g: Guardrails,
+    model: String,
+    body_tx: mpsc::Sender<String>,
+    passthrough_tx: tokio::sync::oneshot::Sender<Response>,
+) {
+    let mut tracker = ErrorTracker::new(g.max_retries);
+
+    let emit_metric = |outcome: Outcome,
+                       error_category: Option<ErrorCategory>,
+                       parser: Option<String>,
+                       tool_name: Option<String>,
+                       retries: u32,
+                       detail: Option<String>| {
+        recorder.record(OutcomeRecord {
+            ts: now_rfc3339(), provider: provider.name().to_string(), model: model.clone(),
+            outcome, error_category, parser, tool_name, retries, detail,
+        });
+    };
+
+    loop {
+        let body_bytes = match serde_json::to_vec(&request) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "failed to serialize request");
+                emit_metric(Outcome::InternalError, None, None, None, tracker.attempts(), None);
+                return;
+            }
+        };
+
+        let (mut sse_rx, is_native_sse) =
+            match port.stream_post(&provider, &target, &headers, body_bytes).await {
+                Ok((_status, _resp_headers, rx, native)) => (rx, native),
+                Err(passthrough_resp) => {
+                    let _ = passthrough_tx.send(passthrough_resp);
+                    return;
+                }
+            };
+
+        let forward_text = tracker.attempts() == 0 && is_native_sse;
+        let tx = body_tx.clone();
+        let assembled = assemble_responses_stream(
+            &mut sse_rx,
+            |line: &str| {
+                if forward_text {
+                    let _ = tx.try_send(line.to_string());
+                }
+            },
+            None,
+        )
+        .await;
+
+        let (mut calls, template, rescued_parser) = match assembled {
+            AssembledResponses::Text { .. } => {
+                emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+                return;
+            }
+            AssembledResponses::Rescued { parser, calls, template } => {
+                info!(parser, count = calls.len(), "rescued tool calls from text");
+                (calls, template, Some(parser))
+            }
+            AssembledResponses::ToolCalls { calls, template, .. } => (calls, template, None),
+        };
+        let rescued = rescued_parser.is_some();
+
+        if respond_active {
+            if let Some(text) = calls
+                .iter()
+                .find(|c| respond::is_respond(c))
+                .and_then(respond::message_text)
+            {
+                emit_metric(Outcome::RespondIntercept, None, None, Some(respond::RESPOND.to_string()), tracker.attempts(), None);
+                send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
+                return;
+            }
+        }
+
+        if let crate::domain::precondition::Precondition::Failed { nudge } =
+            crate::domain::precondition::check(&calls)
+        {
+            warn!(%nudge, "precondition failed");
+            emit_metric(Outcome::WriteRefused, None, None, calls.first().map(|c| c.name.clone()), tracker.attempts(), Some(nudge.clone()));
+            let text = format!("The tool call could not be completed. {nudge}");
+            send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
+            return;
+        }
+
+        let mut repaired = false;
+        if repair_argument_names(&mut calls, &tools) { repaired = true; }
+        if coerce_arguments(&mut calls, &tools) { repaired = true; }
+
+        match validate(&calls, &tools) {
+            Validation::Valid => {
+                let attempts = tracker.attempts();
+                let outcome = if attempts > 0 { Outcome::RecoveredAfterRetry }
+                    else if repaired { Outcome::Repaired }
+                    else if rescued { Outcome::Rescued }
+                    else { Outcome::NativeValid };
+                emit_metric(outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
+                send_responses_value(&body_tx, &responses::with_tool_calls(&template, &calls)).await;
+                return;
+            }
+            Validation::NeedsRetry { category, nudge, offending } => {
+                if tracker.can_retry() {
+                    tracker.record_retry();
+                    warn!(attempt = tracker.attempts(), %nudge, "tool call invalid; retrying");
+                    request.extend_input(crate::domain::retry::tool_error_followup(&calls, &nudge));
+                    continue;
+                }
+                warn!("retries exhausted");
+                let offending_call = calls.get(offending);
+                let detail = offending_call.map(|c| {
+                    let s = redact_args(&c.arguments);
+                    if s.is_empty() { nudge.clone() } else { format!("{nudge} | args: {s}") }
+                });
+                emit_metric(Outcome::RetriesExhausted, Some(category), None, offending_call.map(|c| c.name.clone()), tracker.attempts(), detail);
+                let text = format!("The tool call could not be completed after several attempts. {nudge}");
+                send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Emit a final Responses body as a terminal `response.completed` event.
+async fn send_responses_value(tx: &mpsc::Sender<String>, body: &Value) {
+    let event = serde_json::json!({"type": "response.completed", "response": body});
+    let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+    let _ = tx.send(format!("data: {line}\n\n")).await;
+}
+
+/// Recover the final Responses body from the SSE the loop produced, for a
+/// client that did not ask to stream.
+fn responses_sse_to_json(sse: &str) -> Value {
+    let mut text = String::new();
+    let mut completed = None;
+    for line in sse.lines() {
+        let Some(event) = crate::domain::sse::parse_sse_line(line) else { continue };
+        match event.get("type").and_then(Value::as_str) {
+            // The *last* one wins: the guardrail loop emits its own terminal
+            // event after any repair, and returning an earlier one would hand
+            // back the output the repair replaced.
+            Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    completed = Some(response.clone());
+                }
+            }
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(response) = completed {
+        return response;
+    }
+    // Only text deltas were forwarded (a plain-text answer), so rebuild the
+    // body they add up to.
+    responses::with_text(&Value::Null, &text)
 }
 
 /// `GET /v1/models` — the union of every provider's catalogue.

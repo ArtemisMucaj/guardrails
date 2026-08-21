@@ -622,6 +622,36 @@ fn fenced_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
+/// Whether `text` has begun to look like a tool call written as prose.
+///
+/// Used by a streaming caller to decide whether to hold text back rather than
+/// forward it: a model emitting a call as text opens with a recognisable marker,
+/// so this can be answered from a prefix without waiting for the whole stream.
+/// Deliberately loose — a false positive costs a little latency on one answer,
+/// while a false negative leaks raw call syntax to the client and then
+/// contradicts it with a rescued call.
+pub fn looks_like_tool_call(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<tool_call>",
+        LFM_CALL_START,
+        PYTHON_TAG,
+        "<function=",
+        "```json",
+        "```",
+        "{\"name\"",
+        "{ \"name\"",
+        "[TOOL_CALLS]",
+    ];
+    let trimmed = text.trim_start();
+    MARKERS.iter().any(|marker| {
+        // A prefix of a marker counts too: the stream may have delivered only
+        // part of it so far.
+        trimmed.starts_with(marker)
+            || marker.starts_with(trimmed) && !trimmed.is_empty()
+            || trimmed.contains(marker)
+    })
+}
+
 /// The entire text is a tool-call JSON value.
 pub struct BareJson;
 impl RescueParser for BareJson {

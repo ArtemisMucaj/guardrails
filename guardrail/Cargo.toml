@@ -26,7 +26,7 @@ async-trait = "0.1"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 gh-copilot-rs = { git = "https://github.com/ArtemisMucaj/gh-copilot-rs" }
-openai-rs = { git = "https://github.com/ArtemisMucaj/openai-rs" }
+openai-rs = { git = "https://github.com/ArtemisMucaj/openai-rs", branch = "feat/tool-calling" }
 
 [dev-dependencies]
 wiremock = "0.6"

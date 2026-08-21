@@ -1,7 +1,7 @@
 # guardrails
 
-`guardrails` is a transparent proxy for OpenAI-compatible chat-completions
-servers. It is designed for local model servers such as LM Studio, where models
+`guardrails` is a transparent proxy for OpenAI-compatible servers, speaking both
+the chat-completions and the Responses API. It is designed for local model servers such as LM Studio, where models
 often produce tool calls in inconsistent formats or omit required arguments.
 
 The proxy sits between your OpenAI-compatible client and backend. Plain chat
@@ -38,6 +38,19 @@ and repaired before the response reaches the client.
 - Optionally injects a synthetic `respond` tool so models can return a final text
   answer through the same tool-call path.
 
+## Both APIs
+
+`POST /v1/chat/completions` and `POST /v1/responses` are both guarded, with the
+same repairs. The two protocols differ in shape — Responses carries tool calls
+as `output[]` items typed `function_call` rather than `choices[].message.tool_calls`,
+declares tools flat rather than nested under `function`, and streams typed events
+instead of deltas — so the translation happens at the edges. The guardrails in
+between (rescue, validation, argument repair, retries, the synthetic `respond`
+tool) are shared, and every repair described below applies to both.
+
+A request is guarded on whichever API it arrives on; the proxy does not convert
+between them.
+
 ## Request Flow
 
 ```text
@@ -45,7 +58,13 @@ OpenAI client -> guardrail proxy -> LM Studio or another OpenAI-compatible serve
 ```
 
 Requests that declare no tools are forwarded bytes-for-bytes, streamed or not —
-there is no tool call to check.
+there is no tool call to check. This holds on `/v1/responses` too.
+
+On the Responses path, text is held back the moment it starts to look like a
+tool call written as prose (a `<tool_call>` marker, a fence, a leading
+`{"name":`). Forwarding it and then emitting the rescued call would show the
+client raw call syntax and then contradict it. Text that turns out to be
+ordinary prose is released when the stream ends.
 
 Tool-enabled requests run this loop, whether or not the client asked to stream:
 
@@ -401,6 +420,7 @@ guardrail/src/application/  HTTP proxy and guardrail loop
 guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
 guardrail/src/copilot/      GitHub Copilot provider and device-flow login
-guardrail/src/domain/       Decode, rescue, validate, retry, respond, and provider routing
+guardrail/src/domain/       Decode, rescue, validate, retry, respond, provider routing,
+                            and the Responses API translation
 guardrail/tests/            End-to-end proxy tests
 ```

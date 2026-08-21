@@ -13,7 +13,7 @@ use guardrail::domain::validate::ErrorCategory;
 async fn spawn_admin(db_path: std::path::PathBuf) -> String {
     let info = AdminInfo {
         version: "9.9.9".into(),
-        backend: "http://127.0.0.1:1234".into(),
+        providers: vec!["default=http://127.0.0.1:1234".into()],
         proxy_listen: "127.0.0.1:8080".into(),
         admin_listen: "127.0.0.1:8081".into(),
         max_retries: 2,
@@ -31,6 +31,7 @@ async fn spawn_admin(db_path: std::path::PathBuf) -> String {
 fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
     OutcomeRecord {
         ts: now_rfc3339(),
+        provider: "default".into(),
         model: model.into(),
         outcome,
         error_category: None,
@@ -70,7 +71,10 @@ async fn info_describes_the_proxy() {
         .await
         .unwrap();
     assert_eq!(body["version"], "9.9.9");
-    assert_eq!(body["backend"], "http://127.0.0.1:1234");
+    assert_eq!(
+        body["providers"],
+        serde_json::json!(["default=http://127.0.0.1:1234"])
+    );
     assert_eq!(body["max_retries"], 2);
 }
 

@@ -167,12 +167,20 @@ impl Usage {
         (self.prompt_tokens - self.cached_tokens).max(0)
     }
 
-    /// Fold another attempt's usage into this total.
+    /// Fold another usage total into this one.
+    ///
+    /// Adds `other.attempts` rather than a hard `1`, so folding an already
+    /// aggregated total keeps the backend-call count right. Every caller today
+    /// passes a single attempt straight from [`extract_usage`] (which reports
+    /// `attempts: 1`), making the two equivalent in practice — but a hard `1`
+    /// would silently undercount the moment anything folded a running total in,
+    /// and `calls_per_request` would understate the retry multiplier it exists
+    /// to expose.
     pub fn add(&mut self, other: Usage) {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.cached_tokens += other.cached_tokens;
-        self.attempts += 1;
+        self.attempts += other.attempts;
     }
 }
 
@@ -476,6 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn folding_an_aggregated_total_preserves_the_call_count() {
+        // `add` takes the other side's attempts rather than assuming one, so
+        // combining two running totals gives the same count as adding every
+        // attempt individually. Callers all pass single attempts today; this
+        // keeps that from being load-bearing.
+        let attempt = Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, attempts: 1 };
+
+        let mut one_at_a_time = Usage::default();
+        for _ in 0..4 {
+            one_at_a_time.add(attempt);
+        }
+
+        let mut left = Usage::default();
+        left.add(attempt);
+        left.add(attempt);
+        let mut right = Usage::default();
+        right.add(attempt);
+        right.add(attempt);
+        let mut combined = left;
+        combined.add(right);
+
+        assert_eq!(combined, one_at_a_time);
+        assert_eq!(combined.attempts, 4, "four backend calls, however grouped");
+    }
+
+    #[test]
     fn cached_tokens_never_exceed_the_prompt_in_the_uncached_split() {
         // A backend reporting more cached than prompt tokens would otherwise
         // yield a negative "new tokens" figure in the report.
@@ -601,6 +635,12 @@ mod sqlite {
         }
         dir.join("guardrails.sql")
     }
+
+    /// How far the conversation walk follows `parent_id` links before giving
+    /// up. Bounds the recursive query against a cycle, which nothing in the
+    /// proxy produces but a corrupted database could; well beyond any real
+    /// conversation length, so it never truncates honest data.
+    const MAX_CHAIN_DEPTH: u32 = 1024;
 
     /// Per-provider-and-model rollup, in the total → tool calls → errors
     /// hierarchy.
@@ -892,30 +932,56 @@ mod sqlite {
                 return Ok(());
             }
 
-            // `root` walks each turn up its parent edges. The anchor is every
-            // turn, mapped to itself; the recursive step replaces a turn's root
-            // with its parent's whenever that parent is a known row, so the
-            // walk terminates at the first turn. A chain whose parent was never
-            // recorded (metrics enabled mid-conversation) roots at the earliest
-            // turn we did see, which is the best available grouping.
+            // `chain` walks each turn up its parent edges, carrying the depth
+            // travelled. The anchor maps every turn to itself at depth 0; the
+            // recursive step steps one link further towards the first turn. So
+            // a turn appears once per ancestor, and the *deepest* of those rows
+            // — the one furthest from the turn — names the root of its chain.
+            //
+            // Depth is what picks the root, not the id. Response ids are opaque
+            // strings, so ordering them lexically would let a turn whose id
+            // happens to sort before its parent's keep itself as root, splitting
+            // one conversation into several and restoring the double counting
+            // this whole query exists to remove.
+            //
+            // `depth < MAX_CHAIN_DEPTH` bounds the walk. `UNION ALL` does not
+            // deduplicate, so a `parent_id` cycle — which nothing in the proxy
+            // should produce, but which a corrupted or hand-edited database
+            // could — would otherwise recurse until the process died. A chain
+            // longer than the bound simply groups from as far back as the walk
+            // reached, which is a partial grouping rather than a wrong one.
+            //
+            // A turn whose parent was never recorded (metrics enabled
+            // mid-conversation) roots at the earliest turn that *was* seen,
+            // which is the best grouping the data supports.
             let query = format!(
-                "WITH RECURSIVE chain(response_id, root) AS (\
-                     SELECT response_id, response_id FROM outcomes \
+                "WITH RECURSIVE chain(response_id, root, depth) AS (\
+                     SELECT response_id, response_id, 0 FROM outcomes \
                         WHERE response_id IS NOT NULL \
-                   UNION \
-                     SELECT o.response_id, c.root FROM outcomes o \
+                   UNION ALL \
+                     SELECT o.response_id, c.root, c.depth + 1 FROM outcomes o \
                         JOIN chain c ON o.parent_id = c.response_id \
-                        WHERE o.response_id IS NOT NULL\
+                        WHERE o.response_id IS NOT NULL AND c.depth < {MAX_CHAIN_DEPTH}\
+                 ), \
+                 deepest AS (\
+                     SELECT response_id, root, \
+                            ROW_NUMBER() OVER (\
+                                PARTITION BY response_id ORDER BY depth DESC\
+                            ) AS rn \
+                     FROM chain\
                  ), \
                  rooted AS (\
                      SELECT o.rowid AS rid, \
                             COALESCE({provider_col}, 'unknown') AS provider, \
                             o.model AS model, \
                             o.prompt_tokens AS prompt_tokens, \
-                            COALESCE(MIN(c.root), o.response_id) AS root \
-                     FROM outcomes o LEFT JOIN chain c ON c.response_id = o.response_id \
-                     WHERE o.prompt_tokens IS NOT NULL \
-                     GROUP BY o.rowid\
+                            COALESCE(\
+                                (SELECT d.root FROM deepest d \
+                                 WHERE d.response_id = o.response_id AND d.rn = 1), \
+                                o.response_id\
+                            ) AS root \
+                     FROM outcomes o \
+                     WHERE o.prompt_tokens IS NOT NULL\
                  ), \
                  per_conversation AS (\
                      SELECT provider, model, \
@@ -1606,6 +1672,65 @@ mod sqlite {
             assert_eq!(m.conversations, None);
             // And the report must not claim a deduplication it did not do.
             assert!(!stats.render().contains("distinct tokens"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_chain_groups_regardless_of_how_its_ids_happen_to_sort() {
+            // Response ids are opaque strings, so chain order and lexical order
+            // are unrelated. Here every later turn's id sorts *before* its
+            // parent's; picking a root by string comparison would leave each
+            // turn as its own root, split one conversation into three, and add
+            // the resent prefixes right back up. The root must come from the
+            // walk, not the ordering.
+            let dir = std::env::temp_dir().join(format!("guardrail-idsort-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("idsort.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_chained("m", usage_of(1000, 10), "zzz_first", None));
+            recorder.record(rec_chained("m", usage_of(2500, 20), "mmm_second", Some("zzz_first")));
+            recorder.record(rec_chained("m", usage_of(4200, 30), "aaa_third", Some("mmm_second")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+
+            assert_eq!(m.usage.prompt_tokens, 7700, "billed is unaffected");
+            // One conversation, so only the last turn's prompt counts.
+            assert_eq!(
+                m.conversations,
+                Some(1),
+                "lexically-descending ids must not split the chain"
+            );
+            assert_eq!(m.distinct_prompt_tokens, Some(4200));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_cycle_in_the_parent_links_terminates_instead_of_hanging() {
+            // Nothing in the proxy writes a cycle, but the recursive walk uses
+            // UNION ALL and would not terminate on one. A corrupted or
+            // hand-edited database must still let `stats` return.
+            let dir = std::env::temp_dir().join(format!("guardrail-cycle-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("cycle.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            {
+                let recorder = SqliteRecorder::open(&db).unwrap();
+                recorder.record(rec_chained("m", usage_of(100, 5), "x", Some("y")));
+                recorder.record(rec_chained("m", usage_of(200, 5), "y", Some("x")));
+            }
+
+            // The assertion is simply that this returns at all.
+            let stats = Stats::read(&db).expect("a cycle must not hang or error");
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 300);
+            assert!(m.distinct_prompt_tokens.is_some());
 
             let _ = std::fs::remove_dir_all(&dir);
         }

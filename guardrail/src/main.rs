@@ -7,7 +7,10 @@ use guardrail::application::AppState;
 use guardrail::cli::{shutdown_signal, Command, Config};
 use guardrail::connector::Backend;
 use guardrail::domain::metrics::{SqliteRecorder, Stats};
+use guardrail::admin::manage::Management;
+use guardrail::domain::config::{Config as ProxyConfig, ProviderConfig};
 use guardrail::domain::provider::Provider;
+use openai_rs::{ApiRoutes, Model, ModelCatalog, OpenAiModelCatalog, Transport};
 use guardrail::domain::registry::Registry;
 use tracing::{info, warn};
 
@@ -18,7 +21,12 @@ use tracing::{info, warn};
 /// requests naming one of its models still reach it through the default
 /// provider fallback. Failing startup here would make the multi-provider proxy
 /// less robust than the single-backend one it replaces.
-async fn discover_models(backend: &Backend, registry: &mut Registry) {
+async fn discover_models(
+    backend: &Backend,
+    registry: &mut Registry,
+    config: &ProxyConfig,
+    management: Option<&Arc<Management>>,
+) {
     // Cloned up front so the registry can be mutated while iterating. Going
     // through the `Backend` means each provider is asked with its own client —
     // Copilot's carries the credential its catalogue requires — and through
@@ -28,14 +36,29 @@ async fn discover_models(backend: &Backend, registry: &mut Registry) {
 
     for provider in &providers {
         let name = provider.name().to_string();
-        let url = provider.target("/v1/models");
-        match fetch_model_ids(backend, provider, &url).await {
-            Ok(ids) if ids.is_empty() => {
+        match fetch_models(backend, provider).await {
+            Ok(models) if models.is_empty() => {
                 info!(provider = %name, "no models reported");
             }
-            Ok(ids) => {
+            Ok(models) => {
+                if let Some(management) = management {
+                    management.set_discovered(&name, models.clone()).await;
+                }
                 let mut claimed = 0usize;
-                for id in &ids {
+                let mut hidden = 0usize;
+                for id in models.iter().map(|m| m.id.clone()).collect::<Vec<_>>().iter() {
+                    // A model the user chose not to expose is recorded as
+                    // hidden rather than routed, so it is neither listed nor
+                    // served.
+                    if !config
+                        .provider(&name)
+                        .map(|p| p.exposes(id))
+                        .unwrap_or(true)
+                    {
+                        registry.hide(id.clone());
+                        hidden += 1;
+                        continue;
+                    }
                     if registry.route(id.clone(), &name) {
                         claimed += 1;
                     } else {
@@ -48,7 +71,7 @@ async fn discover_models(backend: &Backend, registry: &mut Registry) {
                         );
                     }
                 }
-                info!(provider = %name, discovered = ids.len(), routed = claimed, "models discovered");
+                info!(provider = %name, discovered = models.len(), routed = claimed, hidden, "models discovered");
             }
             Err(e) => {
                 warn!(
@@ -60,39 +83,28 @@ async fn discover_models(backend: &Backend, registry: &mut Registry) {
     }
 }
 
-/// Read `data[].id` from an OpenAI-compatible models response.
-async fn fetch_model_ids(
-    backend: &Backend,
-    provider: &Provider,
-    url: &str,
-) -> anyhow::Result<Vec<String>> {
-    use guardrail::application::BackendPort;
-
-    let response = backend
-        .forward(
-            provider,
-            reqwest::Method::GET,
-            url,
-            &axum::http::HeaderMap::new(),
-            bytes::Bytes::new(),
-        )
-        .await;
-    if !response.status().is_success() {
-        anyhow::bail!("models request returned {}", response.status());
-    }
-    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await?;
-    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-    Ok(body
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default())
+/// List a provider's models.
+///
+/// Delegates to `openai-rs`, which already normalises the several shapes an
+/// OpenAI-compatible `/models` response comes in into one `Model` type. It is
+/// built on the provider's own HTTP client — Copilot's carries the credential
+/// its catalogue requires — via the transport escape hatch, so this shares the
+/// connection pool and auth rather than constructing a second client that would
+/// not be authenticated.
+async fn fetch_models(backend: &Backend, provider: &Provider) -> anyhow::Result<Vec<Model>> {
+    let routes = if provider.is_unversioned() {
+        ApiRoutes::unversioned()
+    } else {
+        ApiRoutes::default()
+    };
+    let transport = Transport::with_http_client(
+        backend.client_for(provider).clone(),
+        provider.base_url(),
+        routes,
+    );
+    Ok(OpenAiModelCatalog::with_transport(transport)
+        .list_models()
+        .await?)
 }
 
 #[tokio::main]
@@ -137,7 +149,41 @@ async fn main() -> anyhow::Result<()> {
 
     cfg.check_admin_exposure()?;
 
-    let mut providers = cfg.providers()?;
+    // The config file is the source of truth once it exists; CLI flags seed it
+    // on first run and are otherwise defaults. Without this, a change made
+    // through the management API would be overwritten by whatever flags the
+    // supervising app happened to pass on the next restart.
+    let config_path = ProxyConfig::default_path();
+    let mut config = match ProxyConfig::load(&config_path)? {
+        Some(config) => {
+            info!(path = %config_path.display(), "loaded configuration");
+            config
+        }
+        None => {
+            let seeded = ProxyConfig {
+                providers: cfg
+                    .providers()?
+                    .iter()
+                    .map(|p| ProviderConfig::new(p.name(), p.base_url()))
+                    .collect(),
+            };
+            seeded.save(&config_path)?;
+            info!(path = %config_path.display(), "seeded configuration from the command line");
+            seeded
+        }
+    };
+
+    let mut providers: Vec<Provider> = config
+        .enabled_providers()
+        .map(|p| {
+            let provider = Provider::new(&p.name, &p.base_url);
+            if p.unversioned {
+                provider.unversioned()
+            } else {
+                provider
+            }
+        })
+        .collect();
 
     // Copilot is a provider like any other once built, but it needs a
     // credential and its own HTTP client carrying it.
@@ -153,8 +199,20 @@ async fn main() -> anyhow::Result<()> {
                     Duration::from_secs(cfg.read_timeout_secs),
                 )?;
                 backend = backend.with_client_for(built.provider.name(), built.client);
-                providers.push(built.provider);
-                info!("copilot provider enabled");
+                if config.provider(built.provider.name()).is_none() {
+                    let mut entry =
+                        ProviderConfig::new(built.provider.name(), built.provider.base_url());
+                    entry.unversioned = true;
+                    config.providers.push(entry);
+                    config.save(&config_path)?;
+                }
+                if config
+                    .provider(built.provider.name())
+                    .is_some_and(|p| p.enabled)
+                {
+                    providers.push(built.provider);
+                    info!("copilot provider enabled");
+                }
             }
             None => {
                 // Not fatal: the operator can log in through the admin server
@@ -175,8 +233,25 @@ async fn main() -> anyhow::Result<()> {
     // startup is kept, not dropped: a local server is often started after the
     // proxy, and refusing to route to it would be worse than discovering its
     // models late.
-    let mut registry = Registry::new(providers).expect("providers() rejects an empty list");
-    discover_models(&backend, &mut registry).await;
+    let Some(mut registry) = Registry::new(providers) else {
+        anyhow::bail!(
+            "no provider is enabled — enable one in {} or pass --backend",
+            config_path.display()
+        );
+    };
+
+    // Built before discovery so it can record what each provider reports; the
+    // registry it shares is replaced wholesale on every change.
+    let shared_registry: guardrail::application::SharedRegistry =
+        Arc::new(tokio::sync::RwLock::new(Arc::new(registry.clone())));
+    let management = Management::new(
+        shared_registry.clone(),
+        config.clone(),
+        config_path.clone(),
+    );
+
+    discover_models(&backend, &mut registry, &config, Some(&management)).await;
+    *shared_registry.write().await = Arc::new(registry.clone());
 
     // Backend URLs are operator-controlled and may embed basic-auth
     // credentials or token-bearing query params; expose only scheme/host/port.
@@ -185,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| format!("{}={}", p.name(), redact_backend_url(p.base_url())))
         .collect();
 
-    let state = AppState::with_registry(backend, registry)
+    let state = AppState::with_shared_registry(backend, shared_registry.clone())
         .with_guardrails(guardrails)
         .with_recorder(recorder);
 
@@ -214,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
             max_retries: guardrails.max_retries,
             database: db_path.display().to_string(),
         };
-        let mut admin_state = AdminState::new(db_path, info);
+        let mut admin_state = AdminState::new(db_path, info).with_management(management.clone());
         if let Some(login) = copilot_login.clone() {
             admin_state = admin_state.with_login(login);
         }

@@ -5,7 +5,7 @@
 //! ids to providers and falls back to a default, so a model the proxy has never
 //! heard of still reaches somewhere sensible instead of failing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::provider::Provider;
@@ -19,6 +19,10 @@ pub struct Registry {
     providers: Vec<Arc<Provider>>,
     /// Model id → index into `providers`.
     routes: BTreeMap<String, usize>,
+    /// Model ids discovered but deliberately not exposed. Kept apart from
+    /// `routes` so a hidden model is distinguishable from one that was never
+    /// discovered: the first is refused, the second falls back.
+    hidden: BTreeSet<String>,
     /// Index of the provider serving unknown and absent models.
     default: usize,
 }
@@ -30,6 +34,7 @@ impl Registry {
         Self {
             providers: vec![Arc::new(provider)],
             routes: BTreeMap::new(),
+            hidden: BTreeSet::new(),
             default: 0,
         }
     }
@@ -46,6 +51,7 @@ impl Registry {
         Some(Self {
             providers: providers.into_iter().map(Arc::new).collect(),
             routes: BTreeMap::new(),
+            hidden: BTreeSet::new(),
             default: 0,
         })
     }
@@ -69,11 +75,27 @@ impl Registry {
         true
     }
 
+    /// Record `model` as discovered but not exposed.
+    pub fn hide(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        self.routes.remove(&model);
+        self.hidden.insert(model);
+    }
+
+    /// Whether `model` was discovered and deliberately hidden.
+    pub fn is_hidden(&self, model: &str) -> bool {
+        self.hidden.contains(model)
+    }
+
     /// The provider serving `model`, or the default when the id is unknown.
     ///
     /// Unknown ids fall back rather than erroring: discovery can miss a model
     /// that a backend loaded after startup, and refusing those would make the
     /// proxy less useful than the single-backend version it replaces.
+    ///
+    /// A *hidden* id is not unknown — the user decided against it — so callers
+    /// should check [`Self::is_hidden`] first and refuse rather than falling
+    /// back, or hiding a model would silently route it somewhere else.
     pub fn resolve(&self, model: Option<&str>) -> &Arc<Provider> {
         model
             .and_then(|model| self.routes.get(model))
@@ -172,6 +194,31 @@ mod tests {
         let mut registry = registry();
         assert!(!registry.route("gpt-4o", "no-such-provider"));
         assert!(!registry.has_route("gpt-4o"));
+    }
+
+    #[test]
+    fn a_hidden_model_is_distinguishable_from_an_unknown_one() {
+        // The distinction that keeps hiding meaningful: an unknown id falls
+        // back to the default provider, a hidden one must be refused. Without
+        // it, hiding a model would route it to the default instead.
+        let mut registry = registry();
+        registry.route("gpt-4o", "copilot");
+        registry.hide("gpt-4o");
+
+        assert!(registry.is_hidden("gpt-4o"));
+        assert!(!registry.has_route("gpt-4o"));
+        assert!(!registry.is_hidden("never-discovered"));
+    }
+
+    #[test]
+    fn hiding_removes_the_route_so_it_is_not_listed() {
+        let mut registry = registry();
+        registry.route("gpt-4o", "copilot");
+        registry.route("qwen2.5-7b", "lmstudio");
+        registry.hide("gpt-4o");
+
+        let routes: Vec<(&str, &str)> = registry.routes().collect();
+        assert_eq!(routes, vec![("qwen2.5-7b", "lmstudio")]);
     }
 
     #[test]

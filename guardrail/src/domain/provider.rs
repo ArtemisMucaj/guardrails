@@ -107,6 +107,11 @@ impl Provider {
         self
     }
 
+    /// Whether this provider serves the OpenAI routes at the root.
+    pub fn is_unversioned(&self) -> bool {
+        self.strip_v1
+    }
+
     /// The URL to send a request for `path_and_query` to.
     pub fn target(&self, path_and_query: &str) -> String {
         format!("{}{}", self.base_url, self.upstream_path(path_and_query))

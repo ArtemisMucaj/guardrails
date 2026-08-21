@@ -900,7 +900,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openai-rs"
 version = "0.1.0"
-source = "git+https://github.com/ArtemisMucaj/openai-rs?branch=feat%2Ftool-calling#6b693f4b2ab407caae4c6095ad149522bc71f079"
+source = "git+https://github.com/ArtemisMucaj/openai-rs#ef65bbb91dd3cd3b8189da11e5014b86db00be54"
 dependencies = [
  "async-trait",
  "futures-util",

@@ -133,9 +133,108 @@ impl AppState {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", any(proxy))
-        .route("/v1/models", any(proxy))
+        .route("/v1/models", any(models))
         .fallback(any(proxy))
         .with_state(state)
+}
+
+/// `GET /v1/models` — the union of every provider's catalogue.
+///
+/// With several providers a client must see all of their models, not the
+/// default provider's alone, or it cannot name a model that would route
+/// elsewhere. Non-GET requests to this path keep the old behaviour and are
+/// forwarded to the default provider.
+async fn models(State(state): State<AppState>, req: Request) -> Response {
+    // With one provider there is nothing to merge and nothing to disambiguate,
+    // so the response is forwarded untouched. Tagging it would break the
+    // byte-for-byte passthrough single-backend users have today, for no
+    // information they do not already have.
+    if req.method() != axum::http::Method::GET || state.registry.len() == 1 {
+        return proxy(State(state), req).await;
+    }
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1/models")
+        .to_string();
+    let headers = req.headers().clone();
+
+    // Ask every provider concurrently: the response is as slow as the slowest
+    // one, not the sum.
+    let lookups = state.registry.providers().map(|provider| {
+        let provider = provider.clone();
+        let port = state.port.clone();
+        let headers = headers.clone();
+        let target = provider.target(&path_and_query);
+        async move {
+            let response = port
+                .forward(&provider, axum::http::Method::GET, &target, &headers, bytes::Bytes::new())
+                .await;
+            (provider, read_models(response).await)
+        }
+    });
+
+    let mut merged: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reachable = 0usize;
+
+    for (provider, models) in futures_util::future::join_all(lookups).await {
+        match models {
+            Some(models) => {
+                reachable += 1;
+                for model in models {
+                    // Tag each entry with the provider that serves it, so a
+                    // client (or a UI) can tell two same-named models apart.
+                    let id = model.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    if !id.is_empty() && !seen.insert(id) {
+                        // An id already claimed by an earlier provider routes
+                        // there, so listing it twice would misdescribe routing.
+                        continue;
+                    }
+                    let mut model = model;
+                    if let Some(obj) = model.as_object_mut() {
+                        obj.insert("provider".to_string(), Value::String(provider.name().to_string()));
+                    }
+                    merged.push(model);
+                }
+            }
+            None => {
+                // Unreachable or unparseable: the other providers' models are
+                // still worth returning, so this degrades rather than fails.
+                warn!(provider = %provider.name(), "could not list models for the aggregate");
+            }
+        }
+    }
+
+    // The registry always holds at least one provider, so no provider
+    // answering means every one of them failed.
+    if reachable == 0 {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "no provider could list its models",
+        )
+            .into_response();
+    }
+
+    json_response(
+        StatusCode::OK,
+        HeaderMap::new(),
+        &serde_json::json!({ "object": "list", "data": merged }),
+    )
+}
+
+/// Pull `data[]` out of an OpenAI-compatible `/v1/models` response, or `None`
+/// when the provider did not answer with one.
+async fn read_models(response: Response) -> Option<Vec<Value>> {
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), MAX_REQUEST_BODY)
+        .await
+        .ok()?;
+    let body: Value = serde_json::from_slice(&bytes).ok()?;
+    Some(body.get("data")?.as_array()?.clone())
 }
 
 async fn proxy(State(state): State<AppState>, req: Request) -> Response {

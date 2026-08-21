@@ -107,6 +107,14 @@ Three rules make routing predictable:
 A single bare `--backend URL` still behaves exactly as before; it is named
 `default`.
 
+`GET /v1/models` returns the union across providers, each entry tagged with the
+`provider` that serves it, so a client can name any routable model. An id served
+by more than one provider is listed once, under the provider routing sends it to.
+A provider that cannot be reached is skipped rather than emptying the list; if
+none can be reached the endpoint answers `502` rather than claiming the proxy
+serves no models. With a single backend the response is forwarded untouched, so
+the byte-for-byte passthrough is preserved.
+
 The prebuilt macOS release binary is signed with a Developer ID and notarized
 by Apple, so it runs without a Gatekeeper exception.
 

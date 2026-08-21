@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.4...v0.9.0) (2026-08-21)
+
+
+### Features
+
+* aggregate /v1/models across providers ([#39](https://github.com/ArtemisMucaj/guardrails/issues/39)) ([a1bb9d1](https://github.com/ArtemisMucaj/guardrails/commit/a1bb9d1332ab012098c28aa3bc1cd8548a88c18e)), closes [#35](https://github.com/ArtemisMucaj/guardrails/issues/35)
+* choose which models each provider exposes, at runtime ([#41](https://github.com/ArtemisMucaj/guardrails/issues/41)) ([f43039a](https://github.com/ArtemisMucaj/guardrails/commit/f43039ade5a0888554d9bd1c147e5620b28a28f5))
+* guard the OpenAI Responses API ([#42](https://github.com/ArtemisMucaj/guardrails/issues/42)) ([734ee8c](https://github.com/ArtemisMucaj/guardrails/commit/734ee8c1fb544b135c5d4ab04ea0da5305a9df52))
+* proxy GitHub Copilot models ([#40](https://github.com/ArtemisMucaj/guardrails/issues/40)) ([e9f06d3](https://github.com/ArtemisMucaj/guardrails/commit/e9f06d38033a709489c18e176841bb9e1162d3f5)), closes [#36](https://github.com/ArtemisMucaj/guardrails/issues/36)
+* route to multiple providers, selected per model ([#38](https://github.com/ArtemisMucaj/guardrails/issues/38)) ([37df151](https://github.com/ArtemisMucaj/guardrails/commit/37df15151fff9a7c11b8edfcdc372113438bd390)), closes [#35](https://github.com/ArtemisMucaj/guardrails/issues/35)
+
 ## [0.8.4](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.3...v0.8.4) (2026-08-05)
 
 

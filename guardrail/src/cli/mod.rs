@@ -56,6 +56,23 @@ pub struct Config {
     /// Set to `0` to disable retries while keeping the other repairs.
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
+
+    /// Proxy GitHub Copilot models, using a Copilot subscription.
+    ///
+    /// Requires a device-flow login: start the proxy with `--admin-listen` and
+    /// `POST /copilot/login`, or place a token at the store path. Because the
+    /// proxy then holds a credential, the admin server must be bound to a
+    /// loopback address.
+    #[arg(long, env = "GUARDRAIL_COPILOT", default_value_t = false)]
+    pub copilot: bool,
+
+    /// Base URL of the Copilot API. Override for an enterprise deployment.
+    #[arg(
+        long,
+        env = "GUARDRAIL_COPILOT_BASE_URL",
+        default_value = "https://api.githubcopilot.com"
+    )]
+    pub copilot_base_url: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -124,6 +141,28 @@ impl Config {
             anyhow::bail!("no backend configured");
         }
         Ok(providers)
+    }
+
+    /// Reject an admin server exposed off-host while a credential is held.
+    ///
+    /// The admin server is unauthenticated by design, and with `--copilot` it
+    /// can both start a login and front a Copilot subscription. Binding it to a
+    /// non-loopback address would let anything that can reach the host use that
+    /// credential, so this is enforced rather than merely documented.
+    pub fn check_admin_exposure(&self) -> anyhow::Result<()> {
+        if !self.copilot {
+            return Ok(());
+        }
+        if let Some(addr) = self.admin_listen {
+            if !addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "--admin-listen {addr} is not a loopback address, and --copilot makes the \
+                     admin server able to start a login and use a Copilot credential. Bind it to \
+                     127.0.0.1 (or [::1]) instead."
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -254,6 +293,38 @@ mod tests {
     fn a_named_backend_without_a_url_is_rejected() {
         let error = config(&["--backend", "lmstudio="]).providers().unwrap_err();
         assert!(error.to_string().contains("no URL"), "got: {error}");
+    }
+
+    #[test]
+    fn copilot_refuses_an_admin_server_bound_off_host() {
+        // Unauthenticated + holds a credential + reachable off-host is the
+        // combination worth failing at startup rather than documenting.
+        let error = config(&["--copilot", "--admin-listen", "0.0.0.0:8081"])
+            .check_admin_exposure()
+            .unwrap_err();
+        assert!(error.to_string().contains("loopback"), "got: {error}");
+    }
+
+    #[test]
+    fn copilot_allows_a_loopback_admin_server() {
+        for addr in ["127.0.0.1:8081", "[::1]:8081"] {
+            config(&["--copilot", "--admin-listen", addr])
+                .check_admin_exposure()
+                .expect("loopback must be allowed");
+        }
+    }
+
+    #[test]
+    fn without_copilot_the_admin_bind_is_unconstrained() {
+        // No credential is held, so this stays the operator's call.
+        config(&["--admin-listen", "0.0.0.0:8081"])
+            .check_admin_exposure()
+            .expect("unchanged without --copilot");
+    }
+
+    #[test]
+    fn copilot_without_an_admin_server_is_fine() {
+        config(&["--copilot"]).check_admin_exposure().unwrap();
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct Provider {
     /// Header names this provider owns. Stripped from the client's headers
     /// before forwarding so they cannot displace the provider's own values.
     reserved_headers: BTreeSet<String>,
+    /// Whether the upstream serves the OpenAI routes at the root rather than
+    /// under `/v1`.
+    strip_v1: bool,
 }
 
 impl Provider {
@@ -47,6 +50,7 @@ impl Provider {
             name: name.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             reserved_headers: BTreeSet::new(),
+            strip_v1: false,
         }
     }
 
@@ -93,9 +97,32 @@ impl Provider {
         self.reserved_headers.iter().map(String::as_str)
     }
 
+    /// Serve the OpenAI routes at the root instead of under `/v1`.
+    ///
+    /// Copilot does this. Getting it wrong 404s every call, and the proxy's own
+    /// surface stays `/v1/...` regardless — clients should not have to know
+    /// which upstream shape is behind it.
+    pub fn unversioned(mut self) -> Self {
+        self.strip_v1 = true;
+        self
+    }
+
     /// The URL to send a request for `path_and_query` to.
     pub fn target(&self, path_and_query: &str) -> String {
-        format!("{}{}", self.base_url, path_and_query)
+        format!("{}{}", self.base_url, self.upstream_path(path_and_query))
+    }
+
+    /// The client's path as this provider expects to receive it.
+    fn upstream_path<'a>(&self, path_and_query: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.strip_v1 {
+            return std::borrow::Cow::Borrowed(path_and_query);
+        }
+        match path_and_query.strip_prefix("/v1/") {
+            Some(rest) => std::borrow::Cow::Owned(format!("/{rest}")),
+            // `/v1` exactly, or a path that was never versioned: leave it be
+            // rather than inventing a route the upstream may not serve.
+            None => std::borrow::Cow::Borrowed(path_and_query),
+        }
     }
 }
 
@@ -137,6 +164,47 @@ mod tests {
         assert!(provider.reserves("USER-AGENT"));
         assert!(provider.reserves("x-custom"));
         assert!(!provider.reserves("x-other"));
+    }
+
+    #[test]
+    fn an_unversioned_provider_serves_the_routes_at_the_root() {
+        // Copilot's shape. The proxy's own surface stays /v1/... either way.
+        let provider = Provider::new("copilot", "https://api.githubcopilot.com").unversioned();
+        assert_eq!(
+            provider.target("/v1/chat/completions"),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            provider.target("/v1/models"),
+            "https://api.githubcopilot.com/models"
+        );
+    }
+
+    #[test]
+    fn stripping_v1_keeps_the_query_string() {
+        let provider = Provider::new("p", "https://host").unversioned();
+        assert_eq!(
+            provider.target("/v1/models?limit=10"),
+            "https://host/models?limit=10"
+        );
+    }
+
+    #[test]
+    fn a_path_without_a_v1_prefix_is_left_alone() {
+        // Inventing a route the upstream may not serve would turn a clear 404
+        // into a confusing one.
+        let provider = Provider::new("p", "https://host").unversioned();
+        assert_eq!(provider.target("/healthz"), "https://host/healthz");
+        assert_eq!(provider.target("/v1"), "https://host/v1");
+    }
+
+    #[test]
+    fn a_versioned_provider_forwards_the_path_untouched() {
+        let provider = Provider::new("lmstudio", "http://127.0.0.1:1234");
+        assert_eq!(
+            provider.target("/v1/chat/completions"),
+            "http://127.0.0.1:1234/v1/chat/completions"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod admin;
 pub mod application;
 pub mod cli;
 pub mod connector;
+pub mod copilot;
 pub mod domain;
 
 // Re-export the public API.

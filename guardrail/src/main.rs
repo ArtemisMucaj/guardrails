@@ -7,6 +7,7 @@ use guardrail::application::AppState;
 use guardrail::cli::{shutdown_signal, Command, Config};
 use guardrail::connector::Backend;
 use guardrail::domain::metrics::{SqliteRecorder, Stats};
+use guardrail::domain::provider::Provider;
 use guardrail::domain::registry::Registry;
 use tracing::{info, warn};
 
@@ -17,25 +18,25 @@ use tracing::{info, warn};
 /// requests naming one of its models still reach it through the default
 /// provider fallback. Failing startup here would make the multi-provider proxy
 /// less robust than the single-backend one it replaces.
-async fn discover_models(client: &reqwest::Client, registry: &mut Registry) {
-    let names: Vec<String> = registry
-        .providers()
-        .map(|p| p.name().to_string())
-        .collect();
-    let urls: Vec<String> = registry
-        .providers()
-        .map(|p| format!("{}/v1/models", p.base_url()))
-        .collect();
+async fn discover_models(backend: &Backend, registry: &mut Registry) {
+    // Cloned up front so the registry can be mutated while iterating. Going
+    // through the `Backend` means each provider is asked with its own client —
+    // Copilot's carries the credential its catalogue requires — and through
+    // `target`, so a provider serving its routes at the root is asked at
+    // `/models` rather than a `/v1/models` that would 404.
+    let providers: Vec<Provider> = registry.providers().map(|p| (**p).clone()).collect();
 
-    for (name, url) in names.iter().zip(urls.iter()) {
-        match fetch_model_ids(client, url).await {
+    for provider in &providers {
+        let name = provider.name().to_string();
+        let url = provider.target("/v1/models");
+        match fetch_model_ids(backend, provider, &url).await {
             Ok(ids) if ids.is_empty() => {
                 info!(provider = %name, "no models reported");
             }
             Ok(ids) => {
                 let mut claimed = 0usize;
                 for id in &ids {
-                    if registry.route(id.clone(), name) {
+                    if registry.route(id.clone(), &name) {
                         claimed += 1;
                     } else {
                         // Another provider listed this id first. The operator's
@@ -59,9 +60,28 @@ async fn discover_models(client: &reqwest::Client, registry: &mut Registry) {
     }
 }
 
-/// Read `data[].id` from an OpenAI-compatible `/v1/models` response.
-async fn fetch_model_ids(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
-    let body: serde_json::Value = client.get(url).send().await?.json().await?;
+/// Read `data[].id` from an OpenAI-compatible models response.
+async fn fetch_model_ids(
+    backend: &Backend,
+    provider: &Provider,
+    url: &str,
+) -> anyhow::Result<Vec<String>> {
+    use guardrail::application::BackendPort;
+
+    let response = backend
+        .forward(
+            provider,
+            reqwest::Method::GET,
+            url,
+            &axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await;
+    if !response.status().is_success() {
+        anyhow::bail!("models request returned {}", response.status());
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
     Ok(body
         .get("data")
         .and_then(serde_json::Value::as_array)
@@ -115,7 +135,40 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let providers = cfg.providers()?;
+    cfg.check_admin_exposure()?;
+
+    let mut providers = cfg.providers()?;
+
+    // Copilot is a provider like any other once built, but it needs a
+    // credential and its own HTTP client carrying it.
+    let mut backend = Backend::new(client.clone());
+    let copilot_login = if cfg.copilot {
+        let login = guardrail::copilot::CopilotLogin::new(guardrail::copilot::default_token_path())?;
+        match login.token().await {
+            Some(token) => {
+                let built = guardrail::copilot::provider_at(
+                    token,
+                    &cfg.copilot_base_url,
+                    Duration::from_secs(cfg.connect_timeout_secs),
+                    Duration::from_secs(cfg.read_timeout_secs),
+                )?;
+                backend = backend.with_client_for(built.provider.name(), built.client);
+                providers.push(built.provider);
+                info!("copilot provider enabled");
+            }
+            None => {
+                // Not fatal: the operator can log in through the admin server
+                // and restart, and the other providers still work meanwhile.
+                warn!(
+                    "copilot is enabled but no token is stored; \
+                     POST /copilot/login on the admin server to authorize, then restart"
+                );
+            }
+        }
+        Some(login)
+    } else {
+        None
+    };
 
     // Ask each provider which models it serves, so requests route by model
     // without the operator hand-maintaining a list. A provider that is down at
@@ -123,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
     // proxy, and refusing to route to it would be worse than discovering its
     // models late.
     let mut registry = Registry::new(providers).expect("providers() rejects an empty list");
-    discover_models(&client, &mut registry).await;
+    discover_models(&backend, &mut registry).await;
 
     // Backend URLs are operator-controlled and may embed basic-auth
     // credentials or token-bearing query params; expose only scheme/host/port.
@@ -132,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| format!("{}={}", p.name(), redact_backend_url(p.base_url())))
         .collect();
 
-    let state = AppState::with_registry(Backend::new(client), registry)
+    let state = AppState::with_registry(backend, registry)
         .with_guardrails(guardrails)
         .with_recorder(recorder);
 
@@ -161,7 +214,11 @@ async fn main() -> anyhow::Result<()> {
             max_retries: guardrails.max_retries,
             database: db_path.display().to_string(),
         };
-        let admin_app = build_admin_app(AdminState::new(db_path, info));
+        let mut admin_state = AdminState::new(db_path, info);
+        if let Some(login) = copilot_login.clone() {
+            admin_state = admin_state.with_login(login);
+        }
+        let admin_app = build_admin_app(admin_state);
         let admin = axum::serve(admin_listener, admin_app).with_graceful_shutdown(shutdown_signal());
 
         info!(admin_listen = %admin_addr, "admin server starting");

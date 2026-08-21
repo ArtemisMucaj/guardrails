@@ -137,3 +137,87 @@ async fn stats_returns_the_metrics_rollup_as_json() {
     assert_eq!(err["error_category"], "missing_argument");
     assert_eq!(err["count"], 1);
 }
+
+#[tokio::test]
+async fn copilot_login_routes_are_absent_without_a_copilot_provider() {
+    // The mutable surface should not exist at all unless it is needed.
+    let admin = spawn_admin(temp_db("no-copilot")).await;
+
+    let status = reqwest::get(format!("{admin}/copilot/login")).await.unwrap();
+    assert_eq!(status.status(), 404);
+
+    let started = reqwest::Client::new()
+        .post(format!("{admin}/copilot/login"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 404);
+
+    // And discovery must not advertise it.
+    let index: serde_json::Value = reqwest::get(format!("{admin}/"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let endpoints = index["endpoints"].as_array().unwrap();
+    assert!(
+        !endpoints.iter().any(|e| e == "/copilot/login"),
+        "got: {endpoints:?}"
+    );
+}
+
+#[tokio::test]
+async fn copilot_login_status_is_idle_before_any_attempt_and_carries_no_token() {
+    let db = temp_db("copilot-idle");
+    let store = db.with_file_name("copilot-token-idle");
+    let _ = std::fs::remove_file(&store);
+
+    let login = guardrail::copilot::CopilotLogin::new(store.clone()).unwrap();
+    let state = AdminState::new(
+        db,
+        AdminInfo {
+            version: "9.9.9".into(),
+            providers: vec!["copilot=https://api.githubcopilot.com".into()],
+            proxy_listen: "127.0.0.1:8080".into(),
+            admin_listen: "127.0.0.1:8081".into(),
+            max_retries: 2,
+            database: "/tmp/db".into(),
+        },
+    )
+    .with_login(login);
+
+    let app = guardrail::build_admin_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!("http://{addr}/copilot/login"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+
+    assert_eq!(body, r#"{"status":"idle"}"#);
+    // The guarantee that makes this endpoint safe: CopilotToken is
+    // serde-transparent, so a credential in a serialized type would be emitted
+    // in full rather than redacted.
+    assert!(!body.contains("ghu_"), "a response body must never carry a token");
+
+    // The route is listed once it exists.
+    let index: serde_json::Value = reqwest::get(format!("http://{addr}/"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(index["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e == "/copilot/login"));
+
+    let _ = std::fs::remove_file(&store);
+}

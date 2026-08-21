@@ -78,6 +78,35 @@ Then point your client at:
 http://127.0.0.1:8080/v1
 ```
 
+### Proxying several backends
+
+Repeat `--backend` as `NAME=URL` to put more than one server behind the same
+port. Requests route by the model they name:
+
+```bash
+cargo run -p guardrail -- \
+  --backend lmstudio=http://127.0.0.1:1234 \
+  --backend other=http://127.0.0.1:5678
+```
+
+At startup the proxy asks each backend which models it serves and builds the
+routing table from the answers, so the model list is never hand-maintained. A
+backend that is unreachable at startup keeps its place — a local server is often
+started after the proxy — it simply claims no models until the next restart.
+
+Three rules make routing predictable:
+
+- **The first backend is the default.** It serves any model no other backend
+  claims, including models that discovery missed and requests that name none.
+- **The first to claim a model id wins.** When two backends both serve `gpt-4o`,
+  the one listed first gets it, and the other is logged rather than silently
+  preferred.
+- **Names must be unique**, and every backend after the first must be named, so
+  its requests can be told apart in the metrics.
+
+A single bare `--backend URL` still behaves exactly as before; it is named
+`default`.
+
 The prebuilt macOS release binary is signed with a Developer ID and notarized
 by Apple, so it runs without a Gatekeeper exception.
 
@@ -89,7 +118,7 @@ Every option is available as both a CLI flag and an environment variable.
 | --- | --- | --- | --- |
 | `--listen` | `GUARDRAIL_LISTEN` | `127.0.0.1:8080` | Proxy listen address. |
 | `--admin-listen` | `GUARDRAIL_ADMIN_LISTEN` | _(disabled)_ | Address for the read-only admin HTTP server (stats, health, info), on a separate port. Disabled unless set. |
-| `--backend` | `GUARDRAIL_BACKEND` | `http://127.0.0.1:1234` | Backend base URL. |
+| `--backend` | `GUARDRAIL_BACKEND` | `http://127.0.0.1:1234` | An OpenAI-compatible backend, as `URL` or `NAME=URL`. Repeat to proxy several; the environment variable takes a comma-separated list. |
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
@@ -110,11 +139,14 @@ no tools — which have no tool call to check — are recorded as passthroughs, 
 the report reflects all chat traffic instead of being empty for clients that only
 ever stream. The database is a general
 SQLite file — `outcomes` is created with `CREATE TABLE IF NOT EXISTS`, so other
-tables can live alongside it. Recording happens on a background writer thread, so
+tables can live alongside it. A database written before per-provider
+stats existed lacks the `provider` column; the proxy recreates the `outcomes`
+table on first run and logs that it did, discarding the previous request
+history rather than leaving metrics disabled. Other tables are left alone. Recording happens on a background writer thread, so
 it never blocks the proxy's response path, and the database uses WAL mode so you
 can query it while the proxy runs.
 
-Each row captures the request's `model`, the terminal `outcome`, an
+Each row captures the serving `provider`, the request's `model`, the terminal `outcome`, an
 `error_category` (for unfixed errors), the rescue `parser`, the offending
 `tool_name`, the number of `retries`, whether the guardrails `fixed` it, and a
 redacted `detail` snippet for triage.
@@ -141,7 +173,7 @@ Error categories (on `retries_exhausted`): `unknown_tool`, `bad_arguments`,
 ### Viewing stats
 
 The `stats` subcommand reads the database and prints a text report in a
-**total → tool calls → errors** hierarchy per model: every guarded request
+**total → tool calls → errors** hierarchy per provider and model: every guarded request
 (`total`), how many were a real tool call (`tool calls`), how many of those the
 guardrails could not fix (`errors`), the success rate over tool calls, the full
 outcome breakdown, and the triage list of errors (with a redacted argument
@@ -152,10 +184,10 @@ cargo run -p guardrail -- stats
 ```
 
 ```text
-Requests by model
-=================
+Requests by provider and model
+==============================
 
-qwen2.5-7b
+lmstudio / qwen2.5-7b
   total: 168  |  tool calls: 142  |  succeeded: 137  |  errors: 5  |  success rate: 96.5%
     native_valid           110
     rescued                 18
@@ -167,7 +199,7 @@ qwen2.5-7b
 Errors (triage list)
 ====================
 
-  [3x] qwen2.5-7b / missing_argument / Edit
+  [3x] lmstudio / qwen2.5-7b / missing_argument / Edit
         The arguments for tool "Edit" were missing required field "filePath". … | args: {"oldString":"a","newString":"b"}
 ```
 
@@ -204,7 +236,7 @@ authenticated.
 | Method & path | Returns |
 | --- | --- |
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
-| `GET /info` | The running proxy's `version`, `backend` (reduced to scheme/host/port — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
+| `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
 | `GET /` | Lists the available endpoints. |
 
@@ -217,6 +249,7 @@ database runs in WAL mode, these reads never block the proxy's writes.
 {
   "per_model": [
     {
+      "provider": "lmstudio",
       "model": "qwen2.5-7b",
       "total": 168,
       "tool_calls": 142,
@@ -231,6 +264,7 @@ database runs in WAL mode, these reads never block the proxy's writes.
   ],
   "errors": [
     {
+      "provider": "lmstudio",
       "model": "qwen2.5-7b",
       "error_category": "missing_argument",
       "tool_name": "Edit",
@@ -277,6 +311,6 @@ calls.
 guardrail/src/application/  HTTP proxy and guardrail loop
 guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
-guardrail/src/domain/       Decode, rescue, validate, retry, and respond logic
+guardrail/src/domain/       Decode, rescue, validate, retry, respond, and provider routing
 guardrail/tests/            End-to-end proxy tests
 ```

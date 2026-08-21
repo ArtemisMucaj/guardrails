@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::application::BackendPort;
+use crate::domain::provider::Provider;
 
 /// Concrete backend adapter that delegates to a `reqwest::Client`.
 #[derive(Clone)]
@@ -24,19 +25,26 @@ impl Backend {
     }
 }
 
+/// Headers to forward for `provider`, with the provider's own names removed.
+fn headers_for(provider: &Provider, headers: &HeaderMap) -> HeaderMap {
+    forward_headers_reserving(headers, |name| provider.reserves(name))
+}
+
 #[async_trait::async_trait]
 impl BackendPort for Backend {
     async fn post(
         &self,
+        provider: &Provider,
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
-        post_backend(&self.client, target, headers, body).await
+        post_backend(&self.client, &headers_for(provider, headers), target, body).await
     }
 
     async fn stream_post(
         &self,
+        provider: &Provider,
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
@@ -46,7 +54,7 @@ impl BackendPort for Backend {
         let resp = self
             .client
             .post(target)
-            .headers(forward_headers(headers))
+            .headers(headers_for(provider, headers))
             .body(body)
             .send()
             .await
@@ -127,6 +135,7 @@ impl BackendPort for Backend {
 
     async fn forward(
         &self,
+        provider: &Provider,
         method: Method,
         target: &str,
         headers: &HeaderMap,
@@ -137,7 +146,7 @@ impl BackendPort for Backend {
         let resp = match self
             .client
             .request(method, target)
-            .headers(forward_headers(headers))
+            .headers(headers_for(provider, headers))
             .body(body.to_vec())
             .send()
             .await
@@ -200,15 +209,18 @@ fn json_to_sse(json: &str) -> String {
 
 /// POST a body to the backend and return the status, filtered response headers,
 /// and the fully-buffered body. Errors are mapped to a client-facing response.
+///
+/// `headers` are already filtered for the target provider — see
+/// [`forward_headers_reserving`].
 pub async fn post_backend(
     client: &reqwest::Client,
-    target: &str,
     headers: &HeaderMap,
+    target: &str,
     body: Vec<u8>,
 ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
     let resp = client
         .post(target)
-        .headers(forward_headers(headers))
+        .headers(headers.clone())
         .body(body)
         .send()
         .await
@@ -254,10 +266,27 @@ pub fn bytes_response(status: StatusCode, headers: HeaderMap, bytes: Vec<u8>) ->
 /// Copy client → backend headers, dropping hop-by-hop headers (both the static
 /// set and any header named in this message's own `Connection` header).
 pub fn forward_headers(src: &HeaderMap) -> HeaderMap {
+    forward_headers_reserving(src, |_| false)
+}
+
+/// Copy client → backend headers, additionally dropping any header the target
+/// provider owns.
+///
+/// A provider that presents its own credential configures it on the HTTP client
+/// as a default header. `reqwest`'s `RequestBuilder::headers()` *replaces* per
+/// name rather than merging, so forwarding a client's `Authorization` would
+/// displace the provider's — and OpenAI-compatible clients routinely send one
+/// (`Bearer no-key`) even against a backend that ignores it. The result is a
+/// `401` that reads as an expired credential rather than a precedence bug, so
+/// the provider's names win by construction here.
+pub fn forward_headers_reserving(src: &HeaderMap, reserved: impl Fn(&str) -> bool) -> HeaderMap {
     let connection = connection_header_names(src);
     let mut out = HeaderMap::with_capacity(src.len());
     for (name, value) in src.iter() {
-        if should_strip_header(name, &connection) || name == "content-length" {
+        if should_strip_header(name, &connection)
+            || name == "content-length"
+            || reserved(name.as_str())
+        {
             continue;
         }
         out.append(name.clone(), value.clone());

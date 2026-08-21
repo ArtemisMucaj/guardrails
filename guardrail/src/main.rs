@@ -7,7 +7,73 @@ use guardrail::application::AppState;
 use guardrail::cli::{shutdown_signal, Command, Config};
 use guardrail::connector::Backend;
 use guardrail::domain::metrics::{SqliteRecorder, Stats};
-use tracing::info;
+use guardrail::domain::registry::Registry;
+use tracing::{info, warn};
+
+/// Ask every provider for its model list and record the routes.
+///
+/// Best-effort by design. A provider that cannot be reached — not started yet,
+/// no credential — keeps its place in the registry and simply claims no models;
+/// requests naming one of its models still reach it through the default
+/// provider fallback. Failing startup here would make the multi-provider proxy
+/// less robust than the single-backend one it replaces.
+async fn discover_models(client: &reqwest::Client, registry: &mut Registry) {
+    let names: Vec<String> = registry
+        .providers()
+        .map(|p| p.name().to_string())
+        .collect();
+    let urls: Vec<String> = registry
+        .providers()
+        .map(|p| format!("{}/v1/models", p.base_url()))
+        .collect();
+
+    for (name, url) in names.iter().zip(urls.iter()) {
+        match fetch_model_ids(client, url).await {
+            Ok(ids) if ids.is_empty() => {
+                info!(provider = %name, "no models reported");
+            }
+            Ok(ids) => {
+                let mut claimed = 0usize;
+                for id in &ids {
+                    if registry.route(id.clone(), name) {
+                        claimed += 1;
+                    } else {
+                        // Another provider listed this id first. The operator's
+                        // ordering decides; say so rather than silently
+                        // preferring one.
+                        warn!(
+                            provider = %name, model = %id,
+                            "model already served by an earlier provider; not routed here"
+                        );
+                    }
+                }
+                info!(provider = %name, discovered = ids.len(), routed = claimed, "models discovered");
+            }
+            Err(e) => {
+                warn!(
+                    provider = %name, error = %e,
+                    "could not list models; requests naming them will fall back to the default provider"
+                );
+            }
+        }
+    }
+}
+
+/// Read `data[].id` from an OpenAI-compatible `/v1/models` response.
+async fn fetch_model_ids(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
+    let body: serde_json::Value = client.get(url).send().await?.json().await?;
+    Ok(body
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,20 +115,33 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = AppState::new(Backend::new(client), &cfg.backend)
+    let providers = cfg.providers()?;
+
+    // Ask each provider which models it serves, so requests route by model
+    // without the operator hand-maintaining a list. A provider that is down at
+    // startup is kept, not dropped: a local server is often started after the
+    // proxy, and refusing to route to it would be worse than discovering its
+    // models late.
+    let mut registry = Registry::new(providers).expect("providers() rejects an empty list");
+    discover_models(&client, &mut registry).await;
+
+    // Backend URLs are operator-controlled and may embed basic-auth
+    // credentials or token-bearing query params; expose only scheme/host/port.
+    let providers_for_log: Vec<String> = registry
+        .providers()
+        .map(|p| format!("{}={}", p.name(), redact_backend_url(p.base_url())))
+        .collect();
+
+    let state = AppState::with_registry(Backend::new(client), registry)
         .with_guardrails(guardrails)
         .with_recorder(recorder);
 
     let app = guardrail::build_app(state);
 
-    // The backend URL is operator-controlled and may embed basic-auth
-    // credentials or token-bearing query params; expose only scheme/host/port.
-    let backend_for_log = redact_backend_url(&cfg.backend);
-
     info!(
         listen = %cfg.listen,
         admin_listen = ?cfg.admin_listen,
-        backend = %backend_for_log,
+        providers = %providers_for_log.join(", "),
         ?guardrails,
         "guardrail proxy starting"
     );
@@ -76,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
         let info = AdminInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            backend: backend_for_log,
+            providers: providers_for_log,
             proxy_listen: cfg.listen.to_string(),
             admin_listen: admin_addr.to_string(),
             max_retries: guardrails.max_retries,

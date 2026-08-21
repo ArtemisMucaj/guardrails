@@ -111,6 +111,10 @@ pub struct OutcomeRecord {
     /// RFC3339 UTC timestamp, stamped when the outcome occurs (not when it is
     /// written), so a backed-up writer queue does not skew the recorded time.
     pub ts: String,
+    /// Name of the provider that served the request. Recorded alongside the
+    /// model because the same id can be served by several providers, and
+    /// merging their outcomes would hide which upstream is actually failing.
+    pub provider: String,
     pub model: String,
     pub outcome: Outcome,
     /// Failure category, present only on `RetriesExhausted`.
@@ -325,7 +329,8 @@ mod sqlite {
             // WAL keeps the writer from blocking concurrent readers (e.g. an
             // analyst querying the file while the proxy runs).
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.execute_batch(SCHEMA)?;
+            reset_if_stale(&conn)?;
+            conn.execute_batch(SCHEMA_TABLE)?;
 
             let (sender, receiver) = mpsc::sync_channel::<OutcomeRecord>(QUEUE_CAPACITY);
             let writer = thread::Builder::new()
@@ -383,9 +388,15 @@ mod sqlite {
         dir.join("guardrails.sql")
     }
 
-    /// Per-model rollup, in the total → tool calls → errors hierarchy.
+    /// Per-provider-and-model rollup, in the total → tool calls → errors
+    /// hierarchy.
+    ///
+    /// Keyed on the pair, not the model alone: the same id served by two
+    /// providers is two rows, so a provider degrading is visible instead of
+    /// being averaged away against a healthy one.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ModelStats {
+        pub provider: String,
         pub model: String,
         /// All guarded requests for this model (the denominator for how often it
         /// even attempts a tool call versus answering in text).
@@ -420,6 +431,7 @@ mod sqlite {
     /// triage.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ErrorGroup {
+        pub provider: String,
         pub model: String,
         pub error_category: Option<String>,
         pub tool_name: Option<String>,
@@ -467,39 +479,45 @@ mod sqlite {
                 .collect::<Vec<_>>()
                 .join(",");
             let query = format!(
-                "SELECT model, \
+                "SELECT provider, model, \
                     COUNT(*), \
                     SUM(CASE WHEN outcome IN ({in_list}) THEN 1 ELSE 0 END), \
                     SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END) \
-                 FROM outcomes GROUP BY model ORDER BY model"
+                 FROM outcomes GROUP BY provider, model ORDER BY provider, model"
             );
             let mut stmt = conn.prepare(&query)?;
             let rows = stmt.query_map([], |r| {
                 Ok(ModelStats {
-                    model: r.get(0)?,
-                    total: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    tool_calls: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    errors: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    provider: r.get(0)?,
+                    model: r.get(1)?,
+                    total: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    tool_calls: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    errors: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                     by_outcome: Vec::new(),
                 })
             })?;
             let mut per_model: Vec<ModelStats> = rows.collect::<rusqlite::Result<_>>()?;
 
-            // Outcome breakdown per model, folded into the rows above.
+            // Outcome breakdown per provider and model, folded into the rows
+            // above.
             let mut stmt = conn.prepare(
-                "SELECT model, outcome, COUNT(*) FROM outcomes \
-                 GROUP BY model, outcome ORDER BY model, outcome",
+                "SELECT provider, model, outcome, COUNT(*) FROM outcomes \
+                 GROUP BY provider, model, outcome ORDER BY provider, model, outcome",
             )?;
             let breakdown = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })?;
             for row in breakdown {
-                let (model, outcome, count) = row?;
-                if let Some(m) = per_model.iter_mut().find(|m| m.model == model) {
+                let (provider, model, outcome, count) = row?;
+                if let Some(m) = per_model
+                    .iter_mut()
+                    .find(|m| m.provider == provider && m.model == model)
+                {
                     m.by_outcome.push((outcome, count));
                 }
             }
@@ -507,18 +525,19 @@ mod sqlite {
             // Errors the guardrails could not fix, grouped for triage, most
             // frequent first.
             let mut stmt = conn.prepare(
-                "SELECT model, error_category, tool_name, detail, COUNT(*) AS n \
+                "SELECT provider, model, error_category, tool_name, detail, COUNT(*) AS n \
                  FROM outcomes WHERE fixed = 0 \
-                 GROUP BY model, error_category, tool_name, detail \
-                 ORDER BY n DESC, model",
+                 GROUP BY provider, model, error_category, tool_name, detail \
+                 ORDER BY n DESC, provider, model",
             )?;
             let errors = stmt.query_map([], |r| {
                 Ok(ErrorGroup {
-                    model: r.get(0)?,
-                    error_category: r.get(1)?,
-                    tool_name: r.get(2)?,
-                    detail: r.get(3)?,
-                    count: r.get(4)?,
+                    provider: r.get(0)?,
+                    model: r.get(1)?,
+                    error_category: r.get(2)?,
+                    tool_name: r.get(3)?,
+                    detail: r.get(4)?,
+                    count: r.get(5)?,
                 })
             })?;
             let errors: Vec<ErrorGroup> = errors.collect::<rusqlite::Result<_>>()?;
@@ -535,8 +554,8 @@ mod sqlite {
                 return "No metrics recorded yet.\n".to_string();
             }
 
-            out.push_str("Requests by model\n");
-            out.push_str("=================\n");
+            out.push_str("Requests by provider and model\n");
+            out.push_str("==============================\n");
             for m in &self.per_model {
                 let rate = match m.success_rate() {
                     Some(r) => format!("{:.1}%", r * 100.0),
@@ -544,7 +563,8 @@ mod sqlite {
                 };
                 let _ = writeln!(
                     out,
-                    "\n{}\n  total: {}  |  tool calls: {}  |  succeeded: {}  |  errors: {}  |  success rate: {}",
+                    "\n{} / {}\n  total: {}  |  tool calls: {}  |  succeeded: {}  |  errors: {}  |  success rate: {}",
+                    m.provider,
                     m.model,
                     m.total,
                     m.tool_calls,
@@ -565,8 +585,9 @@ mod sqlite {
                 for e in &self.errors {
                     let _ = writeln!(
                         out,
-                        "\n  [{}x] {} / {} / {}",
+                        "\n  [{}x] {} / {} / {} / {}",
                         e.count,
+                        e.provider,
                         e.model,
                         e.error_category.as_deref().unwrap_or("?"),
                         e.tool_name.as_deref().unwrap_or("?"),
@@ -591,10 +612,11 @@ mod sqlite {
     fn insert(conn: &Connection, record: &OutcomeRecord) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO outcomes \
-             (ts, model, outcome, error_category, parser, tool_name, retries, fixed, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 record.ts,
+                record.provider,
                 record.model,
                 record.outcome.as_str(),
                 record.error_category.map(|c| c.as_str()),
@@ -608,10 +630,43 @@ mod sqlite {
         Ok(())
     }
 
-    const SCHEMA: &str = "\
+    /// Drop an `outcomes` table predating the `provider` column.
+    ///
+    /// Deliberately a reset rather than a migration: these are regenerable
+    /// usage metrics, not user data, and the rows carry no honest provider to
+    /// backfill. Without this the table survives, `CREATE INDEX` fails on the
+    /// missing column, and metrics are silently disabled for good — a far worse
+    /// outcome than losing a local stats history, and one that is invisible
+    /// until someone runs `stats` and finds it empty.
+    fn reset_if_stale(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        let exists = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outcomes'")?
+            .exists([])?;
+        if !exists {
+            return Ok(());
+        }
+        let has_provider = conn
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'provider'")?
+            .exists([])?;
+        if !has_provider {
+            warn!(
+                "metrics database predates per-provider stats; recreating the \
+                 outcomes table (previous request history is discarded)"
+            );
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_outcomes_model;\
+                 DROP INDEX IF EXISTS idx_outcomes_unfixed;\
+                 DROP TABLE IF EXISTS outcomes;",
+            )?;
+        }
+        Ok(())
+    }
+
+    const SCHEMA_TABLE: &str = "\
         CREATE TABLE IF NOT EXISTS outcomes (\
             id             INTEGER PRIMARY KEY,\
             ts             TEXT NOT NULL,\
+            provider       TEXT NOT NULL DEFAULT 'unknown',\
             model          TEXT NOT NULL,\
             outcome        TEXT NOT NULL,\
             error_category TEXT,\
@@ -621,9 +676,10 @@ mod sqlite {
             fixed          INTEGER NOT NULL,\
             detail         TEXT\
         );\
-        CREATE INDEX IF NOT EXISTS idx_outcomes_model ON outcomes(model);\
+        CREATE INDEX IF NOT EXISTS idx_outcomes_provider_model \
+            ON outcomes(provider, model);\
         CREATE INDEX IF NOT EXISTS idx_outcomes_unfixed \
-            ON outcomes(model, error_category) WHERE fixed = 0;";
+            ON outcomes(provider, model, error_category) WHERE fixed = 0;";
 
     #[cfg(test)]
     mod tests {
@@ -632,8 +688,13 @@ mod sqlite {
         use crate::domain::validate::ErrorCategory;
 
         fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
+            rec_from("default", model, outcome)
+        }
+
+        fn rec_from(provider: &str, model: &str, outcome: Outcome) -> OutcomeRecord {
             OutcomeRecord {
                 ts: now_rfc3339(),
+                provider: provider.into(),
                 model: model.into(),
                 outcome,
                 error_category: None,
@@ -654,6 +715,7 @@ mod sqlite {
 
             recorder.record(OutcomeRecord {
                 ts: now_rfc3339(),
+                provider: "default".into(),
                 model: "qwen2.5".into(),
                 outcome: Outcome::NativeValid,
                 error_category: None,
@@ -664,6 +726,7 @@ mod sqlite {
             });
             recorder.record(OutcomeRecord {
                 ts: now_rfc3339(),
+                provider: "default".into(),
                 model: "qwen2.5".into(),
                 outcome: Outcome::RetriesExhausted,
                 error_category: Some(ErrorCategory::MissingArgument),
@@ -700,6 +763,98 @@ mod sqlite {
             assert_eq!(outcome, "retries_exhausted");
             assert_eq!(category.as_deref(), Some("missing_argument"));
             assert_eq!(fixed, 0);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_database_predating_providers_is_recreated_rather_than_disabling_metrics() {
+            // The pre-provider schema, as shipped before this change.
+            let dir = std::env::temp_dir().join(format!("guardrail-stale-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("stale.sqlite");
+            let _ = std::fs::remove_file(&db);
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE outcomes (\
+                        id INTEGER PRIMARY KEY, ts TEXT NOT NULL, model TEXT NOT NULL,\
+                        outcome TEXT NOT NULL, error_category TEXT, parser TEXT,\
+                        tool_name TEXT, retries INTEGER NOT NULL DEFAULT 0,\
+                        fixed INTEGER NOT NULL, detail TEXT);\
+                     CREATE INDEX idx_outcomes_model ON outcomes(model);\
+                     CREATE INDEX idx_outcomes_unfixed \
+                        ON outcomes(model, error_category) WHERE fixed = 0;\
+                     INSERT INTO outcomes (ts, model, outcome, retries, fixed) \
+                        VALUES ('t', 'old-model', 'native_valid', 0, 1);",
+                )
+                .unwrap();
+            }
+
+            // Opening must succeed. Before the reset this failed on the missing
+            // column and left metrics silently off for every later run.
+            let recorder = SqliteRecorder::open(&db).expect("stale schema must not disable metrics");
+            recorder.record(rec_from("copilot", "gpt-4o", Outcome::NativeValid));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            assert_eq!(stats.per_model.len(), 1);
+            assert_eq!(stats.per_model[0].provider, "copilot");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_same_model_on_two_providers_stays_separate() {
+            // The reason the provider column exists. `gpt-4o` is reachable
+            // through several vendors; merging them would average a degrading
+            // provider against a healthy one and hide which upstream to fix.
+            let dir =
+                std::env::temp_dir().join(format!("guardrail-providers-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("providers.sqlite");
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_from("copilot", "gpt-4o", Outcome::NativeValid));
+            recorder.record(rec_from("copilot", "gpt-4o", Outcome::RetriesExhausted));
+            recorder.record(rec_from("azure", "gpt-4o", Outcome::NativeValid));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            assert_eq!(
+                stats.per_model.len(),
+                2,
+                "one row per (provider, model), got: {:?}",
+                stats
+                    .per_model
+                    .iter()
+                    .map(|m| (&m.provider, &m.model))
+                    .collect::<Vec<_>>()
+            );
+
+            let copilot = stats
+                .per_model
+                .iter()
+                .find(|m| m.provider == "copilot")
+                .expect("copilot row");
+            assert_eq!(copilot.total, 2);
+            assert_eq!(copilot.errors, 1);
+
+            let azure = stats
+                .per_model
+                .iter()
+                .find(|m| m.provider == "azure")
+                .expect("azure row");
+            assert_eq!(azure.total, 1);
+            assert_eq!(
+                azure.errors, 0,
+                "the failing provider's errors must not be attributed here"
+            );
+
+            // The triage list must name the provider too, or an error is not
+            // actionable when two providers serve the same id.
+            assert_eq!(stats.errors.len(), 1);
+            assert_eq!(stats.errors[0].provider, "copilot");
 
             let _ = std::fs::remove_dir_all(&dir);
         }

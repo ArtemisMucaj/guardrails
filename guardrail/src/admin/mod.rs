@@ -38,7 +38,9 @@ pub struct AdminInfo {
     /// Crate version of the running binary.
     pub version: String,
     /// Backend base URL, reduced to scheme/host/port (no credentials or query).
-    pub backend: String,
+    /// Each configured provider as `name=scheme://host[:port]`, in routing
+    /// order — the first serves models no other one claims.
+    pub providers: Vec<String>,
     /// Address the proxy (model-facing) server listens on.
     pub proxy_listen: String,
     /// Address this admin server listens on.
@@ -146,6 +148,7 @@ struct StatsResponse {
 
 #[derive(Serialize)]
 struct ModelStatsDto {
+    provider: String,
     model: String,
     total: i64,
     tool_calls: i64,
@@ -165,6 +168,7 @@ struct OutcomeCount {
 
 #[derive(Serialize)]
 struct ErrorGroupDto {
+    provider: String,
     model: String,
     error_category: Option<String>,
     tool_name: Option<String>,
@@ -187,6 +191,7 @@ impl From<ModelStats> for ModelStatsDto {
         let succeeded = m.succeeded();
         let success_rate = m.success_rate();
         Self {
+            provider: m.provider,
             model: m.model,
             total: m.total,
             tool_calls: m.tool_calls,
@@ -205,6 +210,7 @@ impl From<ModelStats> for ModelStatsDto {
 impl From<ErrorGroup> for ErrorGroupDto {
     fn from(e: ErrorGroup) -> Self {
         Self {
+            provider: e.provider,
             model: e.model,
             error_category: e.error_category,
             tool_name: e.tool_name,

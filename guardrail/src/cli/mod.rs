@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::application::Guardrails;
 use crate::domain::metrics::default_db_path;
+use crate::domain::provider::{Provider, DEFAULT_PROVIDER};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -28,13 +29,20 @@ pub struct Config {
     #[arg(long, env = "GUARDRAIL_ADMIN_LISTEN")]
     pub admin_listen: Option<SocketAddr>,
 
-    /// Base URL of the OpenAI-compatible backend.
+    /// An OpenAI-compatible backend, as `URL` or `NAME=URL`.
+    ///
+    /// Repeat to proxy several. Requests route by the model they name; the
+    /// first backend listed serves models no other one claims. A bare URL is
+    /// named `default`, so a single `--backend` behaves exactly as before.
+    ///
+    /// The environment variable takes a comma-separated list.
     #[arg(
-        long,
+        long = "backend",
         env = "GUARDRAIL_BACKEND",
+        value_delimiter = ',',
         default_value = "http://127.0.0.1:1234"
     )]
-    pub backend: String,
+    pub backends: Vec<String>,
 
     /// Timeout for establishing the TCP/TLS connection to the backend, in seconds.
     #[arg(long, env = "GUARDRAIL_CONNECT_TIMEOUT_SECS", default_value_t = 10)]
@@ -70,6 +78,52 @@ impl Config {
         Guardrails {
             max_retries: self.max_retries,
         }
+    }
+
+    /// Parse `--backend` into providers, in the order given.
+    ///
+    /// Accepts `URL` or `NAME=URL`. Splitting on the *first* `=` keeps query
+    /// strings and credentials in a URL intact, since only the name is
+    /// `=`-free by construction.
+    pub fn providers(&self) -> anyhow::Result<Vec<Provider>> {
+        let mut providers: Vec<Provider> = Vec::with_capacity(self.backends.len());
+
+        for (index, spec) in self.backends.iter().enumerate() {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                continue;
+            }
+            let (name, url) = match spec.split_once('=') {
+                // A bare URL: `http://host` splits at no `=`, but `scheme://`
+                // means an empty name is impossible here.
+                Some((name, url)) if !name.is_empty() && !name.contains("//") => {
+                    (name.trim(), url.trim())
+                }
+                _ if index == 0 => (DEFAULT_PROVIDER, spec),
+                // Only the first may be anonymous; naming the rest is what
+                // makes their outcomes distinguishable in the stats.
+                _ => anyhow::bail!(
+                    "backend {index} ({spec}) needs a name: pass it as NAME=URL \
+                     so its metrics can be told apart"
+                ),
+            };
+
+            if url.is_empty() {
+                anyhow::bail!("backend '{name}' has no URL");
+            }
+            if providers.iter().any(|p| p.name() == name) {
+                anyhow::bail!(
+                    "two backends are both named '{name}'; names must be unique \
+                     so routing and metrics are unambiguous"
+                );
+            }
+            providers.push(Provider::new(name, url));
+        }
+
+        if providers.is_empty() {
+            anyhow::bail!("no backend configured");
+        }
+        Ok(providers)
     }
 }
 
@@ -108,4 +162,107 @@ pub async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn config(args: &[&str]) -> Config {
+        let mut argv = vec!["guardrail"];
+        argv.extend_from_slice(args);
+        Config::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn a_bare_url_is_the_default_provider() {
+        // The single-backend invocation every existing user is on.
+        let providers = config(&["--backend", "http://127.0.0.1:1234"])
+            .providers()
+            .unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name(), DEFAULT_PROVIDER);
+        assert_eq!(providers[0].base_url(), "http://127.0.0.1:1234");
+    }
+
+    #[test]
+    fn no_backend_flag_still_yields_the_default() {
+        let providers = config(&[]).providers().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].base_url(), "http://127.0.0.1:1234");
+    }
+
+    #[test]
+    fn named_backends_keep_their_order() {
+        let providers = config(&[
+            "--backend",
+            "lmstudio=http://127.0.0.1:1234",
+            "--backend",
+            "copilot=https://api.githubcopilot.com",
+        ])
+        .providers()
+        .unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name(), "lmstudio");
+        assert_eq!(providers[1].name(), "copilot");
+        assert_eq!(providers[1].base_url(), "https://api.githubcopilot.com");
+    }
+
+    #[test]
+    fn a_url_containing_equals_survives_parsing() {
+        // Splitting on the last `=`, or on every `=`, would corrupt a query
+        // string — and the resulting URL would fail at request time, far from
+        // the cause.
+        let providers = config(&["--backend", "azure=https://host/openai?api-version=2024-02-01"])
+            .providers()
+            .unwrap();
+        assert_eq!(providers[0].name(), "azure");
+        assert_eq!(
+            providers[0].base_url(),
+            "https://host/openai?api-version=2024-02-01"
+        );
+    }
+
+    #[test]
+    fn only_the_first_backend_may_be_anonymous() {
+        let error = config(&[
+            "--backend",
+            "http://127.0.0.1:1234",
+            "--backend",
+            "https://api.githubcopilot.com",
+        ])
+        .providers()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("needs a name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_names_are_rejected() {
+        // Two providers with one name make routing and metrics ambiguous.
+        let error = config(&["--backend", "a=http://one", "--backend", "a=http://two"])
+            .providers()
+            .unwrap_err();
+        assert!(error.to_string().contains("both named"), "got: {error}");
+    }
+
+    #[test]
+    fn a_named_backend_without_a_url_is_rejected() {
+        let error = config(&["--backend", "lmstudio="]).providers().unwrap_err();
+        assert!(error.to_string().contains("no URL"), "got: {error}");
+    }
+
+    #[test]
+    fn the_environment_variable_accepts_a_comma_separated_list() {
+        let providers = config(&["--backend", "a=http://one,b=http://two"])
+            .providers()
+            .unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name(), "a");
+        assert_eq!(providers[1].name(), "b");
+    }
 }

@@ -37,6 +37,8 @@ use crate::domain::metrics::{
     now_rfc3339, redact_args, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
 };
 use crate::domain::model::ChatRequest;
+use crate::domain::provider::{Provider, DEFAULT_PROVIDER};
+use crate::domain::registry::Registry;
 use crate::domain::respond;
 use crate::domain::retry::ErrorTracker;
 use crate::domain::sse::{assemble_stream, AssembledResponse};
@@ -45,10 +47,16 @@ use crate::domain::validate::{
 };
 
 /// Port: everything the application layer needs from the HTTP infrastructure.
+///
+/// Every method takes the [`Provider`] the request is bound for. The provider
+/// carries the header names it owns, which the adapter strips from the client's
+/// set before the hop — without that, a client-supplied `Authorization` would
+/// displace a provider's own credential.
 #[async_trait::async_trait]
 pub trait BackendPort: Send + Sync {
     async fn post(
         &self,
+        provider: &Provider,
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
@@ -65,6 +73,7 @@ pub trait BackendPort: Send + Sync {
     /// tool-call tag syntax to the client.
     async fn stream_post(
         &self,
+        provider: &Provider,
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
@@ -72,6 +81,7 @@ pub trait BackendPort: Send + Sync {
 
     async fn forward(
         &self,
+        provider: &Provider,
         method: axum::http::Method,
         target: &str,
         headers: &HeaderMap,
@@ -83,16 +93,26 @@ const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub backend_url: String,
+    pub registry: Arc<Registry>,
     pub guardrails: Guardrails,
     pub port: Arc<dyn BackendPort>,
     pub recorder: SharedRecorder,
 }
 
 impl AppState {
+    /// State with a single unnamed provider serving every request — the shape
+    /// of a lone `--backend`.
     pub fn new(port: impl BackendPort + 'static, backend_url: impl Into<String>) -> Self {
+        Self::with_registry(
+            port,
+            Registry::single(Provider::new(DEFAULT_PROVIDER, backend_url)),
+        )
+    }
+
+    /// State routing across several providers.
+    pub fn with_registry(port: impl BackendPort + 'static, registry: Registry) -> Self {
         Self {
-            backend_url: backend_url.into().trim_end_matches('/').to_string(),
+            registry: Arc::new(registry),
             guardrails: Guardrails::default(),
             port: Arc::new(port),
             recorder: Arc::new(NoopRecorder),
@@ -126,11 +146,9 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
-    let target = format!("{}{}", state.backend_url, path_and_query);
 
     let span = info_span!("proxy", %method, path = %path_and_query);
     async move {
-        debug!(target = %target, "forwarding to backend");
         let (parts, body) = req.into_parts();
         let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
             Ok(b) => b,
@@ -148,19 +166,29 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             None
         };
 
+        // Route on the model, which is the only routing hint an
+        // OpenAI-compatible client gives us. Requests with no parseable model
+        // — every non-chat path — go to the default provider.
+        let provider = state
+            .registry
+            .resolve(chat_request.as_ref().map(|r| r.model.as_str()))
+            .clone();
+        let target = provider.target(&path_and_query);
+        debug!(provider = %provider.name(), target = %target, "forwarding to provider");
+
         if let Some(request) = chat_request {
             if request.has_tools() {
                 let client_wants_stream = request.stream();
-                return guardrail_loop(&state, &target, &parts.headers, request, client_wants_stream).await;
+                return guardrail_loop(&state, &provider, &target, &parts.headers, request, client_wants_stream).await;
             }
             let outcome = if request.stream() { Outcome::StreamedPassthrough } else { Outcome::NonToolPassthrough };
             state.recorder.record(OutcomeRecord {
-                ts: now_rfc3339(), model: request.model, outcome,
+                ts: now_rfc3339(), provider: provider.name().to_string(), model: request.model, outcome,
                 error_category: None, parser: None, tool_name: None, retries: 0, detail: None,
             });
         }
 
-        state.port.forward(parts.method, &target, &parts.headers, body_bytes).await
+        state.port.forward(&provider, parts.method, &target, &parts.headers, body_bytes).await
     }
     .instrument(span)
     .await
@@ -174,6 +202,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 /// client the instant the backend emits them.
 async fn guardrail_loop(
     state: &AppState,
+    provider: &Arc<Provider>,
     target: &str,
     headers: &HeaderMap,
     mut request: ChatRequest,
@@ -198,13 +227,14 @@ async fn guardrail_loop(
 
     let port = state.port.clone();
     let recorder = state.recorder.clone();
+    let provider = provider.clone();
     let target = target.to_string();
     let headers = headers.clone();
     let model = request.model.clone();
 
     tokio::spawn(async move {
         run_guardrail(
-            port, recorder, target, headers, request, tools,
+            port, recorder, provider, target, headers, request, tools,
             respond_active, g, model, body_tx, passthrough_tx,
         ).await;
     });
@@ -237,6 +267,7 @@ async fn guardrail_loop(
 async fn run_guardrail(
     port: Arc<dyn BackendPort>,
     recorder: SharedRecorder,
+    provider: Arc<Provider>,
     target: String,
     headers: HeaderMap,
     mut request: ChatRequest,
@@ -256,7 +287,7 @@ async fn run_guardrail(
                        retries: u32,
                        detail: Option<String>| {
         recorder.record(OutcomeRecord {
-            ts: now_rfc3339(), model: model.clone(), outcome,
+            ts: now_rfc3339(), provider: provider.name().to_string(), model: model.clone(), outcome,
             error_category, parser, tool_name, retries, detail,
         });
     };
@@ -271,7 +302,7 @@ async fn run_guardrail(
             }
         };
 
-        let (mut sse_rx, is_native_sse) = match port.stream_post(&target, &headers, body_bytes).await {
+        let (mut sse_rx, is_native_sse) = match port.stream_post(&provider, &target, &headers, body_bytes).await {
             Ok((_status, _resp_headers, rx, native)) => (rx, native),
             Err(passthrough_resp) => {
                 // Non-JSON/non-SSE backend response — forward verbatim.

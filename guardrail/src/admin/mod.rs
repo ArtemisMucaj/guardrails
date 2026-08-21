@@ -235,6 +235,45 @@ struct ModelStatsDto {
     /// no tool call (so consumers render "n/a" rather than a misleading 0%).
     success_rate: Option<f64>,
     by_outcome: Vec<OutcomeCount>,
+    /// Token usage over the requests that reported any, or `null` when none
+    /// did — so a consumer shows "not measured" rather than a confident zero.
+    usage: Option<UsageDto>,
+}
+
+/// Token usage for one (provider, model), summed over every backend attempt the
+/// measured requests made.
+#[derive(Serialize)]
+struct UsageDto {
+    /// Prompt tokens as billed. NOT additive across a conversation: each turn
+    /// resends the transcript, so shared prefixes are counted once per turn.
+    /// Use `distinct_prompt_tokens` to count them once.
+    prompt_tokens: i64,
+    /// Generated once and never resent, so this figure sums cleanly.
+    completion_tokens: i64,
+    /// `prompt_tokens + completion_tokens` — what the provider charged for,
+    /// not a count of distinct tokens.
+    billed_tokens: i64,
+    /// Of `prompt_tokens`, the portion served from the prompt cache.
+    cached_tokens: i64,
+    /// Of `prompt_tokens`, the portion billed at full rate.
+    uncached_prompt_tokens: i64,
+    /// Cache hit rate over prompt tokens in `[0, 1]`, `null` without any.
+    cache_hit_rate: Option<f64>,
+    /// Backend calls these totals span, retries included.
+    billed_calls: i64,
+    /// Client requests the totals are measured over.
+    requests: i64,
+    /// `billed_calls / requests` — the multiplier retries add to the bill.
+    calls_per_request: Option<f64>,
+    /// Prompt tokens with resent transcript prefixes counted once — a
+    /// conversation contributes its largest prompt, not the sum of its turns.
+    /// `null` when conversations cannot be reconstructed (any Chat Completions
+    /// traffic), rather than repeating the inflated sum under a better name.
+    distinct_prompt_tokens: Option<i64>,
+    /// `distinct_prompt_tokens + completion_tokens`; `null` with the above.
+    distinct_tokens: Option<i64>,
+    /// Conversations the measured requests span; `null` when unknown.
+    conversations: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +306,20 @@ impl From<ModelStats> for ModelStatsDto {
         // Compute before moving out the fields that feed `by_outcome`.
         let succeeded = m.succeeded();
         let success_rate = m.success_rate();
+        let usage = (m.usage_requests > 0).then(|| UsageDto {
+            prompt_tokens: m.usage.prompt_tokens,
+            completion_tokens: m.usage.completion_tokens,
+            billed_tokens: m.billed_tokens(),
+            cached_tokens: m.usage.cached_tokens,
+            uncached_prompt_tokens: m.usage.uncached_prompt_tokens(),
+            cache_hit_rate: m.cache_hit_rate(),
+            billed_calls: m.usage.attempts,
+            requests: m.usage_requests,
+            calls_per_request: m.calls_per_request(),
+            distinct_prompt_tokens: m.distinct_prompt_tokens,
+            distinct_tokens: m.distinct_tokens(),
+            conversations: m.conversations,
+        });
         Self {
             provider: m.provider,
             model: m.model,
@@ -280,6 +333,7 @@ impl From<ModelStats> for ModelStatsDto {
                 .into_iter()
                 .map(|(outcome, count)| OutcomeCount { outcome, count })
                 .collect(),
+            usage,
         }
     }
 }

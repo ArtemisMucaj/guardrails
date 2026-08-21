@@ -60,6 +60,19 @@ impl ResponsesRequest {
         self.tools.as_ref().is_some_and(|t| !t.is_empty())
     }
 
+    /// The response this turn continues, when the client chained it.
+    ///
+    /// The Responses API is stateful: a client continues a conversation by
+    /// naming the previous response instead of resending the transcript. That
+    /// makes this the parent edge of a conversation — following it back reaches
+    /// the first turn, whose id names the whole exchange.
+    ///
+    /// Absent on the first turn of a conversation, and on any client that
+    /// resends full input rather than chaining (`store: false`).
+    pub fn previous_response_id(&self) -> Option<&str> {
+        self.rest.get("previous_response_id").and_then(Value::as_str)
+    }
+
     /// The declared tools as the neutral [`Tool`] the validator expects.
     ///
     /// A Responses tool is flat (`{"type":"function","name":...,"parameters":...}`)

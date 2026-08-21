@@ -66,7 +66,7 @@ pub async fn assemble_responses_stream<F>(
     rx: &mut mpsc::Receiver<Option<String>>,
     mut emit_sse: F,
     kind_tx: Option<mpsc::Sender<bool>>,
-) -> AssembledResponses
+) -> (AssembledResponses, super::sse::StreamUsage)
 where
     F: FnMut(&str),
 {
@@ -75,6 +75,7 @@ where
     let mut text = String::new();
     let mut has_calls = false;
     let mut kind_fired = false;
+    let mut usage: super::sse::StreamUsage = None;
     // Text deltas withheld because the text so far looks like a tool call.
     // Released if the stream ends without one being recovered.
     let mut buffered_text: Vec<String> = Vec::new();
@@ -207,6 +208,13 @@ where
 
             COMPLETED => {
                 if let Some(response) = event.get("response") {
+                    // The Responses protocol reports usage once, on the
+                    // terminal event's response object.
+                    if let Some(reported) = super::metrics::extract_usage(response) {
+                        if !reported.is_empty() {
+                            usage = Some(reported);
+                        }
+                    }
                     template = response.clone();
                 }
                 // Never forwarded. The caller emits its own terminal event once
@@ -240,11 +248,14 @@ where
             })
             .collect();
         if !calls.is_empty() {
-            return AssembledResponses::ToolCalls {
-                calls,
-                template,
-                text,
-            };
+            return (
+                AssembledResponses::ToolCalls {
+                    calls,
+                    template,
+                    text,
+                },
+                usage,
+            );
         }
     }
 
@@ -252,11 +263,14 @@ where
     // same failure the chat path rescues.
     if let Some((parser, calls)) = rescue::rescue(&text) {
         signal(false, &kind_tx);
-        return AssembledResponses::Rescued {
-            parser,
-            calls,
-            template,
-        };
+        return (
+            AssembledResponses::Rescued {
+                parser,
+                calls,
+                template,
+            },
+            usage,
+        );
     }
 
     // Nothing was recovered after all, so the held-back text was ordinary
@@ -265,7 +279,7 @@ where
     for held in buffered_text.drain(..) {
         emit_sse(&held);
     }
-    AssembledResponses::Text { text, template }
+    (AssembledResponses::Text { text, template }, usage)
 }
 
 #[cfg(test)]
@@ -275,6 +289,14 @@ mod tests {
     /// Feed `lines` through the assembler, returning the result and whatever
     /// was forwarded to the client.
     async fn assemble(lines: &[&str]) -> (AssembledResponses, String) {
+        let (assembled, forwarded, _usage) = assemble_usage(lines).await;
+        (assembled, forwarded)
+    }
+
+    /// [`assemble`], also returning the usage the stream reported.
+    async fn assemble_usage(
+        lines: &[&str],
+    ) -> (AssembledResponses, String, super::super::sse::StreamUsage) {
         let (tx, mut rx) = mpsc::channel::<Option<String>>(64);
         for line in lines {
             tx.send(Some((*line).to_string())).await.unwrap();
@@ -283,9 +305,9 @@ mod tests {
         drop(tx);
 
         let mut forwarded = String::new();
-        let assembled =
+        let (assembled, usage) =
             assemble_responses_stream(&mut rx, |s| forwarded.push_str(s), None).await;
-        (assembled, forwarded)
+        (assembled, forwarded, usage)
     }
 
     #[tokio::test]

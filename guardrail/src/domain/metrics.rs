@@ -105,6 +105,118 @@ impl Outcome {
     }
 }
 
+/// Token usage reported by the backend for a guarded request.
+///
+/// Accumulated across *every* backend attempt a request made, not just the one
+/// that produced the delivered answer: a corrective retry is a second billed
+/// call, and hiding it would understate what the guardrails cost. `attempts`
+/// records how many backend calls the totals span so the overhead stays
+/// legible.
+///
+/// The cached counts are the read side of prompt caching — the portion of
+/// `prompt_tokens` that was served from cache and so billed at a discount.
+/// Both APIs report it in a nested object (`prompt_tokens_details.cached_tokens`
+/// for chat, `input_tokens_details.cached_tokens` for responses), and some
+/// backends omit the object entirely; a missing count reads as zero rather than
+/// as an error, since "no cache hit" and "no cache reporting" are indistinguish-
+/// able from the proxy's side.
+///
+/// # Prompt tokens do not add up across a conversation
+///
+/// Every chat turn resends the whole transcript, so turn 5's prompt *contains*
+/// turns 1–4. Summing `prompt_tokens` over the requests of one conversation
+/// therefore counts the early turns once per later turn — growth that is
+/// quadratic in turn count, not a measurement of distinct tokens.
+///
+/// That makes the sum a faithful answer to "what did the provider bill" and a
+/// wrong answer to "how many tokens did this conversation contain". Only
+/// [`completion_tokens`](Self::completion_tokens) is generated once and so sums
+/// cleanly. Every rendered figure is therefore labelled *billed* rather than
+/// *total*, and [`uncached_prompt_tokens`](Self::uncached_prompt_tokens) is
+/// shown alongside because resent prefixes are exactly what a prompt cache
+/// serves — the inflation and its discount are the same tokens.
+///
+/// Deduplicating properly needs per-conversation grouping (take the maximum
+/// prompt over a chain, not the sum), which needs a conversation key the Chat
+/// Completions API does not carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Tokens in the prompt, cached and uncached together. Not additive across
+    /// a conversation — see the type docs.
+    pub prompt_tokens: i64,
+    /// Tokens the model generated. Generated once and never resent, so this is
+    /// the one figure that sums cleanly.
+    pub completion_tokens: i64,
+    /// Of `prompt_tokens`, the portion served from the prompt cache.
+    pub cached_tokens: i64,
+    /// Backend calls these totals span. `1` for a request answered on the first
+    /// attempt; higher when the guardrails retried.
+    pub attempts: i64,
+}
+
+impl Usage {
+    /// Whether the backend reported anything at all. A request whose backend
+    /// sent no usage block records zeroes, and counting those rows as "0 tokens"
+    /// in an average would drag it down; callers use this to skip them.
+    pub fn is_empty(self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.cached_tokens == 0
+    }
+
+    /// Prompt tokens that missed the cache and were billed at full rate.
+    pub fn uncached_prompt_tokens(self) -> i64 {
+        (self.prompt_tokens - self.cached_tokens).max(0)
+    }
+
+    /// Fold another usage total into this one.
+    ///
+    /// Adds `other.attempts` rather than a hard `1`, so folding an already
+    /// aggregated total keeps the backend-call count right. Every caller today
+    /// passes a single attempt straight from [`extract_usage`] (which reports
+    /// `attempts: 1`), making the two equivalent in practice — but a hard `1`
+    /// would silently undercount the moment anything folded a running total in,
+    /// and `calls_per_request` would understate the retry multiplier it exists
+    /// to expose.
+    pub fn add(&mut self, other: Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.attempts += other.attempts;
+    }
+}
+
+/// Extract token usage from a backend response body or terminal SSE chunk.
+///
+/// Reads both API dialects: Chat Completions names the fields
+/// `prompt_tokens` / `completion_tokens`, the Responses API names them
+/// `input_tokens` / `output_tokens`. Returns `None` when the value carries no
+/// `usage` object, which is the common case for every non-terminal chunk.
+pub fn extract_usage(value: &serde_json::Value) -> Option<Usage> {
+    let usage = value.get("usage")?;
+    let field = |names: [&str; 2]| -> i64 {
+        names
+            .iter()
+            .find_map(|n| usage.get(*n).and_then(serde_json::Value::as_i64))
+            .unwrap_or(0)
+    };
+    // Both dialects nest the cache read count one level down, under a details
+    // object named after their own input field.
+    let cached = ["prompt_tokens_details", "input_tokens_details"]
+        .iter()
+        .find_map(|d| {
+            usage
+                .get(*d)
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or(0);
+    Some(Usage {
+        prompt_tokens: field(["prompt_tokens", "input_tokens"]),
+        completion_tokens: field(["completion_tokens", "output_tokens"]),
+        cached_tokens: cached,
+        attempts: 1,
+    })
+}
+
 /// One row of failure metrics: the terminal outcome of a guarded request.
 #[derive(Debug, Clone)]
 pub struct OutcomeRecord {
@@ -128,6 +240,37 @@ pub struct OutcomeRecord {
     /// Triage detail: the last nudge plus a redacted argument snippet, on
     /// failure outcomes only.
     pub detail: Option<String>,
+    /// Token usage summed over every backend attempt this request made. Absent
+    /// when the request never reached a backend (an internal error) or the
+    /// backend reported no usage.
+    pub usage: Option<Usage>,
+    /// Identity of this turn within a conversation, when the API provides one.
+    /// Present for chained Responses traffic; always absent on Chat
+    /// Completions, which carries no conversation key. See [`Conversation`].
+    pub conversation: Option<Conversation>,
+}
+
+/// Where a request sits in a conversation.
+///
+/// Only the Responses API can supply this: it is stateful, so a client
+/// continues an exchange by naming the previous response rather than resending
+/// the transcript. `id` is this turn's response, `parent` the one it continues.
+/// Together they form the edges of a chain whose root identifies the
+/// conversation.
+///
+/// This is what makes prompt tokens summable. Because each turn's prompt
+/// contains every earlier turn, the *last* turn of a chain already accounts for
+/// the whole conversation — so a conversation contributes the maximum prompt
+/// over its turns, not the sum (see [`Usage`]). Without these edges there is no
+/// way to tell two turns of one conversation from two unrelated requests, and
+/// the shared prefix is counted twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    /// This turn's response id, as the backend assigned it.
+    pub id: String,
+    /// The response this turn continues; `None` on the first turn, which makes
+    /// this row the root of its chain.
+    pub parent: Option<String>,
 }
 
 /// A sink for terminal outcome records.
@@ -271,6 +414,110 @@ mod tests {
     }
 
     #[test]
+    fn usage_is_read_from_both_api_dialects() {
+        // Chat Completions names them prompt/completion and nests the cache
+        // read under `prompt_tokens_details`.
+        let chat = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        let u = extract_usage(&chat).expect("chat usage");
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.cached_tokens, 80);
+        assert_eq!(u.uncached_prompt_tokens(), 20);
+
+        // The Responses API names them input/output, under `input_tokens_details`.
+        let responses = serde_json::json!({
+            "usage": {
+                "input_tokens": 100, "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        assert_eq!(extract_usage(&responses), Some(u));
+    }
+
+    #[test]
+    fn a_backend_reporting_no_cache_details_reads_as_zero_cached() {
+        // Most local backends omit the details object entirely. That must read
+        // as "nothing cached", not as a parse failure that drops the usage.
+        let value = serde_json::json!({
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        });
+        let u = extract_usage(&value).expect("usage without cache details");
+        assert_eq!(u.cached_tokens, 0);
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.uncached_prompt_tokens(), 7);
+    }
+
+    #[test]
+    fn a_chunk_without_usage_reports_none() {
+        // Every non-terminal chunk lands here; it must not be mistaken for a
+        // zeroed report.
+        let chunk = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
+        assert_eq!(extract_usage(&chunk), None);
+    }
+
+    #[test]
+    fn usage_sums_across_attempts_so_retries_show_their_cost() {
+        // The reason usage is accumulated rather than overwritten: a request
+        // the guardrails retried twice was billed three times, and a report
+        // showing only the last attempt would understate it threefold.
+        let mut billed = Usage::default();
+        assert!(billed.is_empty());
+
+        for _ in 0..3 {
+            billed.add(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                cached_tokens: 40,
+                attempts: 1,
+            });
+        }
+        assert_eq!(billed.prompt_tokens, 300);
+        assert_eq!(billed.completion_tokens, 30);
+        assert_eq!(billed.cached_tokens, 120);
+        assert_eq!(billed.attempts, 3, "three backend calls were billed");
+        assert!(!billed.is_empty());
+    }
+
+    #[test]
+    fn folding_an_aggregated_total_preserves_the_call_count() {
+        // `add` takes the other side's attempts rather than assuming one, so
+        // combining two running totals gives the same count as adding every
+        // attempt individually. Callers all pass single attempts today; this
+        // keeps that from being load-bearing.
+        let attempt = Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, attempts: 1 };
+
+        let mut one_at_a_time = Usage::default();
+        for _ in 0..4 {
+            one_at_a_time.add(attempt);
+        }
+
+        let mut left = Usage::default();
+        left.add(attempt);
+        left.add(attempt);
+        let mut right = Usage::default();
+        right.add(attempt);
+        right.add(attempt);
+        let mut combined = left;
+        combined.add(right);
+
+        assert_eq!(combined, one_at_a_time);
+        assert_eq!(combined.attempts, 4, "four backend calls, however grouped");
+    }
+
+    #[test]
+    fn cached_tokens_never_exceed_the_prompt_in_the_uncached_split() {
+        // A backend reporting more cached than prompt tokens would otherwise
+        // yield a negative "new tokens" figure in the report.
+        let u = Usage { prompt_tokens: 10, completion_tokens: 0, cached_tokens: 25, attempts: 1 };
+        assert_eq!(u.uncached_prompt_tokens(), 0);
+    }
+
+    #[test]
     fn redact_args_keeps_shape_but_never_values() {
         // Object: keys are kept (sorted by serde_json's BTreeMap), values become
         // type/size tags. "/etc/secret" is 11 chars.
@@ -294,6 +541,7 @@ mod tests {
 
 pub use sqlite::{default_db_path, ErrorGroup, ModelStats, SqliteRecorder, Stats};
 
+
 mod sqlite {
     use std::path::Path;
     use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -302,7 +550,7 @@ mod sqlite {
     use rusqlite::Connection;
     use tracing::{error, info, warn};
 
-    use super::{OutcomeRecord, Recorder};
+    use super::{OutcomeRecord, Recorder, Usage};
 
     /// Bound on records buffered for the writer thread. `record` never blocks the
     /// request path: if the writer falls this far behind (e.g. a slow disk under
@@ -388,6 +636,12 @@ mod sqlite {
         dir.join("guardrails.sql")
     }
 
+    /// How far the conversation walk follows `parent_id` links before giving
+    /// up. Bounds the recursive query against a cycle, which nothing in the
+    /// proxy produces but a corrupted database could; well beyond any real
+    /// conversation length, so it never truncates honest data.
+    const MAX_CHAIN_DEPTH: u32 = 1024;
+
     /// Per-provider-and-model rollup, in the total → tool calls → errors
     /// hierarchy.
     ///
@@ -408,12 +662,76 @@ mod sqlite {
         pub errors: i64,
         /// Counts per outcome tag, summing to `total`.
         pub by_outcome: Vec<(String, i64)>,
+        /// Token usage summed over the requests that reported any. Rows where
+        /// the backend reported nothing are excluded, so this is the cost of the
+        /// measured traffic rather than of all of it.
+        pub usage: Usage,
+        /// Of `total`, the requests that carried a usage report — the
+        /// denominator `usage` is actually over.
+        pub usage_requests: i64,
+        /// Prompt tokens with resent transcript prefixes counted once.
+        ///
+        /// A conversation contributes the largest prompt among its turns rather
+        /// than the sum of them, because the last turn's prompt already
+        /// contains every earlier one. Unchained requests each count in full,
+        /// being conversations of one turn.
+        ///
+        /// `None` when no request carried a conversation key — every Chat
+        /// Completions deployment — since there is then no basis to tell a
+        /// second turn from an unrelated request, and reporting the plain sum
+        /// as if it were deduplicated would be a lie. See [`Conversation`].
+        pub distinct_prompt_tokens: Option<i64>,
+        /// Conversations the measured requests span, when chains are known.
+        pub conversations: Option<i64>,
     }
 
     impl ModelStats {
         /// Tool calls the guardrails delivered as valid.
         pub fn succeeded(&self) -> i64 {
             self.tool_calls - self.errors
+        }
+
+        /// Tokens billed across prompt and completion.
+        ///
+        /// Deliberately *billed*, not *total*: resent transcripts mean the
+        /// prompt side counts shared prefixes once per turn (see [`Usage`]).
+        /// This is what the provider charged for, not a count of distinct
+        /// tokens.
+        pub fn billed_tokens(&self) -> i64 {
+            self.usage.prompt_tokens + self.usage.completion_tokens
+        }
+
+        /// Tokens with resent transcript prefixes counted once — the honest
+        /// answer to "how large was this traffic", as opposed to
+        /// [`billed_tokens`](Self::billed_tokens)'s "what did it cost".
+        ///
+        /// `None` when conversations cannot be reconstructed; see
+        /// [`distinct_prompt_tokens`](Self::distinct_prompt_tokens).
+        pub fn distinct_tokens(&self) -> Option<i64> {
+            self.distinct_prompt_tokens
+                .map(|p| p + self.usage.completion_tokens)
+        }
+
+        /// Share of prompt tokens served from the cache, in `[0, 1]`, or `None`
+        /// when no prompt tokens were reported (so the report shows `n/a`
+        /// rather than a misleading `0%`).
+        pub fn cache_hit_rate(&self) -> Option<f64> {
+            if self.usage.prompt_tokens == 0 {
+                None
+            } else {
+                Some(self.usage.cached_tokens as f64 / self.usage.prompt_tokens as f64)
+            }
+        }
+
+        /// Backend calls per client request — `1.0` when nothing retried, higher
+        /// when the guardrails had to ask again. This is the multiplier the
+        /// guardrails apply to the bill, and `None` without any usage report.
+        pub fn calls_per_request(&self) -> Option<f64> {
+            if self.usage_requests == 0 {
+                None
+            } else {
+                Some(self.usage.attempts as f64 / self.usage_requests as f64)
+            }
         }
 
         /// Success rate over tool calls, or `None` when the model made no tool
@@ -469,6 +787,24 @@ mod sqlite {
                 return Ok(Self::default());
             }
 
+            // `stats` reads a database the proxy owns and may not have opened
+            // this run, so the table can predate any column added since. Reading
+            // is not the place to migrate — the CLI may not even be able to
+            // write the file — so a column that is not there is selected as
+            // NULL, which every aggregate below already handles as "not
+            // recorded". Without this the command fails outright on an older
+            // database instead of reporting what it does have.
+            let column = |name: &str| -> String {
+                let present = conn
+                    .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = ?1")
+                    .and_then(|mut s| s.exists([name]))
+                    .unwrap_or(false);
+                if present { name.to_string() } else { "NULL".to_string() }
+            };
+            let provider_col = column("provider");
+            let (prompt, completion) = (column("prompt_tokens"), column("completion_tokens"));
+            let (cached, billed) = (column("cached_tokens"), column("billed_calls"));
+
             // Per-model totals. The tool-call set is formatted from the single
             // source of truth in `Outcome` so it can never drift from the Rust
             // classification; the tags are static literals, so this is not a
@@ -478,12 +814,18 @@ mod sqlite {
                 .map(|t| format!("'{t}'"))
                 .collect::<Vec<_>>()
                 .join(",");
+            // `COUNT(prompt_tokens)` counts only non-NULL rows, which is exactly
+            // the set the token sums cover — requests whose backend reported
+            // usage. A database written before the token columns existed has
+            // NULL throughout and simply reports no usage.
             let query = format!(
-                "SELECT provider, model, \
+                "SELECT COALESCE({provider_col}, 'unknown'), model, \
                     COUNT(*), \
                     SUM(CASE WHEN outcome IN ({in_list}) THEN 1 ELSE 0 END), \
-                    SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END) \
-                 FROM outcomes GROUP BY provider, model ORDER BY provider, model"
+                    SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END), \
+                    SUM({prompt}), SUM({completion}), SUM({cached}), \
+                    SUM({billed}), COUNT({prompt}) \
+                 FROM outcomes GROUP BY 1, model ORDER BY 1, model"
             );
             let mut stmt = conn.prepare(&query)?;
             let rows = stmt.query_map([], |r| {
@@ -494,16 +836,28 @@ mod sqlite {
                     tool_calls: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                     errors: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                     by_outcome: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                        completion_tokens: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                        cached_tokens: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                        attempts: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    },
+                    usage_requests: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    // Filled by the deduplication pass below.
+                    distinct_prompt_tokens: None,
+                    conversations: None,
                 })
             })?;
             let mut per_model: Vec<ModelStats> = rows.collect::<rusqlite::Result<_>>()?;
 
+            Self::fold_distinct_prompts(&conn, &column, &provider_col, &mut per_model)?;
+
             // Outcome breakdown per provider and model, folded into the rows
             // above.
-            let mut stmt = conn.prepare(
-                "SELECT provider, model, outcome, COUNT(*) FROM outcomes \
-                 GROUP BY provider, model, outcome ORDER BY provider, model, outcome",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT COALESCE({provider_col}, 'unknown'), model, outcome, COUNT(*) \
+                 FROM outcomes GROUP BY 1, model, outcome ORDER BY 1, model, outcome",
+            ))?;
             let breakdown = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -524,12 +878,13 @@ mod sqlite {
 
             // Errors the guardrails could not fix, grouped for triage, most
             // frequent first.
-            let mut stmt = conn.prepare(
-                "SELECT provider, model, error_category, tool_name, detail, COUNT(*) AS n \
+            let mut stmt = conn.prepare(&format!(
+                "SELECT COALESCE({provider_col}, 'unknown'), model, error_category, tool_name, \
+                    detail, COUNT(*) AS n \
                  FROM outcomes WHERE fixed = 0 \
-                 GROUP BY provider, model, error_category, tool_name, detail \
-                 ORDER BY n DESC, provider, model",
-            )?;
+                 GROUP BY 1, model, error_category, tool_name, detail \
+                 ORDER BY n DESC, 1, model",
+            ))?;
             let errors = stmt.query_map([], |r| {
                 Ok(ErrorGroup {
                     provider: r.get(0)?,
@@ -543,6 +898,121 @@ mod sqlite {
             let errors: Vec<ErrorGroup> = errors.collect::<rusqlite::Result<_>>()?;
 
             Ok(Self { per_model, errors })
+        }
+
+        /// Fold per-conversation deduplicated prompt totals into `per_model`.
+        ///
+        /// Each turn's prompt contains every earlier turn of its conversation,
+        /// so summing them counts shared prefixes once per turn. This walks the
+        /// `parent_id` edges to each chain's root, groups the turns by that
+        /// root, and takes the largest prompt in each group — the last turn,
+        /// which already accounts for the whole exchange. Requests with no
+        /// chain are conversations of one and count in full.
+        ///
+        /// Leaves the fields `None` when the database has no conversation keys
+        /// at all (a Chat-Completions-only deployment, or a table predating the
+        /// columns): with nothing to group on, the deduplicated figure would
+        /// just be the inflated sum wearing a better name.
+        fn fold_distinct_prompts(
+            conn: &Connection,
+            column: &dyn Fn(&str) -> String,
+            provider_col: &str,
+            per_model: &mut [ModelStats],
+        ) -> anyhow::Result<()> {
+            let (response_col, parent_col) = (column("response_id"), column("parent_id"));
+            if response_col == "NULL" || parent_col == "NULL" {
+                return Ok(());
+            }
+            // Nothing chained: leave the fields absent rather than reporting a
+            // deduplication that did not happen.
+            let any_chain: bool = conn
+                .prepare("SELECT 1 FROM outcomes WHERE response_id IS NOT NULL")?
+                .exists([])?;
+            if !any_chain {
+                return Ok(());
+            }
+
+            // `chain` walks each turn up its parent edges, carrying the depth
+            // travelled. The anchor maps every turn to itself at depth 0; the
+            // recursive step steps one link further towards the first turn. So
+            // a turn appears once per ancestor, and the *deepest* of those rows
+            // — the one furthest from the turn — names the root of its chain.
+            //
+            // Depth is what picks the root, not the id. Response ids are opaque
+            // strings, so ordering them lexically would let a turn whose id
+            // happens to sort before its parent's keep itself as root, splitting
+            // one conversation into several and restoring the double counting
+            // this whole query exists to remove.
+            //
+            // `depth < MAX_CHAIN_DEPTH` bounds the walk. `UNION ALL` does not
+            // deduplicate, so a `parent_id` cycle — which nothing in the proxy
+            // should produce, but which a corrupted or hand-edited database
+            // could — would otherwise recurse until the process died. A chain
+            // longer than the bound simply groups from as far back as the walk
+            // reached, which is a partial grouping rather than a wrong one.
+            //
+            // A turn whose parent was never recorded (metrics enabled
+            // mid-conversation) roots at the earliest turn that *was* seen,
+            // which is the best grouping the data supports.
+            let query = format!(
+                "WITH RECURSIVE chain(response_id, root, depth) AS (\
+                     SELECT response_id, response_id, 0 FROM outcomes \
+                        WHERE response_id IS NOT NULL \
+                   UNION ALL \
+                     SELECT o.response_id, c.root, c.depth + 1 FROM outcomes o \
+                        JOIN chain c ON o.parent_id = c.response_id \
+                        WHERE o.response_id IS NOT NULL AND c.depth < {MAX_CHAIN_DEPTH}\
+                 ), \
+                 deepest AS (\
+                     SELECT response_id, root, \
+                            ROW_NUMBER() OVER (\
+                                PARTITION BY response_id ORDER BY depth DESC\
+                            ) AS rn \
+                     FROM chain\
+                 ), \
+                 rooted AS (\
+                     SELECT o.rowid AS rid, \
+                            COALESCE({provider_col}, 'unknown') AS provider, \
+                            o.model AS model, \
+                            o.prompt_tokens AS prompt_tokens, \
+                            COALESCE(\
+                                (SELECT d.root FROM deepest d \
+                                 WHERE d.response_id = o.response_id AND d.rn = 1), \
+                                o.response_id\
+                            ) AS root \
+                     FROM outcomes o \
+                     WHERE o.prompt_tokens IS NOT NULL\
+                 ), \
+                 per_conversation AS (\
+                     SELECT provider, model, \
+                            COALESCE(root, 'row:' || rid) AS conversation, \
+                            MAX(prompt_tokens) AS prompt_tokens \
+                     FROM rooted GROUP BY provider, model, conversation\
+                 ) \
+                 SELECT provider, model, SUM(prompt_tokens), COUNT(*) \
+                 FROM per_conversation GROUP BY provider, model"
+            );
+
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (provider, model, distinct, conversations) = row?;
+                if let Some(m) = per_model
+                    .iter_mut()
+                    .find(|m| m.provider == provider && m.model == model)
+                {
+                    m.distinct_prompt_tokens = Some(distinct);
+                    m.conversations = Some(conversations);
+                }
+            }
+            Ok(())
         }
 
         /// Render a plain-text report for the CLI.
@@ -574,6 +1044,49 @@ mod sqlite {
                 );
                 for (outcome, count) in &m.by_outcome {
                     let _ = writeln!(out, "    {outcome:<22} {count}");
+                }
+                // Only models with a usage report get a token line; printing
+                // zeroes for a backend that does not report usage would read as
+                // "this model is free" rather than "this is unmeasured".
+                if m.usage_requests > 0 {
+                    let cache = match m.cache_hit_rate() {
+                        Some(r) => format!("{:.1}%", r * 100.0),
+                        None => "n/a".to_string(),
+                    };
+                    // "new" (uncached prompt) leads because it is the additive
+                    // figure: resent transcript prefixes are what the cache
+                    // serves, so the cached share is the part that would double
+                    // count if this were read as distinct tokens.
+                    let _ = writeln!(
+                        out,
+                        "  tokens billed: {}  |  prompt: {} ({} new, {} cached)  |  completion: {}",
+                        m.billed_tokens(),
+                        m.usage.prompt_tokens,
+                        m.usage.uncached_prompt_tokens(),
+                        m.usage.cached_tokens,
+                        m.usage.completion_tokens,
+                    );
+                    let calls = match m.calls_per_request() {
+                        Some(c) => format!("{c:.2}"),
+                        None => "n/a".to_string(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "  cache hit rate: {cache}  |  backend calls per request: {calls}  \
+                         |  measured over {} of {} requests",
+                        m.usage_requests, m.total,
+                    );
+                    // Shown only where conversations are reconstructible, so the
+                    // absence of the line says "cannot dedupe" rather than
+                    // implying the billed figure is already distinct.
+                    if let (Some(distinct), Some(conversations)) =
+                        (m.distinct_tokens(), m.conversations)
+                    {
+                        let _ = writeln!(
+                            out,
+                            "  distinct tokens: {distinct} over {conversations} conversation(s)",
+                        );
+                    }
                 }
             }
 
@@ -610,10 +1123,15 @@ mod sqlite {
     }
 
     fn insert(conn: &Connection, record: &OutcomeRecord) -> rusqlite::Result<()> {
+        // A request with no reported usage stores NULLs rather than zeroes, so
+        // the aggregates can tell "the backend said nothing" apart from "the
+        // backend said zero" and leave those rows out of the totals.
+        let usage = record.usage.filter(|u| !u.is_empty());
         conn.execute(
             "INSERT INTO outcomes \
-             (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail, \
+              prompt_tokens, completion_tokens, cached_tokens, billed_calls, response_id, parent_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 record.ts,
                 record.provider,
@@ -625,6 +1143,12 @@ mod sqlite {
                 record.retries,
                 record.outcome.fixed() as i64,
                 record.detail,
+                usage.map(|u| u.prompt_tokens),
+                usage.map(|u| u.completion_tokens),
+                usage.map(|u| u.cached_tokens),
+                usage.map(|u| u.attempts),
+                record.conversation.as_ref().map(|c| c.id.as_str()),
+                record.conversation.as_ref().and_then(|c| c.parent.as_deref()),
             ],
         )?;
         Ok(())
@@ -658,6 +1182,25 @@ mod sqlite {
                  DROP INDEX IF EXISTS idx_outcomes_unfixed;\
                  DROP TABLE IF EXISTS outcomes;",
             )?;
+            return Ok(());
+        }
+        // A table that predates the token columns is reset for the same reason:
+        // these are regenerable local metrics, and leaving the old table in
+        // place would make every insert fail on the unknown columns, silently
+        // disabling metrics for good.
+        let has_tokens = conn
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'response_id'")?
+            .exists([])?;
+        if !has_tokens {
+            warn!(
+                "metrics database predates token usage; recreating the outcomes \
+                 table (previous request history is discarded)"
+            );
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_outcomes_provider_model;\
+                 DROP INDEX IF EXISTS idx_outcomes_unfixed;\
+                 DROP TABLE IF EXISTS outcomes;",
+            )?;
         }
         Ok(())
     }
@@ -674,16 +1217,26 @@ mod sqlite {
             tool_name      TEXT,\
             retries        INTEGER NOT NULL DEFAULT 0,\
             fixed          INTEGER NOT NULL,\
-            detail         TEXT\
+            detail         TEXT,\
+            prompt_tokens     INTEGER,\
+            completion_tokens INTEGER,\
+            cached_tokens     INTEGER,\
+            billed_calls      INTEGER,\
+            response_id       TEXT,\
+            parent_id         TEXT\
         );\
         CREATE INDEX IF NOT EXISTS idx_outcomes_provider_model \
             ON outcomes(provider, model);\
         CREATE INDEX IF NOT EXISTS idx_outcomes_unfixed \
-            ON outcomes(provider, model, error_category) WHERE fixed = 0;";
+            ON outcomes(provider, model, error_category) WHERE fixed = 0;\
+        CREATE INDEX IF NOT EXISTS idx_outcomes_response \
+            ON outcomes(response_id) WHERE response_id IS NOT NULL;\
+        CREATE INDEX IF NOT EXISTS idx_outcomes_parent \
+            ON outcomes(parent_id) WHERE parent_id IS NOT NULL;";
 
     #[cfg(test)]
     mod tests {
-        use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder};
+        use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
         use super::{SqliteRecorder, Stats};
         use crate::domain::validate::ErrorCategory;
 
@@ -702,6 +1255,8 @@ mod sqlite {
                 tool_name: None,
                 retries: 0,
                 detail: None,
+                usage: None,
+                conversation: None,
             }
         }
 
@@ -723,6 +1278,8 @@ mod sqlite {
                 tool_name: Some("get_weather".into()),
                 retries: 0,
                 detail: None,
+                usage: None,
+                conversation: None,
             });
             recorder.record(OutcomeRecord {
                 ts: now_rfc3339(),
@@ -734,6 +1291,8 @@ mod sqlite {
                 tool_name: Some("Edit".into()),
                 retries: 2,
                 detail: Some("missing filePath | args: {}".into()),
+                usage: None,
+                conversation: None,
             });
             // Drop closes the channel and joins the writer; rows are flushed.
             drop(recorder);
@@ -881,6 +1440,444 @@ mod sqlite {
             assert_eq!(m.errors, 1);
             assert_eq!(m.succeeded(), 1);
             assert_eq!(m.success_rate(), Some(0.5));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn rec_with_usage(model: &str, outcome: Outcome, usage: Usage) -> OutcomeRecord {
+            OutcomeRecord {
+                usage: Some(usage),
+                ..rec_from("default", model, outcome)
+            }
+        }
+
+        #[test]
+        fn token_usage_is_summed_per_provider_and_model() {
+            let dir = std::env::temp_dir().join(format!("guardrail-tokens-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("tokens.sqlite");
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_with_usage(
+                "m",
+                Outcome::NativeValid,
+                Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 60, attempts: 1 },
+            ));
+            // A retried request: two backend calls folded into one row.
+            recorder.record(rec_with_usage(
+                "m",
+                Outcome::RecoveredAfterRetry,
+                Usage { prompt_tokens: 300, completion_tokens: 30, cached_tokens: 140, attempts: 2 },
+            ));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 400);
+            assert_eq!(m.usage.completion_tokens, 40);
+            assert_eq!(m.usage.cached_tokens, 200);
+            assert_eq!(m.billed_tokens(), 440);
+            assert_eq!(m.usage.uncached_prompt_tokens(), 200);
+            assert_eq!(m.cache_hit_rate(), Some(0.5));
+            // Three backend calls over two client requests.
+            assert_eq!(m.usage.attempts, 3);
+            assert_eq!(m.usage_requests, 2);
+            assert_eq!(m.calls_per_request(), Some(1.5));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn rec_chained(
+            model: &str,
+            usage: Usage,
+            id: &str,
+            parent: Option<&str>,
+        ) -> OutcomeRecord {
+            OutcomeRecord {
+                usage: Some(usage),
+                conversation: Some(super::super::Conversation {
+                    id: id.to_string(),
+                    parent: parent.map(str::to_string),
+                }),
+                ..rec_from("default", model, Outcome::NativeValid)
+            }
+        }
+
+        fn usage_of(prompt: i64, completion: i64) -> Usage {
+            Usage { prompt_tokens: prompt, completion_tokens: completion, cached_tokens: 0, attempts: 1 }
+        }
+
+        #[test]
+        fn a_conversation_counts_its_resent_prefix_once() {
+            // The whole point of fix 2. Three turns of one conversation, each
+            // resending the transcript: prompts of 100, 300, 600. The billed
+            // sum is 1000, but the conversation only ever contained 600 distinct
+            // prompt tokens — turn 3's prompt already holds turns 1 and 2.
+            let dir = std::env::temp_dir().join(format!("guardrail-dedupe-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("dedupe.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_chained("m", usage_of(100, 10), "resp_1", None));
+            recorder.record(rec_chained("m", usage_of(300, 20), "resp_2", Some("resp_1")));
+            recorder.record(rec_chained("m", usage_of(600, 30), "resp_3", Some("resp_2")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+
+            // Billed is still the honest sum of what the provider charged.
+            assert_eq!(m.usage.prompt_tokens, 1000);
+            assert_eq!(m.billed_tokens(), 1060);
+
+            // Deduplicated: the largest prompt in the chain, plus all output.
+            assert_eq!(m.distinct_prompt_tokens, Some(600));
+            assert_eq!(m.distinct_tokens(), Some(660));
+            assert_eq!(m.conversations, Some(1), "three turns, one conversation");
+            // 1000 billed over 600 distinct.
+            // Billed and distinct diverge by exactly the resent prefixes: 1000
+            // charged for 600 distinct tokens.
+            assert!(m.usage.prompt_tokens > m.distinct_prompt_tokens.unwrap());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_conversations_cache_hits_are_recorded_against_its_resent_prefixes() {
+            // Resent prefixes are what a prompt cache serves, so the cached
+            // count is what says whether resending was expensive. The proxy
+            // records the measured tokens and leaves pricing to whoever knows
+            // the rates — it cannot see them.
+            let dir = std::env::temp_dir().join(format!("guardrail-cost-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("cost.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let cached = |prompt: i64, cached: i64| Usage {
+                prompt_tokens: prompt,
+                completion_tokens: 0,
+                cached_tokens: cached,
+                attempts: 1,
+            };
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            // Turn 1 is all new; each later turn's prefix is served from cache.
+            recorder.record(rec_chained("m", cached(1000, 0), "c1", None));
+            recorder.record(rec_chained("m", cached(2500, 1500), "c2", Some("c1")));
+            recorder.record(rec_chained("m", cached(4200, 3200), "c3", Some("c2")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+
+            assert_eq!(m.usage.prompt_tokens, 7700);
+            assert_eq!(m.usage.cached_tokens, 4700);
+            assert_eq!(m.distinct_prompt_tokens, Some(4200));
+
+            // 4700 of the 7700 prompt tokens were cache reads, so most of what
+            // the resends re-sent was served from cache rather than reprocessed.
+            let hit = m.cache_hit_rate().unwrap();
+            assert!((hit - 4700.0 / 7700.0).abs() < 1e-9, "got {hit}");
+            assert!(hit > 0.6, "the resends are mostly cache hits");
+            // Only 3000 were genuinely new work.
+            assert_eq!(m.usage.uncached_prompt_tokens(), 3000);
+
+            let report = stats.render();
+            assert!(report.contains("cache hit rate"));
+            assert!(report.contains("distinct tokens"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn unrelated_requests_each_count_in_full() {
+            // Deduplication must not collapse traffic that merely happens to
+            // share a model. Three unchained requests are three conversations
+            // of one turn, so distinct equals billed.
+            let dir = std::env::temp_dir().join(format!("guardrail-unrel-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("unrelated.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_chained("m", usage_of(100, 10), "resp_a", None));
+            recorder.record(rec_chained("m", usage_of(200, 10), "resp_b", None));
+            recorder.record(rec_chained("m", usage_of(300, 10), "resp_c", None));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 600);
+            assert_eq!(m.distinct_prompt_tokens, Some(600), "nothing to dedupe");
+            assert_eq!(m.conversations, Some(3));
+            assert_eq!(
+                m.distinct_prompt_tokens,
+                Some(m.usage.prompt_tokens),
+                "with nothing resent, distinct equals billed"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn two_conversations_are_deduplicated_independently() {
+            // Sum of per-conversation maxima, not one global maximum: collapsing
+            // across conversations would undercount as badly as summing
+            // overcounts.
+            let dir = std::env::temp_dir().join(format!("guardrail-twoconv-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("twoconv.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            // Conversation A: 100 → 250.
+            recorder.record(rec_chained("m", usage_of(100, 5), "a1", None));
+            recorder.record(rec_chained("m", usage_of(250, 5), "a2", Some("a1")));
+            // Conversation B: 400 → 900.
+            recorder.record(rec_chained("m", usage_of(400, 5), "b1", None));
+            recorder.record(rec_chained("m", usage_of(900, 5), "b2", Some("b1")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 1650, "billed sum");
+            // 250 + 900, not 900 alone and not 1650.
+            assert_eq!(m.distinct_prompt_tokens, Some(1150));
+            assert_eq!(m.conversations, Some(2));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn chat_completions_traffic_reports_no_deduplication_rather_than_a_false_one() {
+            // Chat Completions carries no conversation key, so resends are
+            // invisible. Reporting the inflated sum as "distinct" would be a
+            // lie; absence is the honest answer.
+            let dir = std::env::temp_dir().join(format!("guardrail-nochain-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("nochain.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(100, 10)));
+            recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(300, 20)));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 400, "billed is still reported");
+            assert_eq!(m.distinct_prompt_tokens, None);
+            assert_eq!(m.distinct_tokens(), None);
+            assert_eq!(m.conversations, None);
+            // And the report must not claim a deduplication it did not do.
+            assert!(!stats.render().contains("distinct tokens"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_chain_groups_regardless_of_how_its_ids_happen_to_sort() {
+            // Response ids are opaque strings, so chain order and lexical order
+            // are unrelated. Here every later turn's id sorts *before* its
+            // parent's; picking a root by string comparison would leave each
+            // turn as its own root, split one conversation into three, and add
+            // the resent prefixes right back up. The root must come from the
+            // walk, not the ordering.
+            let dir = std::env::temp_dir().join(format!("guardrail-idsort-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("idsort.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_chained("m", usage_of(1000, 10), "zzz_first", None));
+            recorder.record(rec_chained("m", usage_of(2500, 20), "mmm_second", Some("zzz_first")));
+            recorder.record(rec_chained("m", usage_of(4200, 30), "aaa_third", Some("mmm_second")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+
+            assert_eq!(m.usage.prompt_tokens, 7700, "billed is unaffected");
+            // One conversation, so only the last turn's prompt counts.
+            assert_eq!(
+                m.conversations,
+                Some(1),
+                "lexically-descending ids must not split the chain"
+            );
+            assert_eq!(m.distinct_prompt_tokens, Some(4200));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_cycle_in_the_parent_links_terminates_instead_of_hanging() {
+            // Nothing in the proxy writes a cycle, but the recursive walk uses
+            // UNION ALL and would not terminate on one. A corrupted or
+            // hand-edited database must still let `stats` return.
+            let dir = std::env::temp_dir().join(format!("guardrail-cycle-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("cycle.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            {
+                let recorder = SqliteRecorder::open(&db).unwrap();
+                recorder.record(rec_chained("m", usage_of(100, 5), "x", Some("y")));
+                recorder.record(rec_chained("m", usage_of(200, 5), "y", Some("x")));
+            }
+
+            // The assertion is simply that this returns at all.
+            let stats = Stats::read(&db).expect("a cycle must not hang or error");
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 300);
+            assert!(m.distinct_prompt_tokens.is_some());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_chain_whose_first_turn_was_never_recorded_still_groups() {
+            // Metrics enabled mid-conversation: turn 2 names a parent that is
+            // not in the database. Those turns must still group together rather
+            // than each counting in full.
+            let dir = std::env::temp_dir().join(format!("guardrail-orphan-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("orphan.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_chained("m", usage_of(300, 10), "resp_2", Some("resp_missing")));
+            recorder.record(rec_chained("m", usage_of(700, 10), "resp_3", Some("resp_2")));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.usage.prompt_tokens, 1000);
+            // Rooted at the earliest turn actually seen, so still one group.
+            assert_eq!(m.distinct_prompt_tokens, Some(700));
+            assert_eq!(m.conversations, Some(1));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn requests_without_a_usage_report_are_left_out_of_the_totals() {
+            // A backend that reports no usage must not be averaged in as a
+            // zero-token request — that would drag every per-request figure
+            // down and make the numbers look like a measurement rather than
+            // the absence of one.
+            let dir =
+                std::env::temp_dir().join(format!("guardrail-nousage-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("nousage.sqlite");
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_with_usage(
+                "m",
+                Outcome::NativeValid,
+                Usage { prompt_tokens: 50, completion_tokens: 5, cached_tokens: 0, attempts: 1 },
+            ));
+            recorder.record(rec("m", Outcome::NativeValid)); // no usage at all
+            // An all-zero report is indistinguishable from no report and is
+            // stored as NULL too.
+            recorder.record(rec_with_usage("m", Outcome::NativeValid, Usage::default()));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.total, 3, "every request is still counted");
+            assert_eq!(m.usage_requests, 1, "only one carried a usage report");
+            assert_eq!(m.billed_tokens(), 55);
+            assert_eq!(m.calls_per_request(), Some(1.0));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn reading_a_database_older_than_the_current_schema_degrades_instead_of_failing() {
+            // `stats` reads a database the proxy owns and may not have opened
+            // since an upgrade, so the table can be missing any column added
+            // since. It must report what it has rather than erroring out — the
+            // whole history is otherwise unreadable until the proxy runs again.
+            let dir = std::env::temp_dir().join(format!("guardrail-oldread-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("old.sqlite");
+            let _ = std::fs::remove_file(&db);
+            {
+                // The oldest shipped schema: no provider, no token columns.
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE outcomes (\
+                        id INTEGER PRIMARY KEY, ts TEXT NOT NULL, model TEXT NOT NULL,\
+                        outcome TEXT NOT NULL, error_category TEXT, parser TEXT,\
+                        tool_name TEXT, retries INTEGER NOT NULL DEFAULT 0,\
+                        fixed INTEGER NOT NULL, detail TEXT);\
+                     INSERT INTO outcomes (ts, model, outcome, retries, fixed) \
+                        VALUES ('t', 'old-model', 'native_valid', 0, 1);\
+                     INSERT INTO outcomes (ts, model, outcome, retries, fixed, error_category) \
+                        VALUES ('t', 'old-model', 'retries_exhausted', 2, 0, 'missing_argument');",
+                )
+                .unwrap();
+            }
+
+            let stats = Stats::read(&db).expect("an old database must still be readable");
+            assert_eq!(stats.per_model.len(), 1);
+            let m = &stats.per_model[0];
+            assert_eq!(m.model, "old-model");
+            assert_eq!(m.provider, "unknown", "no provider was recorded back then");
+            assert_eq!(m.total, 2);
+            assert_eq!(m.errors, 1);
+            // The outcome history is intact; only the tokens are unknown.
+            assert_eq!(m.usage_requests, 0);
+            assert_eq!(m.billed_tokens(), 0);
+            assert_eq!(stats.errors.len(), 1, "triage list still reads");
+
+            // And it renders without panicking.
+            assert!(stats.render().contains("old-model"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_database_predating_tokens_is_recreated_rather_than_disabling_metrics() {
+            // Same reasoning as the provider reset: these are regenerable local
+            // metrics, and leaving the old table would make every insert fail on
+            // the unknown columns — metrics silently off until someone runs
+            // `stats` and finds it empty.
+            let dir =
+                std::env::temp_dir().join(format!("guardrail-pretokens-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("pretokens.sqlite");
+            let _ = std::fs::remove_file(&db);
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE outcomes (\
+                        id INTEGER PRIMARY KEY, ts TEXT NOT NULL,\
+                        provider TEXT NOT NULL DEFAULT 'unknown', model TEXT NOT NULL,\
+                        outcome TEXT NOT NULL, error_category TEXT, parser TEXT,\
+                        tool_name TEXT, retries INTEGER NOT NULL DEFAULT 0,\
+                        fixed INTEGER NOT NULL, detail TEXT);\
+                     INSERT INTO outcomes (ts, provider, model, outcome, retries, fixed) \
+                        VALUES ('t', 'copilot', 'gpt-4o', 'native_valid', 0, 1);",
+                )
+                .unwrap();
+            }
+
+            let recorder = SqliteRecorder::open(&db).expect("stale schema must not disable metrics");
+            recorder.record(rec_with_usage(
+                "gpt-4o",
+                Outcome::NativeValid,
+                Usage { prompt_tokens: 9, completion_tokens: 1, cached_tokens: 0, attempts: 1 },
+            ));
+            drop(recorder);
+
+            // The old row is gone with the table; the new one records tokens.
+            let stats = Stats::read(&db).unwrap();
+            assert_eq!(stats.per_model.len(), 1);
+            let m = &stats.per_model[0];
+            assert_eq!(m.total, 1);
+            assert_eq!(m.billed_tokens(), 10);
 
             let _ = std::fs::remove_dir_all(&dir);
         }

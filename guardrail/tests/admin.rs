@@ -39,6 +39,8 @@ fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
         tool_name: None,
         retries: 0,
         detail: None,
+        usage: None,
+        conversation: None,
     }
 }
 

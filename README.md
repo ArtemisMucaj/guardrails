@@ -107,6 +107,44 @@ Three rules make routing predictable:
 A single bare `--backend URL` still behaves exactly as before; it is named
 `default`.
 
+### GitHub Copilot
+
+`--copilot` adds a `copilot` provider backed by a Copilot subscription. Unlike a
+plain backend it needs an OAuth credential, six client-identity headers GitHub
+gates access on, and its routes live at the root rather than under `/v1` — all
+supplied by [`gh-copilot-rs`](https://github.com/ArtemisMucaj/gh-copilot-rs). The
+proxy's own surface stays `/v1/...`, so clients need not know the difference.
+
+Authorize once, through the admin server's device flow:
+
+```bash
+guardrail --backend lmstudio=http://127.0.0.1:1234 \
+  --copilot --admin-listen 127.0.0.1:8081
+
+# Returns a user_code and verification_uri to open in a browser.
+curl -X POST http://127.0.0.1:8081/copilot/login
+# Poll until it reads {"status":"authorized"}.
+curl http://127.0.0.1:8081/copilot/login
+```
+
+The token is stored at `~/.guardrails/copilot-token`, created `0600` so it is
+not world-readable, and reused on later runs. Restart the proxy after
+authorizing for the provider to pick it up. Until a token exists the proxy still
+runs — the other providers work, and Copilot claims no models.
+
+A client's own `Authorization` never displaces the Copilot credential: the
+provider reserves that header along with the six gating ones. Without this an
+OpenAI-compatible client sending `Bearer no-key`, as many do by default, would
+have its placeholder forwarded to GitHub and every request would fail as a `401`
+that reads like an expired token.
+
+**Security.** The admin server is unauthenticated, and with `--copilot` it can
+both start a login and front a paid subscription. The proxy therefore refuses to
+start if `--admin-listen` is not a loopback address. Loopback keeps other hosts
+out, but not other processes on this machine: anything running locally can use
+the credential through the proxy. That is an acceptable trade on a single-user
+development machine, and not on a shared one.
+
 `GET /v1/models` returns the union across providers, each entry tagged with the
 `provider` that serves it, so a client can name any routable model. An id served
 by more than one provider is listed once, under the provider routing sends it to.
@@ -130,6 +168,8 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
+| `--copilot` | `GUARDRAIL_COPILOT` | `false` | Proxy GitHub Copilot models, using a Copilot subscription. |
+| `--copilot-base-url` | `GUARDRAIL_COPILOT_BASE_URL` | `https://api.githubcopilot.com` | Copilot API base URL. Override for an enterprise deployment. |
 
 Rescue, the synthetic `respond` tool, and the deterministic argument repairs
 are always on. The only knob is the retry budget:
@@ -226,8 +266,10 @@ guardrail loop.
 
 For programmatic access — a desktop app, a dashboard, a health check — the same
 stats are available over HTTP from a dedicated admin server on a **separate
-port** from the proxy. It is read-only (every route is a `GET`) and opt-in: pass
-`--admin-listen` to enable it.
+port** from the proxy. It is opt-in: pass `--admin-listen` to enable it. Every route is a `GET`
+except `POST /copilot/login`, which starts a device flow — the one deliberate
+exception to the read-only rule, and present only with `--copilot`. A login
+response carries the user code and verification URL, never the token.
 
 ```bash
 cargo run -p guardrail -- \
@@ -246,6 +288,8 @@ authenticated.
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
 | `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
+| `GET /copilot/login` | Current device-flow status. Only present with `--copilot`. |
+| `POST /copilot/login` | Start (or restart) the device flow; returns the `user_code` and `verification_uri`. Only present with `--copilot`. |
 | `GET /` | Lists the available endpoints. |
 
 `GET /stats` reads the guardrails database on each request — the same source the
@@ -319,6 +363,7 @@ calls.
 guardrail/src/application/  HTTP proxy and guardrail loop
 guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
+guardrail/src/copilot/      GitHub Copilot provider and device-flow login
 guardrail/src/domain/       Decode, rescue, validate, retry, respond, and provider routing
 guardrail/tests/            End-to-end proxy tests
 ```

@@ -57,6 +57,10 @@ pub struct AdminInfo {
 pub struct AdminState {
     db_path: PathBuf,
     info: Arc<AdminInfo>,
+    /// Present only when a Copilot provider is configured. `None` leaves the
+    /// login routes answering `404`, so the mutable surface does not exist at
+    /// all unless it is needed.
+    login: Option<Arc<crate::copilot::CopilotLogin>>,
 }
 
 impl AdminState {
@@ -64,7 +68,14 @@ impl AdminState {
         Self {
             db_path,
             info: Arc::new(info),
+            login: None,
         }
+    }
+
+    /// Enable the Copilot device-flow login routes.
+    pub fn with_login(mut self, login: Arc<crate::copilot::CopilotLogin>) -> Self {
+        self.login = Some(login);
+        self
     }
 }
 
@@ -86,22 +97,65 @@ pub fn redact_backend_url(backend: &str) -> String {
         .unwrap_or_else(|| "<redacted>".to_string())
 }
 
-/// Build the admin router. Read-only: every route is a `GET`.
+/// Build the admin router.
+///
+/// Every route was a `GET` until Copilot login arrived. Starting a device flow
+/// mutates state, so `POST /copilot/login` is a deliberate exception to the
+/// read-only rule rather than an oversight — see the README's note on the admin
+/// server's security posture. The route exists only when a Copilot provider is
+/// configured.
 pub fn build_admin_app(state: AdminState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/info", get(info))
         .route("/stats", get(stats))
+        .route("/copilot/login", get(copilot_login_status).post(copilot_login_start))
         .with_state(state)
+}
+
+/// `GET /copilot/login` — where the current attempt stands.
+///
+/// The body is a `LoginStatus`, which carries no credential by construction.
+async fn copilot_login_status(State(state): State<AdminState>) -> Response {
+    let Some(login) = state.login.as_ref() else {
+        return copilot_disabled();
+    };
+    Json(login.status().await).into_response()
+}
+
+/// `POST /copilot/login` — start, or restart, the device flow.
+///
+/// Returns as soon as GitHub issues the code, so the response carries the
+/// `user_code` and `verification_uri` to show the user; the polling continues in
+/// the background.
+async fn copilot_login_start(State(state): State<AdminState>) -> Response {
+    let Some(login) = state.login.as_ref() else {
+        return copilot_disabled();
+    };
+    Json(login.start().await).into_response()
+}
+
+fn copilot_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no copilot provider is configured" })),
+    )
+        .into_response()
 }
 
 /// Discoverability root: list the available endpoints so the port is
 /// self-describing when opened in a browser or by a new integration.
-async fn index() -> Json<serde_json::Value> {
+async fn index(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    let mut endpoints = vec!["/healthz", "/info", "/stats"];
+    // Listed only when it exists, so discovery does not advertise a route that
+    // answers 404.
+    if state.login.is_some() {
+        endpoints.push("/copilot/login");
+    }
     Json(json!({
         "service": "guardrail-admin",
-        "endpoints": ["/healthz", "/info", "/stats"],
+        "endpoints": endpoints,
     }))
 }
 

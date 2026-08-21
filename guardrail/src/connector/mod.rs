@@ -14,14 +14,38 @@ use crate::application::BackendPort;
 use crate::domain::provider::Provider;
 
 /// Concrete backend adapter that delegates to a `reqwest::Client`.
+///
+/// Most providers share one client. A provider that presents its own credential
+/// needs its own, because the credential is configured as a default header on
+/// the client itself — so it can register one here under its name.
 #[derive(Clone)]
 pub struct Backend {
     client: reqwest::Client,
+    per_provider: std::collections::HashMap<String, reqwest::Client>,
 }
 
 impl Backend {
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            per_provider: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Use `client` for requests to the provider named `name`.
+    ///
+    /// The client is expected to carry that provider's credential and required
+    /// headers as defaults; pair it with [`Provider::owning_credential`] so the
+    /// client's own headers cannot displace them.
+    pub fn with_client_for(mut self, name: impl Into<String>, client: reqwest::Client) -> Self {
+        self.per_provider.insert(name.into(), client);
+        self
+    }
+
+    fn client_for(&self, provider: &Provider) -> &reqwest::Client {
+        self.per_provider
+            .get(provider.name())
+            .unwrap_or(&self.client)
     }
 }
 
@@ -39,7 +63,7 @@ impl BackendPort for Backend {
         headers: &HeaderMap,
         body: Vec<u8>,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response> {
-        post_backend(&self.client, &headers_for(provider, headers), target, body).await
+        post_backend(self.client_for(provider), &headers_for(provider, headers), target, body).await
     }
 
     async fn stream_post(
@@ -52,7 +76,7 @@ impl BackendPort for Backend {
         use futures_util::StreamExt;
 
         let resp = self
-            .client
+            .client_for(provider)
             .post(target)
             .headers(headers_for(provider, headers))
             .body(body)
@@ -144,7 +168,7 @@ impl BackendPort for Backend {
         // Forward verbatim: preserve the body for every method (some APIs send
         // entity bodies with GET/DELETE), matching the proxy's transparency.
         let resp = match self
-            .client
+            .client_for(provider)
             .request(method, target)
             .headers(headers_for(provider, headers))
             .body(body.to_vec())

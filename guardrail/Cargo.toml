@@ -25,6 +25,7 @@ tokio-stream = "0.1"
 async-trait = "0.1"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+gh-copilot-rs = { git = "https://github.com/ArtemisMucaj/gh-copilot-rs" }
 
 [dev-dependencies]
 wiremock = "0.6"

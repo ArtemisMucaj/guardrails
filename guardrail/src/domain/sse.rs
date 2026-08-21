@@ -36,6 +36,37 @@ pub enum AssembledResponse {
     Rescued { parser: &'static str, calls: Vec<ToolCall>, template: Value },
 }
 
+/// Token usage seen on a stream, independent of what the stream turned out to
+/// be. Kept beside [`AssembledResponse`] rather than inside it because usage is
+/// reported the same way for text, tool calls, and rescues, and every variant
+/// would otherwise have to carry a copy.
+pub type StreamUsage = Option<super::metrics::Usage>;
+
+/// Pick the usage report out of a chunk, keeping the richer of the two when a
+/// backend reports more than once.
+///
+/// A stream carries at most one usage block in practice, but backends differ on
+/// which chunk holds it (the last content chunk, the `finish_reason` chunk, or a
+/// trailing usage-only chunk), so every chunk is checked. `max` on the token
+/// count avoids a later, emptier report overwriting a real one — some backends
+/// send a zeroed block on the terminal chunk after the real numbers.
+fn merge_usage(seen: &mut StreamUsage, chunk: &Value) {
+    let Some(usage) = super::metrics::extract_usage(chunk) else { return };
+    if usage.is_empty() {
+        return;
+    }
+    let better = match *seen {
+        Some(prev) => {
+            usage.prompt_tokens + usage.completion_tokens
+                > prev.prompt_tokens + prev.completion_tokens
+        }
+        None => true,
+    };
+    if better {
+        *seen = Some(usage);
+    }
+}
+
 fn fill_slots(slots: &mut Vec<CallSlot>, tool_calls: &[Value]) {
     for tc in tool_calls {
         let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -65,11 +96,14 @@ pub fn parse_sse_line(line: &str) -> Option<Value> {
 /// first tool-call delta is seen — allowing the caller to switch to buffered
 /// mode before returning a response. For text streams, `kind_tx` receives `true`
 /// at EOF (after rescue detection).
+///
+/// Returns the assembled result together with whatever token usage the backend
+/// reported on the stream.
 pub async fn assemble_stream<F>(
     rx: &mut mpsc::Receiver<Option<String>>,
     mut emit_sse: F,
     kind_tx: Option<mpsc::Sender<bool>>,
-) -> AssembledResponse
+) -> (AssembledResponse, StreamUsage)
 where
     F: FnMut(&str),
 {
@@ -78,6 +112,7 @@ where
     let mut has_tool_calls = false;
     let mut accumulated_text = String::new();
     let mut kind_fired = false;
+    let mut usage: StreamUsage = None;
 
     let mut signal = |is_text: bool, tx: &Option<mpsc::Sender<bool>>| {
         if !kind_fired {
@@ -103,6 +138,10 @@ where
             emit_sse(&format!("{line}\n\n"));
             continue;
         };
+
+        // Usage can ride on any chunk, including ones that carry no delta at
+        // all, so it is read before the delta dispatch below.
+        merge_usage(&mut usage, &chunk);
 
         let delta = chunk
             .get("choices")
@@ -155,22 +194,33 @@ where
                 arguments: if s.arguments.is_empty() { "{}".to_string() } else { s.arguments },
             })
             .collect();
-        return AssembledResponse::ToolCalls { calls, template, content: accumulated_text };
+        return (
+            AssembledResponse::ToolCalls { calls, template, content: accumulated_text },
+            usage,
+        );
     }
 
     if !accumulated_text.is_empty() {
         if let Some((parser, calls)) = crate::domain::rescue::rescue(&accumulated_text) {
             signal(false, &kind_tx); // rescue = treat like tool calls
-            return AssembledResponse::Rescued { parser, calls, template };
+            return (AssembledResponse::Rescued { parser, calls, template }, usage);
         }
     }
 
     signal(true, &kind_tx); // pure text — signal at EOF
-    AssembledResponse::Text { template }
+    (AssembledResponse::Text { template }, usage)
 }
 
 /// Synchronous version for tests and non-streaming paths.
-pub fn assemble<F>(raw_sse: &str, mut emit_text: F) -> AssembledResponse
+pub fn assemble<F>(raw_sse: &str, emit_text: F) -> AssembledResponse
+where
+    F: FnMut(&str),
+{
+    assemble_with_usage(raw_sse, emit_text).0
+}
+
+/// [`assemble`], also returning the token usage the stream reported.
+pub fn assemble_with_usage<F>(raw_sse: &str, mut emit_text: F) -> (AssembledResponse, StreamUsage)
 where
     F: FnMut(&str),
 {
@@ -178,12 +228,14 @@ where
     let mut template = Value::Null;
     let mut has_tool_calls = false;
     let mut accumulated_text = String::new();
+    let mut usage: StreamUsage = None;
 
     for line in raw_sse.lines() {
         let Some(chunk) = parse_sse_line(line) else {
             if !line.is_empty() && !line.starts_with(':') { emit_text(&format!("{line}\n\n")); }
             continue;
         };
+        merge_usage(&mut usage, &chunk);
         let delta = chunk.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta"));
 
         if let Some(tool_calls) = delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array) {
@@ -213,16 +265,19 @@ where
             id: s.id, name: s.name,
             arguments: if s.arguments.is_empty() { "{}".to_string() } else { s.arguments },
         }).collect();
-        return AssembledResponse::ToolCalls { calls, template, content: accumulated_text };
+        return (
+            AssembledResponse::ToolCalls { calls, template, content: accumulated_text },
+            usage,
+        );
     }
 
     if !accumulated_text.is_empty() {
         if let Some((parser, calls)) = crate::domain::rescue::rescue(&accumulated_text) {
-            return AssembledResponse::Rescued { parser, calls, template };
+            return (AssembledResponse::Rescued { parser, calls, template }, usage);
         }
     }
 
-    AssembledResponse::Text { template }
+    (AssembledResponse::Text { template }, usage)
 }
 
 #[cfg(test)]
@@ -364,6 +419,88 @@ mod tests {
         };
         assert_eq!(calls[0].name, "root");
         assert!(content.contains("<function=bash>"), "content should carry the XML text");
+    }
+
+    #[test]
+    fn usage_is_read_off_a_trailing_usage_only_chunk() {
+        // The shape OpenAI uses with `stream_options.include_usage`: a final
+        // chunk with an empty `choices` array carrying only the usage block.
+        let mut sse = String::new();
+        let content = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]
+        });
+        sse.push_str(&format!("data: {content}\n\n"));
+        let usage_chunk = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "choices": [],
+            "usage": {
+                "prompt_tokens": 12, "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 8}
+            }
+        });
+        sse.push_str(&format!("data: {usage_chunk}\n\n"));
+        sse.push_str("data: [DONE]\n\n");
+
+        let (_, usage) = assemble_with_usage(&sse, |_| {});
+        let usage = usage.expect("usage from the trailing chunk");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.cached_tokens, 8);
+        assert_eq!(usage.attempts, 1);
+    }
+
+    #[test]
+    fn usage_is_captured_on_tool_call_streams_too() {
+        // Tool-call chunks are buffered rather than forwarded, so usage on that
+        // path is only observable if the assembler reads it — and tool calls
+        // are precisely the traffic the guardrails retry and bill twice.
+        let mut sse = String::new();
+        let tc = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}}]
+            }, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 6}
+        });
+        sse.push_str(&format!("data: {tc}\n\ndata: [DONE]\n\n"));
+
+        let (assembled, usage) = assemble_with_usage(&sse, |_| {});
+        assert!(matches!(assembled, AssembledResponse::ToolCalls { .. }));
+        let usage = usage.expect("usage on a tool-call stream");
+        assert_eq!(usage.prompt_tokens, 30);
+        assert_eq!(usage.completion_tokens, 6);
+    }
+
+    #[test]
+    fn a_zeroed_terminal_report_does_not_erase_the_real_one() {
+        // Some backends send the real numbers mid-stream and then a zeroed
+        // usage block on the terminal chunk. Taking the last one seen would
+        // throw the measurement away.
+        let mut sse = String::new();
+        let real = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 9}
+        });
+        sse.push_str(&format!("data: {real}\n\n"));
+        let zeroed = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        sse.push_str(&format!("data: {zeroed}\n\ndata: [DONE]\n\n"));
+
+        let (_, usage) = assemble_with_usage(&sse, |_| {});
+        let usage = usage.expect("the real report must survive");
+        assert_eq!(usage.prompt_tokens, 40);
+        assert_eq!(usage.completion_tokens, 9);
+    }
+
+    #[test]
+    fn a_stream_without_usage_reports_none() {
+        let sse = text_chunks(&["Hello"]);
+        let (_, usage) = assemble_with_usage(&sse, |_| {});
+        assert_eq!(usage, None, "no usage block means no measurement");
     }
 
     #[test]

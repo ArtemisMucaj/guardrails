@@ -34,7 +34,8 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 use crate::domain::decode::{response_with_text, response_with_tool_calls};
 pub use crate::domain::guardrails::Guardrails;
 use crate::domain::metrics::{
-    now_rfc3339, redact_args, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
+    now_rfc3339, redact_args, Conversation, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
+    Usage,
 };
 use crate::domain::model::ChatRequest;
 use crate::domain::provider::{Provider, DEFAULT_PROVIDER};
@@ -230,6 +231,10 @@ async fn proxy_responses(State(state): State<AppState>, req: Request) -> Respons
                 ts: now_rfc3339(), provider: provider.name().to_string(), model: request.model,
                 outcome, error_category: None, parser: None, tool_name: None, retries: 0,
                 detail: None,
+                // Forwarded verbatim without the proxy reading the body, so
+                // there is no usage and no conversation to report.
+                usage: None,
+                conversation: None,
             });
         }
 
@@ -311,8 +316,20 @@ async fn run_responses_guardrail(
     passthrough_tx: tokio::sync::oneshot::Sender<Response>,
 ) {
     let mut tracker = ErrorTracker::new(g.max_retries);
+    // Totalled over every backend attempt — see the chat loop's counterpart.
+    let mut billed = Usage::default();
+    // The turn this request continues, read once from the client's own request:
+    // the Responses API is stateful, so a chained turn names its predecessor
+    // instead of resending the transcript. Paired with the response id the
+    // backend assigns, this is the edge that lets the report count a resent
+    // prefix once instead of once per turn.
+    let parent_id = request.previous_response_id().map(str::to_string);
+    // This turn's own id, learned from the backend's terminal event.
+    let mut response_id: Option<String> = None;
 
-    let emit_metric = |outcome: Outcome,
+    let emit_metric = |billed: Usage,
+                       response_id: Option<String>,
+                       outcome: Outcome,
                        error_category: Option<ErrorCategory>,
                        parser: Option<String>,
                        tool_name: Option<String>,
@@ -321,6 +338,10 @@ async fn run_responses_guardrail(
         recorder.record(OutcomeRecord {
             ts: now_rfc3339(), provider: provider.name().to_string(), model: model.clone(),
             outcome, error_category, parser, tool_name, retries, detail,
+            usage: (!billed.is_empty()).then_some(billed),
+            // Only a turn the backend named can anchor a chain; without an id
+            // there is nothing for a later turn to point back to.
+            conversation: response_id.map(|id| Conversation { id, parent: parent_id.clone() }),
         });
     };
 
@@ -329,7 +350,7 @@ async fn run_responses_guardrail(
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "failed to serialize request");
-                emit_metric(Outcome::InternalError, None, None, None, tracker.attempts(), None);
+                emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), None);
                 return;
             }
         };
@@ -345,7 +366,7 @@ async fn run_responses_guardrail(
 
         let forward_text = tracker.attempts() == 0 && is_native_sse;
         let tx = body_tx.clone();
-        let assembled = assemble_responses_stream(
+        let (assembled, attempt_usage) = assemble_responses_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -355,10 +376,24 @@ async fn run_responses_guardrail(
             None,
         )
         .await;
+        if let Some(attempt_usage) = attempt_usage {
+            billed.add(attempt_usage);
+        }
+
+        // The backend names this turn on its terminal event, which the
+        // assembler keeps as the template. Read on every attempt so a retry —
+        // which gets a fresh response id — records the one actually delivered,
+        // the id a following turn will chain to.
+        let capture_id = |template: &Value, into: &mut Option<String>| {
+            if let Some(id) = template.get("id").and_then(Value::as_str) {
+                *into = Some(id.to_string());
+            }
+        };
 
         let (mut calls, template, rescued_parser) = match assembled {
-            AssembledResponses::Text { .. } => {
-                emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+            AssembledResponses::Text { ref template, .. } => {
+                capture_id(template, &mut response_id);
+                emit_metric(billed, response_id, Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
                 return;
             }
             AssembledResponses::Rescued { parser, calls, template } => {
@@ -367,6 +402,7 @@ async fn run_responses_guardrail(
             }
             AssembledResponses::ToolCalls { calls, template, .. } => (calls, template, None),
         };
+        capture_id(&template, &mut response_id);
         let rescued = rescued_parser.is_some();
 
         if respond_active {
@@ -375,7 +411,7 @@ async fn run_responses_guardrail(
                 .find(|c| respond::is_respond(c))
                 .and_then(respond::message_text)
             {
-                emit_metric(Outcome::RespondIntercept, None, None, Some(respond::RESPOND.to_string()), tracker.attempts(), None);
+                emit_metric(billed, response_id.clone(), Outcome::RespondIntercept, None, None, Some(respond::RESPOND.to_string()), tracker.attempts(), None);
                 send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
                 return;
             }
@@ -385,7 +421,7 @@ async fn run_responses_guardrail(
             crate::domain::precondition::check(&calls)
         {
             warn!(%nudge, "precondition failed");
-            emit_metric(Outcome::WriteRefused, None, None, calls.first().map(|c| c.name.clone()), tracker.attempts(), Some(nudge.clone()));
+            emit_metric(billed, response_id.clone(), Outcome::WriteRefused, None, None, calls.first().map(|c| c.name.clone()), tracker.attempts(), Some(nudge.clone()));
             let text = format!("The tool call could not be completed. {nudge}");
             send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
             return;
@@ -402,7 +438,7 @@ async fn run_responses_guardrail(
                     else if repaired { Outcome::Repaired }
                     else if rescued { Outcome::Rescued }
                     else { Outcome::NativeValid };
-                emit_metric(outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
+                emit_metric(billed, response_id.clone(), outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
                 send_responses_value(&body_tx, &responses::with_tool_calls(&template, &calls)).await;
                 return;
             }
@@ -419,7 +455,7 @@ async fn run_responses_guardrail(
                     let s = redact_args(&c.arguments);
                     if s.is_empty() { nudge.clone() } else { format!("{nudge} | args: {s}") }
                 });
-                emit_metric(Outcome::RetriesExhausted, Some(category), None, offending_call.map(|c| c.name.clone()), tracker.attempts(), detail);
+                emit_metric(billed, response_id.clone(), Outcome::RetriesExhausted, Some(category), None, offending_call.map(|c| c.name.clone()), tracker.attempts(), detail);
                 let text = format!("The tool call could not be completed after several attempts. {nudge}");
                 send_responses_value(&body_tx, &responses::with_text(&template, &text)).await;
                 return;
@@ -645,6 +681,10 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             state.recorder.record(OutcomeRecord {
                 ts: now_rfc3339(), provider: provider.name().to_string(), model: request.model, outcome,
                 error_category: None, parser: None, tool_name: None, retries: 0, detail: None,
+                // Forwarded verbatim without the proxy reading the body, so
+                // there is no usage and no conversation to report.
+                usage: None,
+                conversation: None,
             });
         }
 
@@ -739,8 +779,18 @@ async fn run_guardrail(
     passthrough_tx: tokio::sync::oneshot::Sender<Response>,
 ) {
     let mut tracker = ErrorTracker::new(g.max_retries);
+    // Usage totalled over every backend attempt this request makes. A retry is
+    // a second billed call, so the recorded row must reflect the sum, not just
+    // the attempt that happened to succeed.
+    let mut billed = Usage::default();
 
-    let emit_metric = |outcome: Outcome,
+    // The conversation argument is always `None` here: Chat Completions is
+    // stateless, so a turn carries no id and no reference to its predecessor.
+    // The parameter exists to keep this closure the same shape as the Responses
+    // loop's, where the ids do exist.
+    let emit_metric = |billed: Usage,
+                       conversation: Option<Conversation>,
+                       outcome: Outcome,
                        error_category: Option<ErrorCategory>,
                        parser: Option<String>,
                        tool_name: Option<String>,
@@ -749,6 +799,8 @@ async fn run_guardrail(
         recorder.record(OutcomeRecord {
             ts: now_rfc3339(), provider: provider.name().to_string(), model: model.clone(), outcome,
             error_category, parser, tool_name, retries, detail,
+            conversation,
+            usage: (!billed.is_empty()).then_some(billed),
         });
     };
 
@@ -757,7 +809,7 @@ async fn run_guardrail(
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "failed to serialize request");
-                emit_metric(Outcome::InternalError, None, None, None, tracker.attempts(), None);
+                emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), None);
                 return;
             }
         };
@@ -779,7 +831,7 @@ async fn run_guardrail(
         // Run the assembler. Text lines go directly to body_tx if forward_text.
         // Tool-call lines are buffered inside the assembler.
         let tx = body_tx.clone();
-        let assembled = assemble_stream(
+        let (assembled, attempt_usage) = assemble_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -789,12 +841,17 @@ async fn run_guardrail(
             None, // kind_tx not needed here — we use result directly
         )
         .await;
+        // Counted before any early return below, so an attempt is billed
+        // whatever the outcome turns out to be.
+        if let Some(attempt_usage) = attempt_usage {
+            billed.add(attempt_usage);
+        }
 
         match assembled {
             // ── Pure text ────────────────────────────────────────────────────
             // Lines were already forwarded live. Just record and return.
             AssembledResponse::Text { .. } => {
-                emit_metric(Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+                emit_metric(billed, None, Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
                 return; // body_tx drops → stream closes
             }
 
@@ -814,7 +871,7 @@ async fn run_guardrail(
                 // Respond-tool intercept.
                 if respond_active {
                     if let Some(text) = calls.iter().find(|c| respond::is_respond(c)).and_then(respond::message_text) {
-                        emit_metric(Outcome::RespondIntercept, None, None, Some(respond::RESPOND.to_string()), tracker.attempts(), None);
+                        emit_metric(billed, None, Outcome::RespondIntercept, None, None, Some(respond::RESPOND.to_string()), tracker.attempts(), None);
                         let value = response_with_text(&template, &text);
                         send_value(&body_tx, &value).await;
                         return;
@@ -826,7 +883,7 @@ async fn run_guardrail(
                     crate::domain::precondition::check(&calls)
                 {
                     warn!(%nudge, "precondition failed");
-                    emit_metric(Outcome::WriteRefused, None, None, calls.first().map(|c| c.name.clone()), tracker.attempts(), Some(nudge.clone()));
+                    emit_metric(billed, None, Outcome::WriteRefused, None, None, calls.first().map(|c| c.name.clone()), tracker.attempts(), Some(nudge.clone()));
                     let value = response_with_text(&template, &format!("The tool call could not be completed. {nudge}"));
                     send_value(&body_tx, &value).await;
                     return;
@@ -844,7 +901,7 @@ async fn run_guardrail(
                             else if repaired { Outcome::Repaired }
                             else if rescued { Outcome::Rescued }
                             else { Outcome::NativeValid };
-                        emit_metric(outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
+                        emit_metric(billed, None, outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
                         let value = response_with_tool_calls(&template, &calls);
                         send_value(&body_tx, &value).await;
                         return;
@@ -864,7 +921,7 @@ async fn run_guardrail(
                                 if coerce_arguments(&mut rescued_calls, &tools) {}
                                 if matches!(validate(&rescued_calls, &tools), Validation::Valid) {
                                     info!(parser, count = rescued_calls.len(), "rescued tool calls from content alongside invalid native call");
-                                    emit_metric(Outcome::Rescued, None, Some(parser.to_string()), rescued_calls.first().map(|c| c.name.clone()), tracker.attempts(), None);
+                                    emit_metric(billed, None, Outcome::Rescued, None, Some(parser.to_string()), rescued_calls.first().map(|c| c.name.clone()), tracker.attempts(), None);
                                     let value = response_with_tool_calls(&template, &rescued_calls);
                                     send_value(&body_tx, &value).await;
                                     return;
@@ -883,7 +940,7 @@ async fn run_guardrail(
                             let s = redact_args(&c.arguments);
                             if s.is_empty() { nudge.clone() } else { format!("{nudge} | args: {s}") }
                         });
-                        emit_metric(Outcome::RetriesExhausted, Some(category), None, offending_call.map(|c| c.name.clone()), tracker.attempts(), detail);
+                        emit_metric(billed, None, Outcome::RetriesExhausted, Some(category), None, offending_call.map(|c| c.name.clone()), tracker.attempts(), detail);
                         let value = response_with_text(&template, &format!("The tool call could not be completed after several attempts. {nudge}"));
                         send_value(&body_tx, &value).await;
                         return;

@@ -813,8 +813,8 @@ async fn run_guardrail(
     // `request.messages`, and hashing the rewritten array would describe a
     // transcript the client never sent: the next real turn extends what the
     // client sent, not what the guardrails asked in between, and would fail to
-    // match. Captured only when matching is enabled -- this is the one place
-    // the metrics path reads message content, so it does not happen by default.
+    // match. This is the one place the metrics path reads message content, and
+    // it reads it only to hash: the digests are what is stored, never the text.
     let prefix_chain = Some(PrefixChain::of(&request.messages));
 
     let emit_metric = |billed: Usage,

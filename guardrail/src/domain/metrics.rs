@@ -567,8 +567,8 @@ mod tests {
 }
 
 pub use sqlite::{
-    default_db_path, Distribution, ErrorGroup, ModelStats, RequestRow, SqliteRecorder, Stats,
-    INFERRED_PREFIX, MAX_ROWS,
+    default_db_path, DayActivity, Distribution, ErrorGroup, ModelStats, Range, RequestRow,
+    SqliteRecorder, Stats, INFERRED_PREFIX, MAX_DAYS, MAX_ROWS,
 };
 
 
@@ -681,6 +681,226 @@ mod sqlite {
     /// A consumer wanting more than this should query the database directly,
     /// which is what the file being local allows.
     pub const MAX_ROWS: i64 = 10_000;
+
+    /// Hard ceiling on days one [`Stats::read_activity`] call returns.
+    ///
+    /// A per-day series is drawn as a calendar, and no calendar shows more than
+    /// a few years. The bound keeps a hand-typed `?days=` from turning into a
+    /// full-history scan.
+    pub const MAX_DAYS: i64 = 1_100;
+
+    /// A half-open time window `[since, until)` over the recorded rows.
+    ///
+    /// Both ends are optional, so `Range::default()` is "everything" and the
+    /// unfiltered reads are the same code path as the filtered ones rather than
+    /// a second one that can drift.
+    ///
+    /// The bounds are RFC3339 strings compared as text, which works because
+    /// [`super::now_rfc3339`] writes a fixed-width UTC format whose
+    /// lexicographic order *is* its chronological order. No date parsing
+    /// happens in SQL, and a malformed bound simply matches nothing rather than
+    /// erroring mid-query.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Range {
+        /// Inclusive lower bound.
+        pub since: Option<String>,
+        /// Exclusive upper bound, so adjacent windows never double-count a row.
+        pub until: Option<String>,
+    }
+
+    impl Range {
+        /// The unbounded range — every recorded row.
+        pub fn all() -> Self {
+            Self::default()
+        }
+
+        /// A range from bounds as a caller wrote them, normalized to compare
+        /// correctly against the stored timestamps.
+        ///
+        /// Use this for anything originating outside the process — a query
+        /// parameter, a config value — rather than constructing the struct
+        /// directly.
+        pub fn parse(since: Option<&str>, until: Option<&str>) -> Self {
+            Self {
+                since: since.map(normalize_bound),
+                until: until.map(normalize_bound),
+            }
+        }
+
+        /// Whether this range constrains anything.
+        pub fn is_unbounded(&self) -> bool {
+            self.since.is_none() && self.until.is_none()
+        }
+
+        /// SQL predicate fragment for the bounds that are set, over the rows of
+        /// `alias` (`""` when the query does not alias the table).
+        ///
+        /// Returns clauses beginning with ` AND `, so callers splice it onto a
+        /// query that already has a `WHERE`. [`Self::clauses_where`] is the
+        /// variant for queries that do not.
+        ///
+        /// The bounds are emitted as `?` placeholders and supplied by
+        /// [`Self::params`]; they are never formatted into the string. Every
+        /// other interpolation in these queries is a static column name or an
+        /// internal tag, and user input must not join them.
+        fn clauses(&self, alias: &str) -> String {
+            let col = if alias.is_empty() {
+                "ts".to_string()
+            } else {
+                format!("{alias}.ts")
+            };
+            let mut out = String::new();
+            if self.since.is_some() {
+                out.push_str(&format!(" AND {col} >= ?"));
+            }
+            if self.until.is_some() {
+                out.push_str(&format!(" AND {col} < ?"));
+            }
+            out
+        }
+
+        /// As [`Self::clauses`], for a query with no `WHERE` of its own.
+        fn clauses_where(&self, alias: &str) -> String {
+            match self.clauses(alias).strip_prefix(" AND ") {
+                Some(rest) => format!(" WHERE {rest}"),
+                None => String::new(),
+            }
+        }
+
+        /// The bound values, in the order [`Self::clauses`] emits placeholders.
+        fn params(&self) -> Vec<&str> {
+            let mut out = Vec::new();
+            if let Some(since) = &self.since {
+                out.push(since.as_str());
+            }
+            if let Some(until) = &self.until {
+                out.push(until.as_str());
+            }
+            out
+        }
+    }
+
+    /// The most recent day present, as `YYYY-MM-DD`.
+    ///
+    /// A point query on the `ts` index, so it costs nothing next to the scan it
+    /// exists to avoid.
+    fn latest_day(conn: &Connection) -> Option<String> {
+        conn.query_row("SELECT substr(MAX(ts), 1, 10) FROM outcomes", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// `days` days back from `latest`, inclusive of both ends, as a `since`
+    /// bound — or `None` when `latest` is not a date this understands.
+    ///
+    /// Counted from the newest *recorded* day rather than from today, so a
+    /// proxy that has been idle for a month still answers with its last `days`
+    /// of traffic instead of an empty series.
+    fn floor_day(latest: &str, days: i64) -> Option<String> {
+        let (y, m, d) = parse_ymd(latest)?;
+        // `days` counts the newest day itself, so step back one fewer.
+        let back = days.saturating_sub(1).clamp(0, MAX_DAYS);
+        let civil = days_from_civil(y, m, d).checked_sub(back)?;
+        let (fy, fm, fd) = super::civil_from_days(civil);
+        Some(format!("{fy:04}-{fm:02}-{fd:02}"))
+    }
+
+    fn parse_ymd(date: &str) -> Option<(i64, u32, u32)> {
+        let b = date.as_bytes();
+        if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        Some((
+            date[0..4].parse().ok()?,
+            date[5..7].parse().ok()?,
+            date[8..10].parse().ok()?,
+        ))
+    }
+
+    /// Days since the Unix epoch for a civil date — the inverse of
+    /// [`super::civil_from_days`], by the same Howard Hinnant algorithm.
+    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = (m as i64 + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Rewrite a caller's bound so it compares correctly against the stored
+    /// timestamps.
+    ///
+    /// The comparison is lexicographic, and [`super::now_rfc3339`] writes
+    /// milliseconds — so `2026-08-05T00:00:00Z` does **not** match its own
+    /// midnight row, because `'.'` (0x2E) sorts below `'Z'` (0x5A) and
+    /// `...00.000Z` therefore compares *less* than `...00Z`. A `since` of that
+    /// form would drop the boundary row and an `until` would wrongly keep it,
+    /// which is the opposite of what half-open bounds promise.
+    ///
+    /// So a seconds-precision instant gains `.000`, which is the same instant
+    /// in the stored format. Shorter prefixes (`2026-08-05`,
+    /// `2026-08-05T10`) are left alone: they are legitimate bounds precisely
+    /// *because* they are prefixes, and padding them would change which rows
+    /// they select. Anything unrecognised passes through untouched and simply
+    /// matches nothing, which stays the honest answer for a nonsense window.
+    fn normalize_bound(bound: &str) -> String {
+        let trimmed = bound.trim();
+        // `YYYY-MM-DDTHH:MM:SSZ` — a complete instant, one `.000` short of the
+        // stored form.
+        let is_seconds_precision = trimmed.len() == 20
+            && trimmed.ends_with('Z')
+            && trimmed.as_bytes()[10] == b'T'
+            && trimmed[..19].chars().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                10 => c == 'T',
+                13 | 16 => c == ':',
+                _ => c.is_ascii_digit(),
+            });
+        if is_seconds_precision {
+            format!("{}.000Z", &trimmed[..19])
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// One UTC day's traffic, for the activity calendar.
+    ///
+    /// Days with no traffic are absent rather than present as zeroes: the
+    /// consumer is drawing a calendar and already owns the full set of dates,
+    /// so the response carries only what happened.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DayActivity {
+        /// `YYYY-MM-DD`, in **UTC** — the timezone the timestamps are written
+        /// in. A consumer east or west of it will see its own midnight fall
+        /// inside one of these buckets rather than on the boundary.
+        pub date: String,
+        /// Guarded requests recorded that day, whether or not usage was reported.
+        pub requests: i64,
+        /// Of `requests`, those the guardrails could not fix.
+        pub errors: i64,
+        /// Prompt tokens as billed. Not additive across a conversation — see
+        /// [`ModelStats::distinct_prompt_tokens`].
+        pub prompt_tokens: i64,
+        pub completion_tokens: i64,
+        /// Of `prompt_tokens`, the portion served from the prompt cache.
+        pub cached_tokens: i64,
+        /// Backend calls that day, retries included.
+        pub billed_calls: i64,
+        /// Requests that reported usage, so a consumer can tell "no tokens" from
+        /// "not measured".
+        pub usage_requests: i64,
+    }
+
+    impl DayActivity {
+        /// `prompt_tokens + completion_tokens` — what the provider charged for.
+        pub fn billed_tokens(&self) -> i64 {
+            self.prompt_tokens + self.completion_tokens
+        }
+    }
 
     /// Per-provider-and-model rollup, in the total → tool calls → errors
     /// hierarchy.
@@ -919,9 +1139,20 @@ mod sqlite {
     }
 
     impl Stats {
-        /// Read and aggregate metrics from the database at `path`. A missing
-        /// database (proxy never run) reads as empty stats rather than an error.
+        /// Read and aggregate every recorded metric from the database at `path`.
+        /// A missing database (proxy never run) reads as empty stats rather than
+        /// an error.
         pub fn read(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+            Self::read_in(path, &Range::all())
+        }
+
+        /// As [`Self::read`], over the rows falling in `range`.
+        ///
+        /// Every figure — the rollup, the outcome breakdown, the error groups,
+        /// the deduplicated conversation totals and the distributions — is
+        /// computed over the same window, so a caller showing them together is
+        /// never mixing a filtered number with a lifetime one.
+        pub fn read_in(path: impl AsRef<Path>, range: &Range) -> anyhow::Result<Self> {
             if !path.as_ref().exists() {
                 return Ok(Self::default());
             }
@@ -979,10 +1210,11 @@ mod sqlite {
                     SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END), \
                     SUM({prompt}), SUM({completion}), SUM({cached}), \
                     SUM({billed}), COUNT({prompt}) \
-                 FROM outcomes GROUP BY 1, model ORDER BY 1, model"
+                 FROM outcomes{} GROUP BY 1, model ORDER BY 1, model",
+                range.clauses_where("")
             );
             let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(range.params()), |r| {
                 Ok(ModelStats {
                     provider: r.get(0)?,
                     model: r.get(1)?,
@@ -1008,16 +1240,24 @@ mod sqlite {
             })?;
             let mut per_model: Vec<ModelStats> = rows.collect::<rusqlite::Result<_>>()?;
 
-            Self::fold_distinct_prompts(&conn, &column, &provider_col, &mut per_model)?;
-            Self::fold_distributions(&conn, &prompt, &completion, &provider_col, &mut per_model)?;
+            Self::fold_distinct_prompts(&conn, &column, &provider_col, range, &mut per_model)?;
+            Self::fold_distributions(
+                &conn,
+                &prompt,
+                &completion,
+                &provider_col,
+                range,
+                &mut per_model,
+            )?;
 
             // Outcome breakdown per provider and model, folded into the rows
             // above.
             let mut stmt = conn.prepare(&format!(
                 "SELECT COALESCE({provider_col}, 'unknown'), model, outcome, COUNT(*) \
-                 FROM outcomes GROUP BY 1, model, outcome ORDER BY 1, model, outcome",
+                 FROM outcomes{} GROUP BY 1, model, outcome ORDER BY 1, model, outcome",
+                range.clauses_where(""),
             ))?;
-            let breakdown = stmt.query_map([], |r| {
+            let breakdown = stmt.query_map(rusqlite::params_from_iter(range.params()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1040,11 +1280,12 @@ mod sqlite {
             let mut stmt = conn.prepare(&format!(
                 "SELECT COALESCE({provider_col}, 'unknown'), model, error_category, tool_name, \
                     detail, COUNT(*) AS n \
-                 FROM outcomes WHERE fixed = 0 \
+                 FROM outcomes WHERE fixed = 0{} \
                  GROUP BY 1, model, error_category, tool_name, detail \
                  ORDER BY n DESC, 1, model",
+                range.clauses(""),
             ))?;
-            let errors = stmt.query_map([], |r| {
+            let errors = stmt.query_map(rusqlite::params_from_iter(range.params()), |r| {
                 Ok(ErrorGroup {
                     provider: r.get(0)?,
                     model: r.get(1)?,
@@ -1072,10 +1313,17 @@ mod sqlite {
         /// at all (a Chat-Completions-only deployment, or a table predating the
         /// columns): with nothing to group on, the deduplicated figure would
         /// just be the inflated sum wearing a better name.
+        ///
+        /// `range` bounds the turns that are *aggregated*, not the edges that
+        /// are walked. A conversation beginning before the window still resolves
+        /// to its true root, so its turns inside the window group together
+        /// instead of each becoming a conversation of one — which would restore
+        /// exactly the double counting this query removes.
         fn fold_distinct_prompts(
             conn: &Connection,
             column: &dyn Fn(&str) -> String,
             provider_col: &str,
+            range: &Range,
             per_model: &mut [ModelStats],
         ) -> anyhow::Result<()> {
             let (response_col, parent_col) = (column("response_id"), column("parent_id"));
@@ -1140,7 +1388,7 @@ mod sqlite {
                                 o.response_id\
                             ) AS root \
                      FROM outcomes o \
-                     WHERE o.prompt_tokens IS NOT NULL\
+                     WHERE o.prompt_tokens IS NOT NULL{}\
                  ), \
                  per_conversation AS (\
                      SELECT provider, model, \
@@ -1150,11 +1398,12 @@ mod sqlite {
                  ) \
                  SELECT provider, model, SUM(prompt_tokens), COUNT(*), \
                         MAX(conversation LIKE '{INFERRED_PREFIX}%') \
-                 FROM per_conversation GROUP BY provider, model"
+                 FROM per_conversation GROUP BY provider, model",
+                range.clauses("o"),
             );
 
             let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(range.params()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1197,6 +1446,7 @@ mod sqlite {
             prompt_col: &str,
             completion_col: &str,
             provider_col: &str,
+            range: &Range,
             per_model: &mut [ModelStats],
         ) -> anyhow::Result<()> {
             // A database predating the token columns selects them as NULL;
@@ -1207,10 +1457,11 @@ mod sqlite {
             let query = format!(
                 "SELECT COALESCE({provider_col}, 'unknown'), model, \
                     {prompt_col}, {completion_col} \
-                 FROM outcomes WHERE {prompt_col} IS NOT NULL"
+                 FROM outcomes WHERE {prompt_col} IS NOT NULL{}",
+                range.clauses(""),
             );
             let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(range.params()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1304,6 +1555,109 @@ mod sqlite {
                     billed_calls: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                     response_id: r.get(8)?,
                     parent_id: r.get(9)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        }
+
+        /// Per-day traffic totals, newest day first.
+        ///
+        /// Answers "how much did each day cost", which the rollups cannot: they
+        /// aggregate a window into one figure, and a calendar needs the window
+        /// broken back out by day. Grouping in SQL rather than returning rows
+        /// for a consumer to bucket is what keeps a year of history from being
+        /// bounded by [`MAX_ROWS`] — a busy proxy passes that in days.
+        ///
+        /// Days are **UTC**, from `substr(ts, 1, 10)` over the fixed-width
+        /// timestamps [`super::now_rfc3339`] writes. Days with no traffic are
+        /// absent rather than zero-filled.
+        ///
+        /// Unlike [`Self::read_rows`], every recorded request counts here —
+        /// including those whose backend reported no usage, which still cost a
+        /// call. `usage_requests` reports how many of them carried token
+        /// figures, so a zero is distinguishable from "not measured".
+        pub fn read_activity(
+            path: impl AsRef<Path>,
+            range: &Range,
+            limit: i64,
+        ) -> anyhow::Result<Vec<DayActivity>> {
+            let limit = limit.clamp(1, MAX_DAYS);
+            if !path.as_ref().exists() {
+                return Ok(Vec::new());
+            }
+            let conn = Connection::open(path.as_ref())?;
+            let has_table: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outcomes'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if !has_table {
+                return Ok(Vec::new());
+            }
+
+            // As in `read`: a column the table predates is selected as NULL, so
+            // an older database reports its request counts rather than failing.
+            let column = |name: &str| -> String {
+                let present = conn
+                    .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = ?1")
+                    .and_then(|mut s| s.exists([name]))
+                    .unwrap_or(false);
+                if present {
+                    name.to_string()
+                } else {
+                    "NULL".to_string()
+                }
+            };
+            let (prompt, completion) = (column("prompt_tokens"), column("completion_tokens"));
+            let (cached, billed) = (column("cached_tokens"), column("billed_calls"));
+
+            // `LIMIT` alone does not bound the work: it applies *after* the
+            // grouping, and the group key is `substr(ts, 1, 10)`, which the
+            // `ts` index cannot serve — so an unbounded read scans the whole
+            // table to produce the handful of days that survive. Deriving a
+            // floor from `limit` turns that scan into an index range: on a
+            // 500k-row database, ~72ms becomes ~3ms.
+            //
+            // Only applied when the caller gave no `since` of its own, and it
+            // can only ever *narrow* to the days `limit` would have kept
+            // anyway, so no row that would have been returned is lost.
+            let effective = match (&range.since, latest_day(&conn)) {
+                (None, Some(latest)) => Range {
+                    since: floor_day(&latest, limit),
+                    until: range.until.clone(),
+                },
+                _ => range.clone(),
+            };
+
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = effective
+                .params()
+                .into_iter()
+                .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            params.push(Box::new(limit));
+
+            let query = format!(
+                "SELECT substr(ts, 1, 10) AS day, COUNT(*), \
+                    SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END), \
+                    SUM({prompt}), SUM({completion}), SUM({cached}), \
+                    SUM({billed}), COUNT({prompt}) \
+                 FROM outcomes{} \
+                 GROUP BY day ORDER BY day DESC LIMIT ?",
+                effective.clauses_where(""),
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                Ok(DayActivity {
+                    date: r.get(0)?,
+                    requests: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    errors: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    prompt_tokens: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    completion_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    cached_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    billed_calls: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    usage_requests: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1718,12 +2072,14 @@ mod sqlite {
             ON outcomes(parent_id) WHERE parent_id IS NOT NULL;\
         CREATE INDEX IF NOT EXISTS idx_outcomes_head_hash \
             ON outcomes(head_hash, provider, model) \
-            WHERE head_hash IS NOT NULL AND response_id IS NOT NULL;";
+            WHERE head_hash IS NOT NULL AND response_id IS NOT NULL;\
+        CREATE INDEX IF NOT EXISTS idx_outcomes_ts \
+            ON outcomes(ts);";
 
     #[cfg(test)]
     mod tests {
-        use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
-        use super::{Distribution, PrefixChain, SqliteRecorder, Stats, MAX_ROWS};
+        use super::super::{civil_from_days, now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
+        use super::{Distribution, PrefixChain, Range, SqliteRecorder, Stats, MAX_ROWS};
         use crate::domain::validate::ErrorCategory;
 
         fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
@@ -1994,6 +2350,96 @@ mod sqlite {
 
         fn usage_of(prompt: i64, completion: i64) -> Usage {
             Usage { prompt_tokens: prompt, completion_tokens: completion, cached_tokens: 0, attempts: 1 }
+        }
+
+        #[test]
+        fn the_activity_floor_counts_back_from_the_newest_day() {
+            // `days` includes the newest day itself, so N days back is N-1
+            // steps. An off-by-one here silently drops a day from the calendar.
+            assert_eq!(super::floor_day("2026-08-22", 1).as_deref(), Some("2026-08-22"));
+            assert_eq!(super::floor_day("2026-08-22", 30).as_deref(), Some("2026-07-24"));
+            // Across a month, a year, and a leap day.
+            assert_eq!(super::floor_day("2026-01-01", 2).as_deref(), Some("2025-12-31"));
+            assert_eq!(super::floor_day("2024-03-01", 2).as_deref(), Some("2024-02-29"));
+            // Garbage in, no bound out — the read then falls back to a scan
+            // rather than inventing a window.
+            assert_eq!(super::floor_day("not-a-date", 30), None);
+        }
+
+        #[test]
+        fn the_civil_date_conversions_round_trip() {
+            // `floor_day` composes days_from_civil with civil_from_days; if the
+            // two disagree the derived bound lands on the wrong day.
+            for date in [
+                "1970-01-01", "1999-12-31", "2000-02-29", "2024-02-29",
+                "2026-08-22", "2100-03-01",
+            ] {
+                let (y, m, d) = super::parse_ymd(date).unwrap();
+                let days = super::days_from_civil(y, m, d);
+                let (ry, rm, rd) = civil_from_days(days);
+                assert_eq!(
+                    (y, m, d), (ry, rm, rd),
+                    "round trip failed for {date}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_window_still_deduplicates_a_conversation_that_began_before_it() {
+            // The trap in filtering this query. Turn 3 resends turns 1 and 2,
+            // so a window holding only turn 3 must still charge 600 — its
+            // prompt already contains the earlier turns.
+            //
+            // Applying the range to the recursive walk instead of the rows
+            // being aggregated would hide turns 1 and 2 from the parent lookup,
+            // leaving turn 3 unable to find its root. It would become a
+            // conversation of one, which happens to give the same total here
+            // but splits any window holding *two* turns of one chain back into
+            // per-turn counting — exactly the double counting the whole query
+            // exists to remove. The two-turn window below is what pins that.
+            let dir = std::env::temp_dir()
+                .join(format!("guardrail-window-dedupe-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("window.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let at = |ts: &str, r: OutcomeRecord| OutcomeRecord { ts: ts.to_string(), ..r };
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(at(
+                "2026-08-01T10:00:00.000Z",
+                rec_chained("m", usage_of(100, 10), "resp_1", None),
+            ));
+            recorder.record(at(
+                "2026-08-05T10:00:00.000Z",
+                rec_chained("m", usage_of(300, 20), "resp_2", Some("resp_1")),
+            ));
+            recorder.record(at(
+                "2026-08-09T10:00:00.000Z",
+                rec_chained("m", usage_of(600, 30), "resp_3", Some("resp_2")),
+            ));
+            drop(recorder);
+
+            // A window holding turns 2 and 3, whose chain starts outside it.
+            let range = Range {
+                since: Some("2026-08-05T00:00:00.000Z".into()),
+                until: Some("2026-08-10T00:00:00.000Z".into()),
+            };
+            let stats = Stats::read_in(&db, &range).unwrap();
+            let m = &stats.per_model[0];
+
+            // Billed is the honest sum of the two turns in the window.
+            assert_eq!(m.usage.prompt_tokens, 900);
+            // But they are one conversation, so the distinct figure is turn 3's
+            // prompt alone — not 900, which would count turn 2's tokens twice.
+            assert_eq!(m.distinct_prompt_tokens, Some(600));
+            assert_eq!(m.conversations, Some(1));
+
+            // And the lifetime read is unchanged by any of this.
+            let all = Stats::read(&db).unwrap();
+            assert_eq!(all.per_model[0].distinct_prompt_tokens, Some(600));
+            assert_eq!(all.per_model[0].usage.prompt_tokens, 1000);
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]

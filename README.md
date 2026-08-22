@@ -439,7 +439,8 @@ authenticated.
 | --- | --- |
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
 | `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
-| `GET /stats` | The full metrics rollup as JSON (see below). |
+| `GET /stats` | The full metrics rollup as JSON (see below). `?since=`/`?until=` bound it to a window. |
+| `GET /activity` | Per-day totals, newest day first, for a contribution-graph view. `?days=` (default 30), clamped to `[1, 1100]`; also takes `?since=`/`?until=`. |
 | `GET /requests` | The individual recorded requests, newest first, so a consumer can group them itself. `?limit=` (default 1000), clamped to `[1, 10000]`. |
 | `GET /providers` | Providers, their discovered models, and exposure. |
 | `POST /providers` | Add a provider. |
@@ -453,6 +454,89 @@ authenticated.
 `stats` subcommand reads — so the response is always current and the admin
 server holds no in-memory counters that could drift from the proxy. Because the
 database runs in WAL mode, these reads never block the proxy's writes.
+
+#### Bounding a window
+
+`?since=` and `?until=` restrict the rollup to a half-open `[since, until)`
+window, so adjacent windows never double-count a row. Both are optional; with
+neither, the response is the lifetime rollup it has always been.
+
+```bash
+curl 'http://127.0.0.1:8081/stats?since=2026-08-01T00:00:00Z&until=2026-09-01T00:00:00Z'
+curl 'http://127.0.0.1:8081/stats?since=2026-08-22'   # a date prefix is a valid bound
+```
+
+Every figure moves together — the per-model rollup, the outcome breakdown, the
+error groups and the distributions — so a UI showing them side by side is never
+mixing a windowed number with a lifetime one.
+
+The bounds are compared as text against the timestamps the proxy writes, which
+are fixed-width UTC and therefore sort chronologically. A prefix like
+`2026-08-22` is a legitimate bound; anything that is not a prefix of a real
+timestamp simply selects nothing, which is the honest answer for a window that
+matches nothing.
+
+Rows are stored with milliseconds, so a seconds-precision instant
+(`2026-08-05T00:00:00Z`) is normalized to `2026-08-05T00:00:00.000Z` before the
+comparison. Without that it would sort *above* its own midnight row — `.` is
+below `Z` in ASCII — and a `since` on the boundary would drop the row sitting
+exactly on it while the matching `until` kept it, so two adjacent windows would
+both miss it.
+
+Deduplication survives the window. A conversation that began *before* `since`
+still resolves to its true root, so turns inside the window group together
+rather than each counting as a conversation of one — which would restore exactly
+the double counting `distinct_prompt_tokens` exists to remove.
+
+#### Per-day totals
+
+`GET /activity` breaks a window back out by day, which the rollup cannot do:
+`/stats` collapses its window into one set of figures, and a contribution graph
+needs one figure per day. The grouping happens in SQL, so a year of history is
+not bounded by the `/requests` row cap — a busy proxy passes 10,000 rows in
+days.
+
+```bash
+curl 'http://127.0.0.1:8081/activity?days=90'
+```
+
+```jsonc
+{
+  "count": 2,
+  "days": 90,
+  "activity": [
+    {
+      "date": "2026-08-22",       // UTC — see below
+      "requests": 168,            // every request, measured or not
+      "errors": 5,
+      "billed_tokens": 48211,     // prompt + completion
+      "prompt_tokens": 41022,
+      "completion_tokens": 7189,
+      "cached_tokens": 15003,
+      "billed_calls": 174,        // retries included
+      "usage_requests": 160       // of `requests`, those that reported usage
+    }
+  ]
+}
+```
+
+Two things to know when drawing this:
+
+- **Days are UTC**, from the timestamps the proxy writes. A consumer east or
+  west of UTC will see its own local midnight fall *inside* a bucket rather than
+  on the boundary. Relabel client-side if that matters.
+- **A day with no traffic is absent, not zero.** The consumer already owns the
+  calendar it is drawing, so the response carries only what happened.
+- **`days` bounds the work, not just the output.** `LIMIT` applies after the
+  grouping, and the group key (`substr(ts, 1, 10)`) is not something the `ts`
+  index can serve — so the read derives a `since` floor from `days` and counts
+  back from the newest *recorded* day, turning a full scan into an index range.
+  A proxy idle for a month therefore still answers with its last `days` of
+  traffic rather than an empty series. An explicit `?since=` takes precedence.
+
+`usage_requests` is what separates "no tokens" from "not measured": a day whose
+backend reported no usage still counts its requests, with the token figures at
+zero and `usage_requests` below `requests`.
 
 ```jsonc
 {

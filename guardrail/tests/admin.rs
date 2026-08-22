@@ -355,3 +355,264 @@ async fn copilot_login_status_is_idle_before_any_attempt_and_carries_no_token() 
 
     let _ = std::fs::remove_file(&store);
 }
+
+/// A record stamped at a specific instant, so a test can lay out history
+/// across days rather than waiting for the clock.
+fn rec_at(ts: &str, model: &str, prompt: i64, completion: i64) -> OutcomeRecord {
+    OutcomeRecord {
+        ts: ts.into(),
+        ..rec_usage(model, prompt, completion)
+    }
+}
+
+#[tokio::test]
+async fn stats_can_be_bounded_to_a_window() {
+    let db = temp_db("stats-window");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(rec_at("2026-08-01T10:00:00.000Z", "m", 100, 10));
+    recorder.record(rec_at("2026-08-05T10:00:00.000Z", "m", 200, 20));
+    recorder.record(rec_at("2026-08-09T10:00:00.000Z", "m", 400, 40));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+
+    // Unbounded: the lifetime rollup, exactly as before.
+    let all: serde_json::Value = reqwest::get(format!("{admin}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["per_model"][0]["total"], 3);
+    assert_eq!(all["per_model"][0]["usage"]["prompt_tokens"], 700);
+
+    // Half-open: `since` includes its instant, `until` excludes it, so the
+    // middle row alone falls in this window.
+    let window: serde_json::Value = reqwest::get(format!(
+        "{admin}/stats?since=2026-08-05T00:00:00.000Z&until=2026-08-09T00:00:00.000Z"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(window["per_model"][0]["total"], 1);
+    assert_eq!(window["per_model"][0]["usage"]["prompt_tokens"], 200);
+
+    // The distributions are computed over the same window, not the lifetime —
+    // a UI showing them beside the totals must not mix the two populations.
+    assert_eq!(window["per_model"][0]["usage"]["prompt_distribution"]["count"], 1);
+    assert_eq!(window["per_model"][0]["usage"]["prompt_distribution"]["max"], 200);
+}
+
+#[tokio::test]
+async fn a_window_matching_nothing_is_empty_rather_than_an_error() {
+    let db = temp_db("stats-empty-window");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(rec_at("2026-08-01T10:00:00.000Z", "m", 100, 10));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+    let response = reqwest::get(format!("{admin}/stats?since=2030-01-01T00:00:00.000Z"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["per_model"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn activity_buckets_rows_by_utc_day() {
+    let db = temp_db("activity-days");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    // Two rows on one day, one on the next.
+    recorder.record(rec_at("2026-08-01T01:00:00.000Z", "m", 100, 10));
+    recorder.record(rec_at("2026-08-01T23:59:59.999Z", "m", 200, 20));
+    recorder.record(rec_at("2026-08-02T00:00:00.000Z", "m", 400, 40));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/activity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Newest day first.
+    let days = body["activity"].as_array().unwrap();
+    assert_eq!(days.len(), 2);
+    assert_eq!(days[0]["date"], "2026-08-02");
+    assert_eq!(days[0]["requests"], 1);
+    assert_eq!(days[0]["billed_tokens"], 440);
+
+    // The 23:59:59.999Z row belongs to the 1st, not the 2nd: the boundary is
+    // UTC midnight, and the last millisecond of a day is still that day.
+    assert_eq!(days[1]["date"], "2026-08-01");
+    assert_eq!(days[1]["requests"], 2);
+    assert_eq!(days[1]["prompt_tokens"], 300);
+    assert_eq!(days[1]["billed_tokens"], 330);
+    assert_eq!(days[1]["usage_requests"], 2);
+}
+
+#[tokio::test]
+async fn activity_counts_requests_that_reported_no_usage() {
+    // `/requests` serves only measured rows; a calendar must still show that
+    // the proxy was busy on a day whose backend reported no usage at all.
+    let db = temp_db("activity-unmeasured");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(OutcomeRecord {
+        ts: "2026-08-01T10:00:00.000Z".into(),
+        ..rec("m", Outcome::NativeValid)
+    });
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/activity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let day = &body["activity"][0];
+    assert_eq!(day["requests"], 1);
+    // Distinguishable from a measured zero.
+    assert_eq!(day["usage_requests"], 0);
+    assert_eq!(day["billed_tokens"], 0);
+}
+
+#[tokio::test]
+async fn activity_honours_the_window_and_the_day_limit() {
+    let db = temp_db("activity-window");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    for day in 1..=5 {
+        recorder.record(rec_at(
+            &format!("2026-08-0{day}T10:00:00.000Z"),
+            "m",
+            100,
+            10,
+        ));
+    }
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+
+    let windowed: serde_json::Value = reqwest::get(format!(
+        "{admin}/activity?since=2026-08-02T00:00:00.000Z&until=2026-08-04T00:00:00.000Z"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let days = windowed["activity"].as_array().unwrap();
+    assert_eq!(days.len(), 2, "the 2nd and 3rd, with the 4th excluded");
+    assert_eq!(days[0]["date"], "2026-08-03");
+
+    // `days` caps the series; a nonsensical value is clamped, not rejected.
+    let capped: serde_json::Value = reqwest::get(format!("{admin}/activity?days=2"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(capped["count"], 2);
+    assert_eq!(capped["days"], 2);
+    assert_eq!(capped["activity"][0]["date"], "2026-08-05", "newest first");
+
+    let clamped: serde_json::Value = reqwest::get(format!("{admin}/activity?days=0"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(clamped["days"], 1);
+}
+
+#[tokio::test]
+async fn activity_for_a_missing_database_is_empty() {
+    let admin = spawn_admin(temp_db("activity-absent").with_file_name("nope.sqlite")).await;
+    let response = reqwest::get(format!("{admin}/activity")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 0);
+    assert!(body["activity"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_index_advertises_the_activity_endpoint() {
+    let admin = spawn_admin(temp_db("activity-index")).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e == "/activity"));
+}
+
+#[tokio::test]
+async fn a_seconds_precision_bound_includes_its_own_boundary_row() {
+    // Rows are stored with milliseconds, and the comparison is lexicographic:
+    // `...T00:00:00.000Z` sorts BELOW `...T00:00:00Z`, because '.' (0x2E) is
+    // less than 'Z' (0x5A). So the most natural way to write a bound — the form
+    // the README documents — would silently drop the row sitting exactly on it,
+    // and the matching `until` would wrongly keep it. Half-open bounds have to
+    // mean what they say at the boundary, or two adjacent windows both miss a
+    // row that neither should.
+    let db = temp_db("boundary-precision");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(rec_at("2026-08-05T00:00:00.000Z", "m", 100, 10));
+    recorder.record(rec_at("2026-08-05T12:00:00.000Z", "m", 200, 20));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+
+    // `since` on the boundary includes the row at that instant.
+    let from: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?since=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(from["per_model"][0]["total"], 2, "the midnight row must be included");
+    assert_eq!(from["per_model"][0]["usage"]["prompt_tokens"], 300);
+
+    // `until` on the same boundary excludes it — the other half of half-open.
+    let upto: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?until=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(
+        upto["per_model"].as_array().unwrap().is_empty(),
+        "the midnight row must be excluded by an equal `until`"
+    );
+
+    // The two windows partition the data: nothing counted twice, nothing lost.
+    let later: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?since=2026-08-05T12:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(later["per_model"][0]["total"], 1);
+
+    // `/activity` takes the same bounds, so it must agree.
+    let activity: serde_json::Value =
+        reqwest::get(format!("{admin}/activity?since=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(activity["activity"][0]["requests"], 2);
+}

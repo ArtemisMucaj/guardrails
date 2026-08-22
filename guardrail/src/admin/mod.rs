@@ -30,7 +30,7 @@ use serde_json::json;
 use tracing::error;
 
 use crate::domain::metrics::{
-    Distribution, ErrorGroup, ModelStats, RequestRow, Stats, MAX_ROWS,
+    DayActivity, Distribution, ErrorGroup, ModelStats, Range, RequestRow, Stats, MAX_DAYS, MAX_ROWS,
 };
 
 /// Static description of the running proxy, surfaced at `/info` so an embedding
@@ -124,6 +124,7 @@ pub fn build_admin_app(state: AdminState) -> Router {
         .route("/healthz", get(healthz))
         .route("/info", get(info))
         .route("/stats", get(stats))
+        .route("/activity", get(activity))
         .route("/requests", get(requests))
         .route("/copilot/login", get(copilot_login_status).post(copilot_login_start))
         .route(
@@ -170,7 +171,7 @@ fn copilot_disabled() -> Response {
 /// Discoverability root: list the available endpoints so the port is
 /// self-describing when opened in a browser or by a new integration.
 async fn index(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    let mut endpoints = vec!["/healthz", "/info", "/stats", "/requests"];
+    let mut endpoints = vec!["/healthz", "/info", "/stats", "/activity", "/requests"];
     if state.management.is_some() {
         endpoints.push("/providers");
     }
@@ -197,12 +198,85 @@ async fn info(State(state): State<AdminState>) -> Json<AdminInfo> {
     Json((*state.info).clone())
 }
 
-/// Read and return the full failure-metrics rollup as JSON. Reads the database
-/// on each request (the same `Stats::read` the CLI uses), so the response is
-/// always current without the admin server holding its own counters.
-async fn stats(State(state): State<AdminState>) -> Response {
-    match Stats::read(&state.db_path) {
+/// A half-open `[since, until)` window, as query parameters.
+///
+/// Both are optional and absent means unbounded, so `/stats` with no query is
+/// the lifetime rollup it has always been.
+#[derive(Deserialize, Default)]
+struct RangeQuery {
+    since: Option<String>,
+    until: Option<String>,
+}
+
+impl From<&RangeQuery> for Range {
+    fn from(q: &RangeQuery) -> Self {
+        // Not validated as timestamps: the comparison is lexicographic against
+        // a fixed-width format, so a prefix like `2026-08-22` is a legitimate
+        // and useful bound. Anything that is not a prefix of a real timestamp
+        // simply selects nothing, which is the honest answer to a window that
+        // matches nothing.
+        Self {
+            since: q.since.clone(),
+            until: q.until.clone(),
+        }
+    }
+}
+
+/// Read and return the failure-metrics rollup as JSON. Reads the database on
+/// each request (the same `Stats::read` the CLI uses), so the response is always
+/// current without the admin server holding its own counters.
+///
+/// `?since=`/`?until=` bound the window every figure is computed over — the
+/// rollup, the outcome breakdown, the errors and the distributions alike — so a
+/// UI showing them together never mixes a filtered figure with a lifetime one.
+async fn stats(State(state): State<AdminState>, Query(range): Query<RangeQuery>) -> Response {
+    match Stats::read_in(&state.db_path, &Range::from(&range)) {
         Ok(stats) => Json(StatsResponse::from(stats)).into_response(),
+        Err(e) => {
+            error!(error = %e, "admin: failed to read guardrails database");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to read guardrails database" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Default number of days `GET /activity` returns.
+const DEFAULT_DAY_LIMIT: i64 = 30;
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    days: Option<i64>,
+    #[serde(flatten)]
+    range: RangeQuery,
+}
+
+/// `GET /activity` — per-day totals, newest day first.
+///
+/// The calendar view the rollup cannot serve: `/stats` collapses a window into
+/// one set of figures, and a contribution graph needs it broken back out by day.
+/// Grouped in SQL, so a year of history is not bounded by the `/requests` row
+/// cap.
+///
+/// Days are UTC (see `Stats::read_activity`), and a day with no traffic is
+/// absent rather than zero — the consumer owns the calendar it is drawing.
+async fn activity(
+    State(state): State<AdminState>,
+    Query(query): Query<ActivityQuery>,
+) -> Response {
+    // Clamped rather than rejected, as on `/requests`: this is a read-only
+    // diagnostic surface, and the nearest sane read beats a 400 for a
+    // hand-typed URL.
+    let days = query.days.unwrap_or(DEFAULT_DAY_LIMIT).clamp(1, MAX_DAYS);
+    match Stats::read_activity(&state.db_path, &Range::from(&query.range), days) {
+        Ok(rows) => Json(ActivityResponse {
+            count: rows.len(),
+            days,
+            activity: rows.into_iter().map(DayActivityDto::from).collect(),
+        })
+        .into_response(),
         Err(e) => {
             error!(error = %e, "admin: failed to read guardrails database");
             (
@@ -353,6 +427,56 @@ struct DistributionDto {
 impl From<Distribution> for DistributionDto {
     fn from(d: Distribution) -> Self {
         Self { count: d.count, min: d.min, p50: d.p50, p90: d.p90, p99: d.p99, max: d.max }
+    }
+}
+
+#[derive(Serialize)]
+struct ActivityResponse {
+    /// Days returned, which is `days` when more were available.
+    count: usize,
+    /// The day limit actually applied, after clamping.
+    days: i64,
+    activity: Vec<DayActivityDto>,
+}
+
+/// One UTC day's traffic.
+#[derive(Serialize)]
+struct DayActivityDto {
+    /// `YYYY-MM-DD` in **UTC**, the timezone the proxy writes timestamps in —
+    /// not the consumer's local day.
+    date: String,
+    /// Every guarded request that day, measured or not.
+    requests: i64,
+    /// Of `requests`, those the guardrails could not fix.
+    errors: i64,
+    /// `prompt_tokens + completion_tokens` — what the provider charged for.
+    billed_tokens: i64,
+    /// Prompt tokens as billed. NOT additive across a conversation; see the
+    /// note on `UsageDto::prompt_tokens`.
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    /// Of `prompt_tokens`, the portion served from the prompt cache.
+    cached_tokens: i64,
+    /// Backend calls that day, retries included.
+    billed_calls: i64,
+    /// Of `requests`, those that reported usage — so a zero token figure is
+    /// distinguishable from one that was never measured.
+    usage_requests: i64,
+}
+
+impl From<DayActivity> for DayActivityDto {
+    fn from(d: DayActivity) -> Self {
+        Self {
+            billed_tokens: d.billed_tokens(),
+            date: d.date,
+            requests: d.requests,
+            errors: d.errors,
+            prompt_tokens: d.prompt_tokens,
+            completion_tokens: d.completion_tokens,
+            cached_tokens: d.cached_tokens,
+            billed_calls: d.billed_calls,
+            usage_requests: d.usage_requests,
+        }
     }
 }
 

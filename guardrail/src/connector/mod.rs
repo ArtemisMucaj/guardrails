@@ -94,6 +94,20 @@ impl BackendPort for Backend {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let out_headers = copy_response_headers(resp.headers());
 
+        // A failed backend call is relayed with its own status rather than fed
+        // to the assembler. An error body carries no `choices`, so assembling it
+        // would classify a 429 or a context-length error as an ordinary empty
+        // text answer and hand the client a `200 OK` — hiding the failure from
+        // the very retry and backoff logic that exists to react to it.
+        if !status.is_success() {
+            tracing::warn!(%status, target = %target, "backend returned an error status");
+            let bytes = resp.bytes().await.map_err(|e| {
+                tracing::error!(error = %e, "failed to read backend error body");
+                (StatusCode::BAD_GATEWAY, "failed to read backend response").into_response()
+            })?;
+            return Err(bytes_response(status, out_headers, bytes.to_vec()));
+        }
+
         // Peek at the content-type to decide whether to stream or buffer.
         let is_sse = out_headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -108,15 +122,19 @@ impl BackendPort for Backend {
             // send each line down the channel immediately.
             let mut byte_stream = resp.bytes_stream();
             tokio::spawn(async move {
-                let mut buf = String::new();
+                // Buffered as bytes, not as a String: a chunk boundary can fall
+                // in the middle of a multi-byte UTF-8 character, so decoding
+                // each chunk on its own would fail on perfectly valid output
+                // (any accented or non-Latin text). Bytes accumulate until a
+                // line is complete, and only that line is decoded.
+                let mut buf: Vec<u8> = Vec::new();
                 while let Some(chunk) = byte_stream.next().await {
                     let Ok(bytes) = chunk else { break };
-                    let Ok(text) = std::str::from_utf8(&bytes) else { break };
-                    buf.push_str(text);
+                    buf.extend_from_slice(&bytes);
                     // Emit complete lines as they accumulate.
-                    while let Some(pos) = buf.find('\n') {
-                        let end = if pos > 0 && buf.as_bytes()[pos - 1] == b'\r' { pos - 1 } else { pos };
-                        let line = buf[..end].to_string();
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let end = if pos > 0 && buf[pos - 1] == b'\r' { pos - 1 } else { pos };
+                        let line = decode_line(&buf[..end]);
                         buf.drain(..=pos);
                         if tx.send(Some(line)).await.is_err() {
                             return;
@@ -125,7 +143,7 @@ impl BackendPort for Backend {
                 }
                 // Flush any remaining partial line.
                 if !buf.is_empty() {
-                    let _ = tx.send(Some(buf)).await;
+                    let _ = tx.send(Some(decode_line(&buf))).await;
                 }
                 let _ = tx.send(None).await; // EOF sentinel
             });
@@ -201,6 +219,23 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
     "host",
 ];
+
+/// Decode one complete SSE line to text.
+///
+/// A line is only decoded once its terminator has arrived, so a split
+/// multi-byte character has already been reassembled by the caller's buffer.
+/// Genuinely invalid bytes are replaced rather than propagated as an error: one
+/// bad line should not truncate the rest of a stream, and the assembler already
+/// tolerates a line it cannot parse as JSON.
+fn decode_line(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(line) => line.to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, "backend sent invalid UTF-8 on an SSE line; replacing");
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+}
 
 /// Wrap a plain JSON chat-completion body into a minimal synthetic SSE stream.
 /// Used when a backend ignores `stream: true` and returns JSON directly.

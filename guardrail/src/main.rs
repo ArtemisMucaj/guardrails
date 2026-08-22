@@ -225,7 +225,15 @@ async fn main() -> anyhow::Result<()> {
                     .provider(built.provider.name())
                     .is_some_and(|p| p.enabled)
                 {
-                    providers.push(built.provider);
+                    // Replace, never append. The config already contributed a
+                    // `copilot` entry above, but that one is built from a name
+                    // and a URL alone — it cannot carry the OAuth credential or
+                    // GitHub's client-identity headers, which live on this
+                    // provider's own HTTP client. Pushing beside it left two
+                    // providers of the same name: `Registry` keeps both and
+                    // resolves by first match, so which one served depended on
+                    // ordering, and `/info` listed Copilot twice.
+                    Registry::replacing(&mut providers, built.provider);
                     info!("copilot provider enabled");
                 }
             }

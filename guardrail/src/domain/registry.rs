@@ -44,6 +44,20 @@ impl Registry {
     /// Returns `None` if `providers` is empty: a registry with nothing to route
     /// to has no meaningful behaviour, and callers should fail at startup with
     /// a clear message rather than construct one.
+    /// Add `provider`, replacing any existing one of the same name.
+    ///
+    /// Two providers sharing a name is never meaningful: [`Self::route`]
+    /// resolves by first match, so the later one is unreachable, and `/info`
+    /// reports the name twice. It happens when a provider is both described in
+    /// the configuration and constructed in code — Copilot, whose entry is a
+    /// name and a URL but whose working provider carries an OAuth credential on
+    /// its own HTTP client. The constructed one must win.
+    pub fn replacing(providers: &mut Vec<Provider>, provider: Provider) {
+        let name = provider.name().to_string();
+        providers.retain(|p| p.name() != name);
+        providers.push(provider);
+    }
+
     pub fn new(providers: Vec<Provider>) -> Option<Self> {
         if providers.is_empty() {
             return None;
@@ -137,6 +151,31 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_replaces_one_of_the_same_name() {
+        // Copilot arrives twice: once from the config (a name and a URL) and
+        // once built with its credential. Keeping both left `route` resolving
+        // to whichever came first and `/info` listing the name twice.
+        let mut providers = vec![
+            Provider::new("mlx", "http://127.0.0.1:8000"),
+            Provider::new("copilot", "https://api.githubcopilot.com"),
+        ];
+        Registry::replacing(
+            &mut providers,
+            Provider::new("copilot", "https://api.githubcopilot.com").unversioned(),
+        );
+
+        assert_eq!(providers.len(), 2, "no duplicate entry");
+        assert_eq!(providers.iter().filter(|p| p.name() == "copilot").count(), 1);
+        // The replacement is the one kept, credential and routing rules
+        // included -- here observable through `unversioned`, which the config
+        // one lacked.
+        let copilot = providers.iter().find(|p| p.name() == "copilot").unwrap();
+        assert!(copilot.is_unversioned(), "the constructed provider must win");
+        // Untouched providers keep their place.
+        assert_eq!(providers[0].name(), "mlx");
+    }
 
     fn registry() -> Registry {
         Registry::new(vec![

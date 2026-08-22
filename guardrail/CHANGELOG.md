@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.9.0...v0.10.0) (2026-08-22)
+
+
+### Features
+
+* reconstruct Chat Completions conversations by prefix containment ([#50](https://github.com/ArtemisMucaj/guardrails/issues/50)) ([b6e1ca0](https://github.com/ArtemisMucaj/guardrails/commit/b6e1ca0cc578416acd59ff495f8c608e2cf0cf76))
+* record inference token usage and cache metrics ([#45](https://github.com/ArtemisMucaj/guardrails/issues/45)) ([2786fe4](https://github.com/ArtemisMucaj/guardrails/commit/2786fe465e407faee2e8d2eb16ff3841ee6e3d2a))
+* report per-request token distributions and serve the raw rows ([#48](https://github.com/ArtemisMucaj/guardrails/issues/48)) ([cb47cc1](https://github.com/ArtemisMucaj/guardrails/commit/cb47cc167c90b796e4caf973e4b9a77a16b6b22e)), closes [#46](https://github.com/ArtemisMucaj/guardrails/issues/46)
+
 ## [0.9.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.8.4...v0.9.0) (2026-08-21)
 
 

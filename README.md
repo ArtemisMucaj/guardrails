@@ -220,7 +220,6 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
-| `--match-conversations` | `GUARDRAIL_MATCH_CONVERSATIONS` | `false` | Reconstruct conversations from Chat Completions traffic by matching resent message prefixes, so token metrics count a resent transcript once. Off by default: it is the only thing that makes the metrics path read message content (to hash it — no text is stored), and the grouping is approximate. |
 | `--copilot` | `GUARDRAIL_COPILOT` | `false` | Proxy GitHub Copilot models, using a Copilot subscription. |
 | `--copilot-base-url` | `GUARDRAIL_COPILOT_BASE_URL` | `https://api.githubcopilot.com` | Copilot API base URL. Override for an enterprise deployment. |
 
@@ -353,11 +352,15 @@ For any grouping the report does not do — by hour, by outcome, or by a session
 key only the client knows — `GET /requests` serves the underlying per-request
 rows.
 
-#### Grouping Chat Completions (`--match-conversations`)
+#### Grouping Chat Completions
 
-`distinct tokens` is absent on Chat Completions because that API supplies no
-conversation key. `--match-conversations` reconstructs one, so the line appears
-for that traffic too:
+Chat Completions supplies no conversation key, so one is reconstructed from the
+traffic itself. This is unconditional, and not a setting: every turn resends the
+whole transcript, so without grouping each turn's resent prefix is counted
+again and the totals describe the sum of the turns rather than the conversation
+— the wrong number, not a cheaper approximation of the right one.
+
+The report therefore carries `distinct tokens` for that traffic too:
 
 ```text
   distinct tokens: ~660 over ~1 conversation(s)
@@ -384,9 +387,12 @@ cryptographic by design: a collision merges two conversations in a local metrics
 report, which is a failure the heuristic already admits, and nothing of
 consequence rests on it.
 
-It is nonetheless **off by default**, because enabling it is the one thing that
-makes the metrics path read message content at all — to hash it — where it
-otherwise never touches the body of a guarded request.
+This is the one place the metrics path reads message content at all — to hash
+it — where it otherwise never touches the body of a guarded request. That was
+once the argument for making it opt-in. It is not a strong one: the read
+produces digests and nothing else, so the cost is a hash over data already in
+memory, against token totals that are otherwise simply wrong for the more common
+of the two APIs.
 
 The grouping is approximate, and both the report (`~`) and the `/stats` JSON
 (`inferred_conversations: true`) say so. Known limits:
@@ -565,14 +571,13 @@ zero and `usage_requests` below `requests`.
         "billed_calls": 183,        // backend calls, retries included
         "requests": 168,
         "calls_per_request": 1.089,
-        // Resent prefixes counted once. On Chat Completions this is null
-        // unless --match-conversations is on, since that API carries no
-        // conversation key — never the inflated sum renamed.
+        // Resent prefixes counted once — never the inflated sum renamed.
+        // Null only when a model's traffic carries no reconstructible chain.
         "distinct_prompt_tokens": null,
         "distinct_tokens": null,
         "conversations": null,
         // true when the edges above were inferred from message prefixes
-        // (--match-conversations) rather than supplied by the API.
+        // rather than supplied by the API, as on Chat Completions.
         "inferred_conversations": false,
         // Spread across single requests: needs no conversation key, so it is
         // populated for all traffic. Percentiles are nearest-rank.

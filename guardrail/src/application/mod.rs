@@ -800,9 +800,7 @@ async fn run_guardrail(
     // client sent, not what the guardrails asked in between, and would fail to
     // match. Captured only when matching is enabled -- this is the one place
     // the metrics path reads message content, so it does not happen by default.
-    let prefix_chain = g
-        .match_conversations
-        .then(|| PrefixChain::of(&request.messages));
+    let prefix_chain = Some(PrefixChain::of(&request.messages));
 
     let emit_metric = |billed: Usage,
                        conversation: Option<Conversation>,

@@ -199,18 +199,41 @@ async fn main() -> anyhow::Result<()> {
                     Duration::from_secs(cfg.read_timeout_secs),
                 )?;
                 backend = backend.with_client_for(built.provider.name(), built.client);
-                if config.provider(built.provider.name()).is_none() {
-                    let mut entry =
-                        ProviderConfig::new(built.provider.name(), built.provider.base_url());
-                    entry.unversioned = true;
-                    config.providers.push(entry);
-                    config.save(&config_path)?;
+                // Copilot serves its routes at the root, not under `/v1`, so
+                // its entry must say so. Correcting an existing entry matters
+                // as much as seeding a new one: the management API rebuilds
+                // providers from this config, and an entry written before this
+                // was set — or edited by hand — makes every rebuild target
+                // `/v1/...`, which Copilot answers with 404. The proxy then
+                // serves no Copilot models until the next restart, while the
+                // admin API still reports them as routed.
+                let path = built.provider.base_url().to_string();
+                match config.provider_mut(built.provider.name()) {
+                    Some(entry) if !entry.unversioned => {
+                        entry.unversioned = true;
+                        config.save(&config_path)?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let mut entry = ProviderConfig::new(built.provider.name(), path);
+                        entry.unversioned = true;
+                        config.providers.push(entry);
+                        config.save(&config_path)?;
+                    }
                 }
                 if config
                     .provider(built.provider.name())
                     .is_some_and(|p| p.enabled)
                 {
-                    providers.push(built.provider);
+                    // Replace, never append. The config already contributed a
+                    // `copilot` entry above, but that one is built from a name
+                    // and a URL alone — it cannot carry the OAuth credential or
+                    // GitHub's client-identity headers, which live on this
+                    // provider's own HTTP client. Pushing beside it left two
+                    // providers of the same name: `Registry` keeps both and
+                    // resolves by first match, so which one served depended on
+                    // ordering, and `/info` listed Copilot twice.
+                    Registry::replacing(&mut providers, built.provider);
                     info!("copilot provider enabled");
                 }
             }

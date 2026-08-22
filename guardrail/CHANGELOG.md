@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.12.2](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.1...v0.12.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* register one copilot provider, not two ([#60](https://github.com/ArtemisMucaj/guardrails/issues/60)) ([dad57c5](https://github.com/ArtemisMucaj/guardrails/commit/dad57c5e904f53c60d463017b4e4289834ffefee))
+
+## [0.12.1](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.0...v0.12.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* correct an existing copilot entry's unversioned flag ([#57](https://github.com/ArtemisMucaj/guardrails/issues/57)) ([a40fe11](https://github.com/ArtemisMucaj/guardrails/commit/a40fe11f215db17a55a617cbb45da3811d36d274))
+
+## [0.12.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.11.0...v0.12.0) (2026-08-22)
+
+
+### Features
+
+* group Chat Completions conversations unconditionally ([#53](https://github.com/ArtemisMucaj/guardrails/issues/53)) ([8af707f](https://github.com/ArtemisMucaj/guardrails/commit/8af707f0569f0908bacb4cc118cd58473f50226b))
+
 ## [0.11.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.10.0...v0.11.0) (2026-08-22)
 
 

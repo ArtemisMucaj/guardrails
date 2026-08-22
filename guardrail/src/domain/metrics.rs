@@ -249,14 +249,13 @@ pub struct OutcomeRecord {
     /// Present for chained Responses traffic; always absent on Chat
     /// Completions, which carries no conversation key. See [`Conversation`].
     pub conversation: Option<Conversation>,
-    /// Rolling prefix hashes of this request's `messages[]`, when conversation
-    /// matching is enabled.
+    /// Rolling prefix hashes of this request's `messages[]`.
     ///
     /// Chat Completions supplies no conversation key, so the chain is what the
     /// recorder matches against earlier turns to reconstruct one — see
-    /// [`crate::domain::conversation`]. `None` when matching is off (the
-    /// default) or on Responses traffic, which already has real edges and needs
-    /// no inference.
+    /// [`crate::domain::conversation`]. `None` on Responses traffic, which
+    /// already has real edges and needs no inference, and on requests forwarded
+    /// without the proxy reading their body.
     pub prefix_chain: Option<PrefixChain>,
 }
 
@@ -936,10 +935,9 @@ mod sqlite {
         /// contains every earlier one. Unchained requests each count in full,
         /// being conversations of one turn.
         ///
-        /// `None` when no request carried a conversation key — Chat
-        /// Completions traffic without `--match-conversations`, which is the
-        /// default — since there is then no basis to tell a second turn from
-        /// an unrelated request, and reporting the plain sum as if it were
+        /// `None` when no request carried a conversation key and none could be
+        /// inferred — there is then no basis to tell a second turn from an
+        /// unrelated request, and reporting the plain sum as if it were
         /// deduplicated would be a lie. See [`Conversation`].
         pub distinct_prompt_tokens: Option<i64>,
         /// Conversations the measured requests span, when chains are known.
@@ -947,7 +945,8 @@ mod sqlite {
         /// Whether the conversation edges behind the two fields above were
         /// *inferred* from message prefixes rather than supplied by the API.
         ///
-        /// True for Chat Completions traffic grouped with `--match-conversations`.
+        /// True for Chat Completions traffic, whose chains are reconstructed
+        /// from message prefixes because the API carries no conversation key.
         /// The grouping is a heuristic — a regenerated turn breaks the chain, and
         /// two clients replaying an identical transcript are indistinguishable —
         /// so the figures are real but approximate, and every rendering says so.

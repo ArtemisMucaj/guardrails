@@ -446,12 +446,11 @@ async fn send_turn(proxy: &str, messages: &serde_json::Value) {
         .unwrap();
 }
 
-/// Guardrails with conversation matching turned on.
+/// Default guardrails. Conversation matching is unconditional, so this is
+/// simply the standard configuration — kept as a named helper because the
+/// tests below read better naming what they rely on.
 fn matching() -> guardrail::application::Guardrails {
-    guardrail::application::Guardrails {
-        max_retries: 2,
-        match_conversations: true,
-    }
+    guardrail::application::Guardrails::default()
 }
 
 #[tokio::test]
@@ -602,17 +601,26 @@ async fn unrelated_chat_requests_are_not_merged_into_one_conversation() {
 }
 
 #[tokio::test]
-async fn matching_is_off_unless_asked_for() {
-    // The default posture: no message content is read, and the report says
-    // "cannot group" rather than approximating.
+async fn plain_chat_traffic_is_grouped_without_any_opt_in() {
+    // The inverse of what this test used to assert. Grouping was opt-in, so the
+    // default answer for Chat Completions was "cannot group" -- which is not a
+    // safer answer, it is the wrong one: every turn resends the transcript, so
+    // ungrouped totals count a shared prefix once per turn. Two turns of one
+    // exchange must now be recognised as one conversation with no flag set.
     let backend = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_string(turn_with_usage(100, 10, 0)))
+        .up_to_n_times(1)
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(turn_with_usage(300, 20, 0)))
         .mount(&backend)
         .await;
 
-    let db = temp_db("chat-nomatch");
+    let db = temp_db("chat-default-grouping");
     let recorder = Arc::new(SqliteRecorder::open(&db).unwrap());
     let proxy = spawn_proxy(
         AppState::new(Backend::new(reqwest::Client::new()), backend.uri())
@@ -632,7 +640,14 @@ async fn matching_is_off_unless_asked_for() {
 
     let stats = stats_for_n(&db, 2);
     let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
-    assert_eq!(m.distinct_prompt_tokens, None, "no grouping without the flag");
-    assert_eq!(m.conversations, None);
-    assert!(!m.inferred_conversations);
+
+    // Billed stays the honest sum of what the provider charged.
+    assert_eq!(m.usage.prompt_tokens, 400);
+    // But turn 2's prompt already contains turn 1's, so the conversation only
+    // ever held 300 distinct prompt tokens.
+    assert_eq!(m.distinct_prompt_tokens, Some(300), "grouped with no flag set");
+    assert_eq!(m.conversations, Some(1));
+    // Still marked approximate: the edge was inferred from message prefixes,
+    // not supplied by the API. Removing the flag does not make it exact.
+    assert!(m.inferred_conversations);
 }

@@ -388,18 +388,17 @@ struct UsageDto {
     calls_per_request: Option<f64>,
     /// Prompt tokens with resent transcript prefixes counted once — a
     /// conversation contributes its largest prompt, not the sum of its turns.
-    /// `null` when conversations cannot be reconstructed — Chat Completions
-    /// without `--match-conversations` — rather than repeating the inflated
-    /// sum under a better name.
+    /// `null` when conversations cannot be reconstructed, rather than repeating
+    /// the inflated sum under a better name.
     distinct_prompt_tokens: Option<i64>,
     /// `distinct_prompt_tokens + completion_tokens`; `null` with the above.
     distinct_tokens: Option<i64>,
     /// Conversations the measured requests span; `null` when unknown.
     conversations: Option<i64>,
     /// Whether the three fields above rest on conversation edges the proxy
-    /// *inferred* from message prefixes (Chat Completions with matching
-    /// enabled) rather than ones the API supplied. Inferred grouping is a
-    /// heuristic, so those figures are real but approximate.
+    /// *inferred* from message prefixes (Chat Completions, which carries no
+    /// conversation key) rather than ones the API supplied. Inferred grouping
+    /// is a heuristic, so those figures are real but approximate.
     inferred_conversations: bool,
     /// Spread of prompt tokens across single requests. Unlike the three fields
     /// above this needs no conversation key, so it is populated for Chat

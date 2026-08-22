@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.0...v0.12.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* correct an existing copilot entry's unversioned flag ([#57](https://github.com/ArtemisMucaj/guardrails/issues/57)) ([a40fe11](https://github.com/ArtemisMucaj/guardrails/commit/a40fe11f215db17a55a617cbb45da3811d36d274))
+
 ## [0.12.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.11.0...v0.12.0) (2026-08-22)
 
 

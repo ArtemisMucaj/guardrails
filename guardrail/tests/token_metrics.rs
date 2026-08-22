@@ -324,7 +324,11 @@ async fn a_chained_responses_conversation_counts_its_resent_prefix_once() {
 
     drop(recorder);
 
-    let stats = stats_for(&db);
+    // Two turns, so wait for both. `stats_for` waits for a single measured row,
+    // which on a slow runner can be read after turn 1 is written and before
+    // turn 2 is — reporting turn 1's 100 prompt tokens as the whole total
+    // rather than failing to wait.
+    let stats = stats_for_n(&db, 2);
     let m = stats
         .per_model
         .iter()

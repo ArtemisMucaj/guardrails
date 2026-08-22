@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.10.0...v0.11.0) (2026-08-22)
+
+
+### Features
+
+* bound the metrics rollup to a window, and total it per day ([#51](https://github.com/ArtemisMucaj/guardrails/issues/51)) ([c43f8e3](https://github.com/ArtemisMucaj/guardrails/commit/c43f8e348f1abddad71d23525cd90d8d0c84ed2c))
+
 ## [0.10.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.9.0...v0.10.0) (2026-08-22)
 
 

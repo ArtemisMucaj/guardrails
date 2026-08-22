@@ -57,6 +57,20 @@ pub struct Config {
     #[arg(long, env = "GUARDRAIL_MAX_RETRIES", default_value_t = 2)]
     pub max_retries: u32,
 
+    /// Reconstruct conversations from Chat Completions traffic, so token
+    /// metrics can count a resent transcript once instead of once per turn.
+    ///
+    /// That API is stateless and carries no conversation key, so turns are
+    /// matched by their message prefix: turn N resends turn N−1's messages and
+    /// appends, which identifies the predecessor. Off by default for two
+    /// reasons. It is the only thing that makes the metrics path read message
+    /// content — to hash it; message text is never stored, only digests — and
+    /// the grouping is approximate, so the figures derived from it are reported
+    /// as such. The Responses API is unaffected: it supplies real conversation
+    /// edges and never needs the inference.
+    #[arg(long, env = "GUARDRAIL_MATCH_CONVERSATIONS", default_value_t = false)]
+    pub match_conversations: bool,
+
     /// Proxy GitHub Copilot models, using a Copilot subscription.
     ///
     /// Requires a device-flow login: start the proxy with `--admin-listen` and
@@ -94,6 +108,7 @@ impl Config {
     pub fn guardrails(&self) -> Guardrails {
         Guardrails {
             max_retries: self.max_retries,
+            match_conversations: self.match_conversations,
         }
     }
 

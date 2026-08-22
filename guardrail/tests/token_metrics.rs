@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use guardrail::application::AppState;
 use guardrail::connector::Backend;
-use guardrail::domain::metrics::{SqliteRecorder, Stats};
+use guardrail::domain::metrics::{
+    now_rfc3339, Conversation, Outcome, OutcomeRecord, Recorder, SqliteRecorder, Stats, Usage,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -378,4 +380,241 @@ async fn a_backend_reporting_no_usage_records_the_request_without_tokens() {
     assert_eq!(m.usage_requests, 0, "but it carries no token measurement");
     assert_eq!(m.billed_tokens(), 0);
     assert_eq!(m.calls_per_request(), None, "no basis to report a multiplier");
+}
+
+/// A completion carrying a valid tool call and a usage block, used to drive a
+/// multi-turn conversation down the guarded path.
+fn turn_with_usage(prompt: i64, completion: i64, cached: i64) -> String {
+    serde_json::json!({
+        "id": "chatcmpl-x",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        },
+    })
+    .to_string()
+}
+
+/// Send one chat turn carrying `messages` verbatim.
+///
+/// Declares a tool so the request takes the *guarded* path: a tool-less chat
+/// request is forwarded without the proxy reading the response, so it reports
+/// no usage and there would be nothing to group.
+async fn send_turn(proxy: &str, messages: &serde_json::Value) {
+    reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m", "messages": messages, "tools": [weather_tool()],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+}
+
+/// Guardrails with conversation matching turned on.
+fn matching() -> guardrail::application::Guardrails {
+    guardrail::application::Guardrails {
+        max_retries: 2,
+        match_conversations: true,
+    }
+}
+
+#[tokio::test]
+async fn a_chat_conversation_is_reconstructed_from_its_resent_transcript() {
+    // The end-to-end case this feature exists for. Chat Completions carries no
+    // conversation key, so three turns of one exchange would each count in
+    // full — 100 + 300 + 600 = 1000 billed prompt tokens for a conversation
+    // that only ever contained 600 distinct ones. With matching enabled the
+    // proxy infers the chain from the resent transcript and reports 600.
+    let backend = MockServer::start().await;
+    for (n, body) in [(1, turn_with_usage(100, 10, 0)), (1, turn_with_usage(300, 20, 80))] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .up_to_n_times(n)
+            .mount(&backend)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(turn_with_usage(600, 30, 260)))
+        .mount(&backend)
+        .await;
+
+    let db = temp_db("chat-chain");
+    let recorder = Arc::new(SqliteRecorder::open(&db).unwrap());
+    let proxy = spawn_proxy(
+        AppState::new(Backend::new(reqwest::Client::new()), backend.uri())
+            .with_recorder(recorder.clone())
+            .with_guardrails(matching()),
+    )
+    .await;
+
+    // A conversation as a client actually sends it: each turn resends
+    // everything before it and appends.
+    let t1 = serde_json::json!([
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hello"},
+    ]);
+    let t2 = serde_json::json!([
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "and again"},
+    ]);
+    let t3 = serde_json::json!([
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "and again"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "once more"},
+    ]);
+    send_turn(&proxy, &t1).await;
+    send_turn(&proxy, &t2).await;
+    send_turn(&proxy, &t3).await;
+    drop(recorder);
+
+    let stats = stats_for(&db);
+    let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
+
+    // Billed is unchanged — it is still what the provider charged.
+    assert_eq!(m.usage.prompt_tokens, 1000);
+    // But the three turns are now one conversation, contributing the largest
+    // prompt rather than the sum.
+    assert_eq!(m.conversations, Some(1), "three turns, one conversation");
+    assert_eq!(m.distinct_prompt_tokens, Some(600));
+    assert_eq!(m.distinct_tokens(), Some(660));
+
+    // The grouping is inferred, so it must be reported as approximate rather
+    // than with the confidence a Responses chain earns.
+    assert!(m.inferred_conversations, "chat edges are inferred, not given");
+    let report = stats.render();
+    assert!(report.contains("distinct tokens: ~660"), "got: {report}");
+    assert!(report.contains("~ conversations inferred"), "got: {report}");
+}
+
+#[tokio::test]
+async fn a_responses_chain_is_not_marked_approximate() {
+    // The distinction the flag exists for: the Responses API names its edges,
+    // so its deduplication is exact and must not carry the heuristic's caveat.
+    let db = temp_db("resp-exact");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    let chained = |prompt: i64, id: &str, parent: Option<&str>| OutcomeRecord {
+        ts: now_rfc3339(),
+        provider: "default".into(),
+        model: "m".into(),
+        outcome: Outcome::NativeValid,
+        error_category: None,
+        parser: None,
+        tool_name: None,
+        retries: 0,
+        detail: None,
+        usage: Some(Usage {
+            prompt_tokens: prompt,
+            completion_tokens: 10,
+            cached_tokens: 0,
+            attempts: 1,
+        }),
+        conversation: Some(Conversation { id: id.into(), parent: parent.map(str::to_string) }),
+        prefix_chain: None,
+    };
+    Recorder::record(&recorder, chained(100, "r1", None));
+    Recorder::record(&recorder, chained(400, "r2", Some("r1")));
+    drop(recorder);
+
+    let stats = Stats::read(&db).unwrap();
+    let m = &stats.per_model[0];
+    assert_eq!(m.distinct_prompt_tokens, Some(400));
+    assert!(!m.inferred_conversations, "responses edges are exact");
+    assert!(!stats.render().contains('~'), "exact figures carry no marker");
+}
+
+#[tokio::test]
+async fn unrelated_chat_requests_are_not_merged_into_one_conversation() {
+    // The failure that would make this worse than reporting nothing. Two
+    // requests sharing no transcript must stay separate, so `distinct` equals
+    // `billed` rather than collapsing to the larger one.
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(turn_with_usage(100, 5, 0)))
+        .mount(&backend)
+        .await;
+
+    let db = temp_db("chat-unrelated");
+    let recorder = Arc::new(SqliteRecorder::open(&db).unwrap());
+    let proxy = spawn_proxy(
+        AppState::new(Backend::new(reqwest::Client::new()), backend.uri())
+            .with_recorder(recorder.clone())
+            .with_guardrails(matching()),
+    )
+    .await;
+
+    send_turn(&proxy, &serde_json::json!([{"role": "user", "content": "about cats"}])).await;
+    send_turn(&proxy, &serde_json::json!([{"role": "user", "content": "about dogs"}])).await;
+    drop(recorder);
+
+    let stats = stats_for(&db);
+    let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
+    assert_eq!(m.usage.prompt_tokens, 200);
+    assert_eq!(m.conversations, Some(2), "two unrelated requests");
+    assert_eq!(
+        m.distinct_prompt_tokens,
+        Some(200),
+        "nothing was resent, so nothing to deduplicate"
+    );
+}
+
+#[tokio::test]
+async fn matching_is_off_unless_asked_for() {
+    // The default posture: no message content is read, and the report says
+    // "cannot group" rather than approximating.
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(turn_with_usage(100, 10, 0)))
+        .mount(&backend)
+        .await;
+
+    let db = temp_db("chat-nomatch");
+    let recorder = Arc::new(SqliteRecorder::open(&db).unwrap());
+    let proxy = spawn_proxy(
+        AppState::new(Backend::new(reqwest::Client::new()), backend.uri())
+            .with_recorder(recorder.clone()),
+    )
+    .await;
+
+    let t1 = serde_json::json!([{"role": "user", "content": "hello"}]);
+    let t2 = serde_json::json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "again"},
+    ]);
+    send_turn(&proxy, &t1).await;
+    send_turn(&proxy, &t2).await;
+    drop(recorder);
+
+    let stats = stats_for(&db);
+    let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
+    assert_eq!(m.distinct_prompt_tokens, None, "no grouping without the flag");
+    assert_eq!(m.conversations, None);
+    assert!(!m.inferred_conversations);
 }

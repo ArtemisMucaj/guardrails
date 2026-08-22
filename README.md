@@ -220,6 +220,7 @@ Every option is available as both a CLI flag and an environment variable.
 | `--connect-timeout-secs` | `GUARDRAIL_CONNECT_TIMEOUT_SECS` | `10` | Backend connection timeout. |
 | `--read-timeout-secs` | `GUARDRAIL_READ_TIMEOUT_SECS` | `300` | Maximum idle gap while reading backend responses. |
 | `--max-retries` | `GUARDRAIL_MAX_RETRIES` | `2` | Maximum corrective retries per request. Set to `0` to disable retries while keeping the other repairs. |
+| `--match-conversations` | `GUARDRAIL_MATCH_CONVERSATIONS` | `false` | Reconstruct conversations from Chat Completions traffic by matching resent message prefixes, so token metrics count a resent transcript once. Off by default: it is the only thing that makes the metrics path read message content (to hash it — no text is stored), and the grouping is approximate. |
 | `--copilot` | `GUARDRAIL_COPILOT` | `false` | Proxy GitHub Copilot models, using a Copilot subscription. |
 | `--copilot-base-url` | `GUARDRAIL_COPILOT_BASE_URL` | `https://api.githubcopilot.com` | Copilot API base URL. Override for an enterprise deployment. |
 
@@ -352,6 +353,56 @@ For any grouping the report does not do — by hour, by outcome, or by a session
 key only the client knows — `GET /requests` serves the underlying per-request
 rows.
 
+#### Grouping Chat Completions (`--match-conversations`)
+
+`distinct tokens` is absent on Chat Completions because that API supplies no
+conversation key. `--match-conversations` reconstructs one, so the line appears
+for that traffic too:
+
+```text
+  distinct tokens: ~660 over ~1 conversation(s)
+
+  ~ conversations inferred from message prefixes
+```
+
+The `~` marks a figure that rests on inferred grouping; the footnote is printed
+once per report rather than repeated on every line.
+
+The mechanism is **prefix containment**, not a fingerprint of the opening. Turn
+N's `messages[]` *is* turn N−1's array plus the new entries — a property of how a
+stateless API works, not a guess about what conversations look like — so a turn
+is matched to its predecessor by asking whether the predecessor's messages are a
+prefix of this one's. Where several turns qualify, the most recent wins; a
+candidate more than two hours old is refused, on the grounds that a shared prefix
+across a long gap is more likely two sessions that opened alike than one exchange
+resumed.
+
+**Message text is never stored.** What is written is a rolling hash per prefix
+length (`h₁ = H(m₁)`, `h₂ = H(h₁ ‖ m₂)`, …), so containment reduces to comparing
+digests and nothing is reconstructible from the database. The hash is non-
+cryptographic by design: a collision merges two conversations in a local metrics
+report, which is a failure the heuristic already admits, and nothing of
+consequence rests on it.
+
+It is nonetheless **off by default**, because enabling it is the one thing that
+makes the metrics path read message content at all — to hash it — where it
+otherwise never touches the body of a guarded request.
+
+The grouping is approximate, and both the report (`~`) and the `/stats` JSON
+(`inferred_conversations: true`) say so. Known limits:
+
+- A **regenerated or edited turn** sends an array that diverges rather than
+  extends, so it reads as a new conversation.
+- Two clients **replaying an identical transcript** are indistinguishable.
+- **Parallel turns** on one conversation form a tree rather than a chain. That is
+  handled correctly — a conversation contributes its largest prompt regardless of
+  branching — and the siblings remain separable in the raw rows, since the second
+  request typically reports more `cached_tokens` than the first, having read the
+  cache the first populated.
+
+The Responses API is unaffected either way: it names its own edges, so its
+deduplication is exact and is never marked approximate.
+
 [#46]: https://github.com/ArtemisMucaj/guardrails/issues/46
 
 ### Admin HTTP server
@@ -426,6 +477,9 @@ database runs in WAL mode, these reads never block the proxy's writes.
         "distinct_prompt_tokens": null,
         "distinct_tokens": null,
         "conversations": null,
+        // true when the edges above were inferred from message prefixes
+        // (--match-conversations) rather than supplied by the API.
+        "inferred_conversations": false,
         // Spread across single requests: needs no conversation key, so it is
         // populated for all traffic. Percentiles are nearest-rank.
         "prompt_distribution": {
@@ -523,6 +577,6 @@ guardrail/src/admin/        Read-only admin HTTP server (stats, health, info)
 guardrail/src/connector/    Backend HTTP forwarding
 guardrail/src/copilot/      GitHub Copilot provider and device-flow login
 guardrail/src/domain/       Decode, rescue, validate, retry, respond, provider routing,
-                            and the Responses API translation
+                            the Responses API translation, and conversation matching
 guardrail/tests/            End-to-end proxy tests
 ```

@@ -33,6 +33,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::domain::decode::{response_with_text, response_with_tool_calls};
 pub use crate::domain::guardrails::Guardrails;
+use crate::domain::conversation::PrefixChain;
 use crate::domain::metrics::{
     now_rfc3339, redact_args, Conversation, NoopRecorder, Outcome, OutcomeRecord, SharedRecorder,
     Usage,
@@ -234,6 +235,7 @@ async fn proxy_responses(State(state): State<AppState>, req: Request) -> Respons
                 // Forwarded verbatim without the proxy reading the body, so
                 // there is no usage and no conversation to report.
                 usage: None,
+                prefix_chain: None,
                 conversation: None,
             });
         }
@@ -342,6 +344,8 @@ async fn run_responses_guardrail(
             // Only a turn the backend named can anchor a chain; without an id
             // there is nothing for a later turn to point back to.
             conversation: response_id.map(|id| Conversation { id, parent: parent_id.clone() }),
+            // The Responses API supplies real edges; nothing to infer.
+            prefix_chain: None,
         });
     };
 
@@ -684,6 +688,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                 // Forwarded verbatim without the proxy reading the body, so
                 // there is no usage and no conversation to report.
                 usage: None,
+                prefix_chain: None,
                 conversation: None,
             });
         }
@@ -784,10 +789,21 @@ async fn run_guardrail(
     // the attempt that happened to succeed.
     let mut billed = Usage::default();
 
-    // The conversation argument is always `None` here: Chat Completions is
-    // stateless, so a turn carries no id and no reference to its predecessor.
-    // The parameter exists to keep this closure the same shape as the Responses
-    // loop's, where the ids do exist.
+    // Chat Completions is stateless: a turn carries no id and no reference to
+    // its predecessor, so the `conversation` argument below is always `None`
+    // and the edge -- if any -- is inferred by the recorder instead.
+    //
+    // The chain is computed from the client's *original* messages, captured
+    // before the loop appends any corrective nudge. A retry rewrites
+    // `request.messages`, and hashing the rewritten array would describe a
+    // transcript the client never sent: the next real turn extends what the
+    // client sent, not what the guardrails asked in between, and would fail to
+    // match. Captured only when matching is enabled -- this is the one place
+    // the metrics path reads message content, so it does not happen by default.
+    let prefix_chain = g
+        .match_conversations
+        .then(|| PrefixChain::of(&request.messages));
+
     let emit_metric = |billed: Usage,
                        conversation: Option<Conversation>,
                        outcome: Outcome,
@@ -801,6 +817,7 @@ async fn run_guardrail(
             error_category, parser, tool_name, retries, detail,
             conversation,
             usage: (!billed.is_empty()).then_some(billed),
+            prefix_chain: prefix_chain.clone(),
         });
     };
 

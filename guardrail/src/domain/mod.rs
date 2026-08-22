@@ -1,4 +1,5 @@
 pub mod config;
+pub mod conversation;
 pub mod decode;
 pub mod guardrails;
 pub mod metrics;

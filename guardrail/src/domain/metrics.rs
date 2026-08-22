@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use crate::domain::conversation::PrefixChain;
 use crate::domain::validate::ErrorCategory;
 
 /// Terminal classification of a single guarded request.
@@ -248,15 +249,30 @@ pub struct OutcomeRecord {
     /// Present for chained Responses traffic; always absent on Chat
     /// Completions, which carries no conversation key. See [`Conversation`].
     pub conversation: Option<Conversation>,
+    /// Rolling prefix hashes of this request's `messages[]`, when conversation
+    /// matching is enabled.
+    ///
+    /// Chat Completions supplies no conversation key, so the chain is what the
+    /// recorder matches against earlier turns to reconstruct one — see
+    /// [`crate::domain::conversation`]. `None` when matching is off (the
+    /// default) or on Responses traffic, which already has real edges and needs
+    /// no inference.
+    pub prefix_chain: Option<PrefixChain>,
 }
 
 /// Where a request sits in a conversation.
 ///
-/// Only the Responses API can supply this: it is stateful, so a client
+/// The Responses API supplies this directly: it is stateful, so a client
 /// continues an exchange by naming the previous response rather than resending
 /// the transcript. `id` is this turn's response, `parent` the one it continues.
 /// Together they form the edges of a chain whose root identifies the
 /// conversation.
+///
+/// On Chat Completions the edges are *inferred* instead, when matching is
+/// enabled: the recorder matches each request's message prefix against recent
+/// turns and synthesises the same two fields (see
+/// [`crate::domain::conversation`]). Inferred edges are approximate, and
+/// [`Stats`] reports figures derived from them as such.
 ///
 /// This is what makes prompt tokens summable. Because each turn's prompt
 /// contains every earlier turn, the *last* turn of a chain already accounts for
@@ -338,17 +354,24 @@ fn redact_value(value: &serde_json::Value) -> String {
 }
 
 /// Current time as an RFC3339 UTC timestamp, without pulling in a date library.
+///
+/// Millisecond precision, not whole seconds. A burst of requests routinely
+/// shares one second, and conversation matching picks a parent by recency
+/// ([`Conversation`]) — with second resolution the turns of one exchange are
+/// simply tied, and the "most recent" turn is whichever the comparison happened
+/// to see first. Milliseconds make that ordering meaningful. Row *insertion*
+/// order still comes from the monotonic rowid, which no clock can perturb.
 pub fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let (secs, millis) = (now.as_secs(), now.subsec_millis());
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
 }
 
 /// Howard Hinnant's days-to-civil-date algorithm (days since 1970-01-01).
@@ -372,7 +395,11 @@ mod tests {
     #[test]
     fn now_rfc3339_is_well_formed_utc() {
         let ts = now_rfc3339();
-        assert_eq!(ts.len(), 20, "expected YYYY-MM-DDThh:mm:ssZ, got {ts}");
+        assert_eq!(ts.len(), 24, "expected YYYY-MM-DDThh:mm:ss.mmmZ, got {ts}");
+        // Milliseconds are what make "most recent matching parent" well
+        // defined; a burst otherwise shares one timestamp and ties.
+        assert_eq!(&ts[19..20], ".", "expected sub-second precision, got {ts}");
+        assert!(ts[20..23].chars().all(|c| c.is_ascii_digit()), "got {ts}");
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");
         // Epoch and a known leap-aware date anchor the civil-date math.
@@ -541,7 +568,7 @@ mod tests {
 
 pub use sqlite::{
     default_db_path, Distribution, ErrorGroup, ModelStats, RequestRow, SqliteRecorder, Stats,
-    MAX_ROWS,
+    INFERRED_PREFIX, MAX_ROWS,
 };
 
 
@@ -552,6 +579,8 @@ mod sqlite {
 
     use rusqlite::Connection;
     use tracing::{error, info, warn};
+
+    use crate::domain::conversation::{self, Candidate, PrefixChain};
 
     use super::{OutcomeRecord, Recorder, Usage};
 
@@ -694,6 +723,15 @@ mod sqlite {
         pub distinct_prompt_tokens: Option<i64>,
         /// Conversations the measured requests span, when chains are known.
         pub conversations: Option<i64>,
+        /// Whether the conversation edges behind the two fields above were
+        /// *inferred* from message prefixes rather than supplied by the API.
+        ///
+        /// True for Chat Completions traffic grouped with `--match-conversations`.
+        /// The grouping is a heuristic — a regenerated turn breaks the chain, and
+        /// two clients replaying an identical transcript are indistinguishable —
+        /// so the figures are real but approximate, and every rendering says so.
+        /// False when the chains came from the Responses API, which names them.
+        pub inferred_conversations: bool,
         /// Spread of per-request prompt tokens, over the requests that reported
         /// usage. Available for all traffic, chained or not: it describes
         /// single requests, so it needs no conversation key. `None` when no
@@ -961,6 +999,7 @@ mod sqlite {
                     // Filled by the deduplication pass below.
                     distinct_prompt_tokens: None,
                     conversations: None,
+                    inferred_conversations: false,
                     // Filled by the distribution pass below.
                     prompt_distribution: None,
                     completion_distribution: None,
@@ -1108,7 +1147,8 @@ mod sqlite {
                             MAX(prompt_tokens) AS prompt_tokens \
                      FROM rooted GROUP BY provider, model, conversation\
                  ) \
-                 SELECT provider, model, SUM(prompt_tokens), COUNT(*) \
+                 SELECT provider, model, SUM(prompt_tokens), COUNT(*), \
+                        MAX(conversation LIKE '{INFERRED_PREFIX}%') \
                  FROM per_conversation GROUP BY provider, model"
             );
 
@@ -1119,16 +1159,21 @@ mod sqlite {
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
                 ))
             })?;
             for row in rows {
-                let (provider, model, distinct, conversations) = row?;
+                let (provider, model, distinct, conversations, inferred) = row?;
                 if let Some(m) = per_model
                     .iter_mut()
                     .find(|m| m.provider == provider && m.model == model)
                 {
                     m.distinct_prompt_tokens = Some(distinct);
                     m.conversations = Some(conversations);
+                    // Any inferred root makes the whole figure approximate:
+                    // a mixed-dialect model is only as exact as its weakest
+                    // grouping, and claiming otherwise would overstate it.
+                    m.inferred_conversations = inferred;
                 }
             }
             Ok(())
@@ -1329,9 +1374,15 @@ mod sqlite {
                     if let (Some(distinct), Some(conversations)) =
                         (m.distinct_tokens(), m.conversations)
                     {
+                        // A leading `~` marks an inferred grouping. Terse on
+                        // purpose: the caveat belongs in a legend, not repeated
+                        // in full on every model's line. The symbol is still
+                        // load-bearing — an inferred figure must never read as
+                        // exact — and the footnote below spells it out once.
+                        let approx = if m.inferred_conversations { "~" } else { "" };
                         let _ = writeln!(
                             out,
-                            "  distinct tokens: {distinct} over {conversations} conversation(s)",
+                            "  distinct tokens: {approx}{distinct} over {approx}{conversations} conversation(s)",
                         );
                     }
                     // Per-request spread. Unlike the line above this needs no
@@ -1353,6 +1404,12 @@ mod sqlite {
                         );
                     }
                 }
+            }
+
+            // Explained once, at the end, rather than restated on every line
+            // that carries the marker.
+            if self.per_model.iter().any(|m| m.inferred_conversations) {
+                out.push_str("\n  ~ conversations inferred from message prefixes\n");
             }
 
             out.push_str("\nErrors (triage list)\n");
@@ -1380,12 +1437,97 @@ mod sqlite {
     }
 
     fn writer_loop(conn: Connection, receiver: mpsc::Receiver<OutcomeRecord>) {
-        for record in receiver {
+        for mut record in receiver {
+            // Resolve the conversation edge here rather than on the request
+            // path: matching reads earlier rows, and the whole point of the
+            // writer thread is that the proxy's response never waits on the
+            // database.
+            if let Err(e) = infer_conversation(&conn, &mut record) {
+                // A failed match costs a grouping, not a row. Record it anyway.
+                warn!(error = %e, "failed to match conversation; recording unlinked");
+            }
             if let Err(e) = insert(&conn, &record) {
                 error!(error = %e, "failed to write metrics row");
             }
         }
     }
+
+    /// How many recent rows a match considers.
+    ///
+    /// Matching scans back over recent turns of the same provider and model. A
+    /// conversation's previous turn is by definition one of the most recent
+    /// rows, so a modest window finds it; a larger one only adds rows that the
+    /// gap check would reject anyway.
+    const MATCH_WINDOW: i64 = 256;
+
+    /// Fill in `record.conversation` by matching its message prefix against
+    /// recent turns.
+    ///
+    /// Does nothing unless the record carries a [`PrefixChain`] (matching
+    /// enabled, Chat Completions traffic) and has no conversation already — the
+    /// Responses API supplies real edges, which are never overridden by an
+    /// inferred one.
+    ///
+    /// The synthetic id is the chain's own head hash, so it is stable and
+    /// derivable: the *next* turn computes the same value for this turn's
+    /// prefix and links to it without needing to have seen the id.
+    fn infer_conversation(conn: &Connection, record: &mut OutcomeRecord) -> rusqlite::Result<()> {
+        let Some(chain) = record.prefix_chain.as_ref() else {
+            return Ok(());
+        };
+        if record.conversation.is_some() || chain.is_empty() {
+            return Ok(());
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT response_id, ts, prefix_chain, \
+                COALESCE(prompt_tokens, 0), COALESCE(cached_tokens, 0) \
+             FROM outcomes \
+             WHERE prefix_chain IS NOT NULL AND response_id IS NOT NULL \
+               AND provider = ?1 AND model = ?2 \
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let candidates: Vec<Candidate> = stmt
+            .query_map(
+                rusqlite::params![record.provider, record.model, MATCH_WINDOW],
+                |r| {
+                    Ok(Candidate {
+                        id: r.get(0)?,
+                        ts: r.get(1)?,
+                        chain: PrefixChain::decode(&r.get::<_, String>(2)?),
+                        prompt_tokens: r.get(3)?,
+                        cached_tokens: r.get(4)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let parent = conversation::match_parent(chain, &record.ts, &candidates);
+        record.conversation = Some(super::Conversation {
+            // The head hash identifies this exact transcript, so the next turn
+            // arrives at the same id independently.
+            id: synthetic_id(chain),
+            parent: parent.map(|p| p.id.clone()),
+        });
+        Ok(())
+    }
+
+    /// Synthetic conversation id for an inferred turn.
+    ///
+    /// Prefixed so it is never mistaken for a backend-assigned response id in a
+    /// database holding both dialects, and so `stats` can tell an inferred edge
+    /// from a real one.
+    fn synthetic_id(chain: &PrefixChain) -> String {
+        match chain.head() {
+            Some(head) => format!("{INFERRED_PREFIX}{head:016x}"),
+            None => String::new(),
+        }
+    }
+
+    /// Marks a conversation id the proxy inferred rather than one a backend
+    /// assigned. Load-bearing: [`Stats`] reports figures over inferred chains as
+    /// approximate.
+    pub const INFERRED_PREFIX: &str = "inferred:";
 
     fn insert(conn: &Connection, record: &OutcomeRecord) -> rusqlite::Result<()> {
         // A request with no reported usage stores NULLs rather than zeroes, so
@@ -1395,8 +1537,9 @@ mod sqlite {
         conn.execute(
             "INSERT INTO outcomes \
              (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail, \
-              prompt_tokens, completion_tokens, cached_tokens, billed_calls, response_id, parent_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              prompt_tokens, completion_tokens, cached_tokens, billed_calls, response_id, parent_id, \
+              prefix_chain) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
                 record.ts,
                 record.provider,
@@ -1414,6 +1557,7 @@ mod sqlite {
                 usage.map(|u| u.attempts),
                 record.conversation.as_ref().map(|c| c.id.as_str()),
                 record.conversation.as_ref().and_then(|c| c.parent.as_deref()),
+                record.prefix_chain.as_ref().map(|c| c.encode()),
             ],
         )?;
         Ok(())
@@ -1453,13 +1597,17 @@ mod sqlite {
         // these are regenerable local metrics, and leaving the old table in
         // place would make every insert fail on the unknown columns, silently
         // disabling metrics for good.
+        // `prefix_chain` arrived after `response_id`; checking the newest
+        // column covers both, for the same reason as above — an insert naming
+        // a column the table lacks fails every time, silently disabling
+        // metrics.
         let has_tokens = conn
-            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'response_id'")?
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'prefix_chain'")?
             .exists([])?;
         if !has_tokens {
             warn!(
-                "metrics database predates token usage; recreating the outcomes \
-                 table (previous request history is discarded)"
+                "metrics database predates conversation matching; recreating the \
+                 outcomes table (previous request history is discarded)"
             );
             conn.execute_batch(
                 "DROP INDEX IF EXISTS idx_outcomes_provider_model;\
@@ -1488,7 +1636,8 @@ mod sqlite {
             cached_tokens     INTEGER,\
             billed_calls      INTEGER,\
             response_id       TEXT,\
-            parent_id         TEXT\
+            parent_id         TEXT,\
+            prefix_chain      TEXT\
         );\
         CREATE INDEX IF NOT EXISTS idx_outcomes_provider_model \
             ON outcomes(provider, model);\
@@ -1522,6 +1671,7 @@ mod sqlite {
                 detail: None,
                 usage: None,
                 conversation: None,
+                prefix_chain: None,
             }
         }
 
@@ -1545,6 +1695,7 @@ mod sqlite {
                 detail: None,
                 usage: None,
                 conversation: None,
+                prefix_chain: None,
             });
             recorder.record(OutcomeRecord {
                 ts: now_rfc3339(),
@@ -1558,6 +1709,7 @@ mod sqlite {
                 detail: Some("missing filePath | args: {}".into()),
                 usage: None,
                 conversation: None,
+                prefix_chain: None,
             });
             // Drop closes the channel and joins the writer; rows are flushed.
             drop(recorder);

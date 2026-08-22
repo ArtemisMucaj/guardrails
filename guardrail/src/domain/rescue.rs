@@ -38,6 +38,45 @@ pub fn rescue(text: &str) -> Option<(&'static str, Vec<ToolCall>)> {
     None
 }
 
+/// The model's own prose from `text`, with the call syntax removed — or `None`
+/// when nothing readable is left.
+///
+/// A rescued call is recovered *from* the text, so re-emitting that text
+/// verbatim would show the client the very markup the rescue exists to hide.
+/// Only a fenced block is stripped here: it is the one rescue form that
+/// routinely carries an explanation around it, and its boundaries are
+/// unambiguous. Every other form is a control token the model emitted *instead*
+/// of prose, so any stray text beside it is fragmentary and is dropped, which
+/// is what the guardrails did for all rescues before.
+pub fn prose_beside_call(text: &str) -> Option<String> {
+    // Anything token-shaped means the model was emitting a call, not writing.
+    const CALL_MARKERS: &[&str] = &[
+        "<tool_call>",
+        "<function_call>",
+        "<function=",
+        LFM_CALL_START,
+        PYTHON_TAG,
+        MISTRAL_TOKEN,
+        ARGS_MARKER,
+    ];
+    if CALL_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return None;
+    }
+    // Drop the fenced block, keeping what the model wrote around it.
+    let mut prose = String::new();
+    for (index, part) in text.split("```").enumerate() {
+        if index % 2 == 0 {
+            prose.push_str(part);
+        }
+    }
+    let prose = prose.trim();
+    // A bare-JSON answer leaves nothing but the JSON itself behind.
+    if prose.is_empty() || prose.starts_with('{') || prose.starts_with('[') {
+        return None;
+    }
+    Some(prose.to_string())
+}
+
 // ── Shared JSON interpretation ──────────────────────────────────────────────
 
 /// Interpret a JSON value as one or more tool calls.
@@ -582,21 +621,51 @@ impl RescueParser for Llama {
 
 /// A fenced code block (```json … ``` or bare ``` … ```) containing tool-call
 /// JSON.
+///
+/// Unlike the tagged parsers above, a fenced block is ordinary Markdown rather
+/// than a model-specific control token: a model *explaining* an API emits the
+/// same syntax as one *calling* it, and the two are indistinguishable by the
+/// time validation sees them — a documented example names a real tool with real
+/// arguments. So the block must be the answer rather than an illustration
+/// inside one; see [`fence_is_the_whole_answer`].
 pub struct FencedJson;
 impl RescueParser for FencedJson {
     fn name(&self) -> &'static str {
         "fenced_json"
     }
     fn try_parse(&self, text: &str) -> Option<Vec<ToolCall>> {
-        for block in fenced_blocks(text) {
-            if let Some(v) = first_json_value(block.trim()) {
-                if let Some(calls) = tool_calls_from_value(&v) {
-                    return Some(calls);
-                }
-            }
+        let blocks = fenced_blocks(text);
+        // More than one block is a walkthrough, not a call.
+        if blocks.len() != 1 || !fence_is_the_whole_answer(text) {
+            return None;
         }
-        None
+        let v = first_json_value(blocks[0].trim())?;
+        tool_calls_from_value(&v)
     }
+}
+
+/// Whether the fenced block *is* the answer rather than an illustration inside
+/// one.
+///
+/// A short lead-in is allowed — models routinely prefix their only call with
+/// something like `Here you go:` — but nothing may follow the closing fence,
+/// and the lead-in must stay short enough that it cannot be an explanation. A
+/// model that writes a paragraph, shows a block, and then asks whether to
+/// proceed is *describing* the call: executing it would answer a question the
+/// user was still being asked, and the surrounding text would be dropped along
+/// the way, since a rescued result carries only the calls.
+fn fence_is_the_whole_answer(text: &str) -> bool {
+    let trimmed = text.trim();
+    // A trailing question or caveat means the block was quoted, not emitted as
+    // the turn's action.
+    if !trimmed.ends_with("```") {
+        return false;
+    }
+    let lead = trimmed.split("```").next().unwrap_or_default().trim();
+    // Generous enough for `Here you go:` or `Calling the tool now:`, far short
+    // of a paragraph of explanation.
+    const MAX_LEAD_IN: usize = 48;
+    lead.chars().count() <= MAX_LEAD_IN
 }
 
 /// Return the body of each ``` fenced block, stripping an optional language tag

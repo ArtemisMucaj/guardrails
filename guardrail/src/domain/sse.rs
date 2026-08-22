@@ -15,6 +15,23 @@ use tracing::warn;
 
 use super::decode::ToolCall;
 
+/// One item read off a backend stream.
+///
+/// A stream can end two ways, and they are not the same event: the backend
+/// finished, or the connection died partway through. Collapsing both into
+/// "no more lines" makes a truncated answer indistinguishable from a complete
+/// one — the client is handed half a sentence, or half a tool call, with a
+/// clean terminator and no indication anything went wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamItem {
+    /// One complete line of the backend's SSE body.
+    Line(String),
+    /// The backend closed the stream normally.
+    Eof,
+    /// The stream failed partway through; the text describes why.
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Default)]
 struct CallSlot {
     id: Option<String>,
@@ -45,6 +62,28 @@ pub enum AssembledResponse {
         template: Value,
         content: String,
     },
+}
+
+/// Why a stream stopped, beside what it turned out to contain.
+///
+/// Orthogonal to [`AssembledResponse`]: a stream that died can still have
+/// produced text or a partial tool call, and the caller needs both facts —
+/// what arrived, and whether it was all of it. Kept separate rather than added
+/// as a fourth variant so every existing arm keeps its meaning.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Completion {
+    /// The backend closed the stream itself; what arrived is the whole answer.
+    #[default]
+    Complete,
+    /// The stream died partway through. Whatever was assembled is a fragment.
+    Truncated(String),
+}
+
+impl Completion {
+    /// Whether the stream ended early.
+    pub fn is_truncated(&self) -> bool {
+        matches!(self, Completion::Truncated(_))
+    }
 }
 
 /// Token usage seen on a stream, independent of what the stream turned out to
@@ -108,13 +147,13 @@ pub fn parse_sse_line(line: &str) -> Option<Value> {
 /// mode before returning a response. For text streams, `kind_tx` receives `true`
 /// at EOF (after rescue detection).
 ///
-/// Returns the assembled result together with whatever token usage the backend
-/// reported on the stream.
+/// Returns the assembled result, whatever token usage the backend reported, and
+/// whether the stream actually finished.
 pub async fn assemble_stream<F>(
-    rx: &mut mpsc::Receiver<Option<String>>,
+    rx: &mut mpsc::Receiver<StreamItem>,
     mut emit_sse: F,
     kind_tx: Option<mpsc::Sender<bool>>,
-) -> (AssembledResponse, StreamUsage)
+) -> (AssembledResponse, StreamUsage, Completion)
 where
     F: FnMut(&str),
 {
@@ -124,6 +163,7 @@ where
     let mut accumulated_text = String::new();
     let mut kind_fired = false;
     let mut usage: StreamUsage = None;
+    let mut completion = Completion::Complete;
 
     let mut signal = |is_text: bool, tx: &Option<mpsc::Sender<bool>>| {
         if !kind_fired {
@@ -136,8 +176,21 @@ where
 
     loop {
         let line = match rx.recv().await {
-            Some(Some(line)) => line,
-            Some(None) | None => break,
+            Some(StreamItem::Line(line)) => line,
+            Some(StreamItem::Failed(why)) => {
+                // The sender dropping without a verdict is also a failure, but
+                // an explicit one carries the reason, so it wins.
+                completion = Completion::Truncated(why);
+                break;
+            }
+            Some(StreamItem::Eof) => break,
+            // The sender went away without saying which it was. Treating that
+            // as success would be the very assumption this type exists to stop.
+            None => {
+                completion =
+                    Completion::Truncated("the backend stream ended without a terminator".into());
+                break;
+            }
         };
 
         if line.is_empty() || line.starts_with(':') {
@@ -208,6 +261,7 @@ where
         return (
             AssembledResponse::ToolCalls { calls, template, content: accumulated_text },
             usage,
+            completion,
         );
     }
 
@@ -217,12 +271,13 @@ where
             return (
                 AssembledResponse::Rescued { parser, calls, template, content: accumulated_text },
                 usage,
+                completion,
             );
         }
     }
 
     signal(true, &kind_tx); // pure text — signal at EOF
-    (AssembledResponse::Text { template, content: accumulated_text }, usage)
+    (AssembledResponse::Text { template, content: accumulated_text }, usage, completion)
 }
 
 /// Synchronous version for tests and non-streaming paths.

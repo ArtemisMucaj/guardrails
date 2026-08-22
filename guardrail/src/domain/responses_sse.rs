@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use super::decode::ToolCall;
 use super::rescue;
-use super::sse::parse_sse_line;
+use super::sse::{parse_sse_line, Completion, StreamItem};
 
 /// Event announcing a new output item (message, reasoning, or function call).
 const ITEM_ADDED: &str = "response.output_item.added";
@@ -66,10 +66,10 @@ struct CallSlot {
 /// `false` the moment the first function call is seen, so the caller can switch
 /// to buffered mode before it has committed to a streaming response.
 pub async fn assemble_responses_stream<F>(
-    rx: &mut mpsc::Receiver<Option<String>>,
+    rx: &mut mpsc::Receiver<StreamItem>,
     mut emit_sse: F,
     kind_tx: Option<mpsc::Sender<bool>>,
-) -> (AssembledResponses, super::sse::StreamUsage)
+) -> (AssembledResponses, super::sse::StreamUsage, Completion)
 where
     F: FnMut(&str),
 {
@@ -79,6 +79,7 @@ where
     let mut has_calls = false;
     let mut kind_fired = false;
     let mut usage: super::sse::StreamUsage = None;
+    let mut completion = Completion::Complete;
     // Text deltas withheld because the text so far looks like a tool call.
     // Released if the stream ends without one being recovered.
     let mut buffered_text: Vec<String> = Vec::new();
@@ -94,8 +95,17 @@ where
 
     loop {
         let line = match rx.recv().await {
-            Some(Some(line)) => line,
-            Some(None) | None => break,
+            Some(StreamItem::Line(line)) => line,
+            Some(StreamItem::Failed(why)) => {
+                completion = Completion::Truncated(why);
+                break;
+            }
+            Some(StreamItem::Eof) => break,
+            None => {
+                completion =
+                    Completion::Truncated("the backend stream ended without a terminator".into());
+                break;
+            }
         };
 
         // Blank lines and comments frame the stream; a `event:` line names the
@@ -258,6 +268,7 @@ where
                     text,
                 },
                 usage,
+                completion,
             );
         }
     }
@@ -274,6 +285,7 @@ where
                 text,
             },
             usage,
+            completion,
         );
     }
 
@@ -283,7 +295,7 @@ where
     for held in buffered_text.drain(..) {
         emit_sse(&held);
     }
-    (AssembledResponses::Text { text, template }, usage)
+    (AssembledResponses::Text { text, template }, usage, completion)
 }
 
 #[cfg(test)]
@@ -301,15 +313,15 @@ mod tests {
     async fn assemble_usage(
         lines: &[&str],
     ) -> (AssembledResponses, String, super::super::sse::StreamUsage) {
-        let (tx, mut rx) = mpsc::channel::<Option<String>>(64);
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(64);
         for line in lines {
-            tx.send(Some((*line).to_string())).await.unwrap();
+            tx.send(StreamItem::Line((*line).to_string())).await.unwrap();
         }
-        tx.send(None).await.unwrap();
+        tx.send(StreamItem::Eof).await.unwrap();
         drop(tx);
 
         let mut forwarded = String::new();
-        let (assembled, usage) =
+        let (assembled, usage, _) =
             assemble_responses_stream(&mut rx, |s| forwarded.push_str(s), None).await;
         (assembled, forwarded, usage)
     }
@@ -430,11 +442,11 @@ mod tests {
     #[tokio::test]
     async fn the_kind_signal_reports_a_tool_call_before_the_stream_ends() {
         // The caller needs to stop streaming before it commits to a response.
-        let (tx, mut rx) = mpsc::channel::<Option<String>>(16);
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(16);
         let (kind_tx, mut kind_rx) = mpsc::channel::<bool>(4);
 
-        tx.send(Some(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"f"}}"#.to_string())).await.unwrap();
-        tx.send(None).await.unwrap();
+        tx.send(StreamItem::Line(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"f"}}"#.to_string())).await.unwrap();
+        tx.send(StreamItem::Eof).await.unwrap();
         drop(tx);
 
         let _ = assemble_responses_stream(&mut rx, |_| {}, Some(kind_tx)).await;

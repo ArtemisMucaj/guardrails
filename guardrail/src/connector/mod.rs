@@ -12,6 +12,7 @@ use axum::{
 
 use crate::application::BackendPort;
 use crate::domain::provider::Provider;
+use crate::domain::sse::StreamItem;
 
 /// Concrete backend adapter that delegates to a `reqwest::Client`.
 ///
@@ -75,7 +76,7 @@ impl BackendPort for Backend {
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
-    ) -> Result<(StatusCode, HeaderMap, tokio::sync::mpsc::Receiver<Option<String>>, bool), Response> {
+    ) -> Result<(StatusCode, HeaderMap, tokio::sync::mpsc::Receiver<StreamItem>, bool), Response> {
         use futures_util::StreamExt;
 
         let resp = self
@@ -115,7 +116,7 @@ impl BackendPort for Backend {
             .map(|s| s.contains("text/event-stream"))
             .unwrap_or(false);
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Option<String>>(256);
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamItem>(256);
 
         if is_sse {
             // True streaming path: read bytes as they arrive, split into lines,
@@ -128,24 +129,43 @@ impl BackendPort for Backend {
                 // (any accented or non-Latin text). Bytes accumulate until a
                 // line is complete, and only that line is decoded.
                 let mut buf: Vec<u8> = Vec::new();
+                let mut failure: Option<String> = None;
                 while let Some(chunk) = byte_stream.next().await {
-                    let Ok(bytes) = chunk else { break };
+                    let bytes = match chunk {
+                        Ok(bytes) => bytes,
+                        // The connection died partway through the answer. Ending
+                        // the loop quietly here is what made a cut stream look
+                        // finished; the reason travels to the assembler instead.
+                        Err(e) => {
+                            tracing::error!(error = %e, "backend stream failed mid-response");
+                            failure = Some(e.to_string());
+                            break;
+                        }
+                    };
                     buf.extend_from_slice(&bytes);
                     // Emit complete lines as they accumulate.
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                         let end = if pos > 0 && buf[pos - 1] == b'\r' { pos - 1 } else { pos };
                         let line = decode_line(&buf[..end]);
                         buf.drain(..=pos);
-                        if tx.send(Some(line)).await.is_err() {
+                        if tx.send(StreamItem::Line(line)).await.is_err() {
                             return;
                         }
                     }
                 }
-                // Flush any remaining partial line.
+                // Flush any remaining partial line. On a healthy stream this is
+                // a backend that omitted the final newline; on a failed one it
+                // is the fragment that was in flight when the connection died,
+                // and the verdict below says which.
                 if !buf.is_empty() {
-                    let _ = tx.send(Some(decode_line(&buf))).await;
+                    let _ = tx.send(StreamItem::Line(decode_line(&buf))).await;
                 }
-                let _ = tx.send(None).await; // EOF sentinel
+                let _ = tx
+                    .send(match failure {
+                        Some(why) => StreamItem::Failed(why),
+                        None => StreamItem::Eof,
+                    })
+                    .await;
             });
         } else {
             // Backend returned JSON or non-SSE — buffer it, convert, then feed
@@ -167,11 +187,13 @@ impl BackendPort for Backend {
             };
             tokio::spawn(async move {
                 for line in sse.lines() {
-                    if tx.send(Some(line.to_string())).await.is_err() {
+                    if tx.send(StreamItem::Line(line.to_string())).await.is_err() {
                         return;
                     }
                 }
-                let _ = tx.send(None).await;
+                // Synthesised from a body already read in full, so it cannot
+                // be truncated.
+                let _ = tx.send(StreamItem::Eof).await;
             });
         }
 

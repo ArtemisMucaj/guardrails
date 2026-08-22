@@ -45,7 +45,7 @@ use crate::domain::respond;
 use crate::domain::responses::{self, ResponsesRequest};
 use crate::domain::responses_sse::{assemble_responses_stream, AssembledResponses};
 use crate::domain::retry::ErrorTracker;
-use crate::domain::sse::{assemble_stream, AssembledResponse};
+use crate::domain::sse::{assemble_stream, AssembledResponse, Completion, StreamItem};
 use crate::domain::validate::{
     coerce_arguments, repair_argument_names, validate, ErrorCategory, Validation,
 };
@@ -67,7 +67,8 @@ pub trait BackendPort: Send + Sync {
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response>;
 
     /// POST with `stream: true`. Returns status, headers, a channel of raw SSE
-    /// lines (`None` = end-of-stream), and a bool indicating whether the backend
+    /// lines terminated by [`StreamItem::Eof`] or [`StreamItem::Failed`], and a
+    /// bool indicating whether the backend
     /// responded with a native `text/event-stream` (`true`) or a JSON body that
     /// was synthetically converted to SSE (`false`).
     ///
@@ -81,7 +82,7 @@ pub trait BackendPort: Send + Sync {
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
-    ) -> Result<(StatusCode, HeaderMap, mpsc::Receiver<Option<String>>, bool), Response>;
+    ) -> Result<(StatusCode, HeaderMap, mpsc::Receiver<StreamItem>, bool), Response>;
 
     async fn forward(
         &self,
@@ -377,7 +378,7 @@ async fn run_responses_guardrail(
 
         let forward_text = tracker.attempts() == 0 && is_native_sse;
         let tx = body_tx.clone();
-        let (assembled, attempt_usage) = assemble_responses_stream(
+        let (assembled, attempt_usage, completion) = assemble_responses_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -389,6 +390,20 @@ async fn run_responses_guardrail(
         .await;
         if let Some(attempt_usage) = attempt_usage {
             billed.add(attempt_usage);
+        }
+
+        // See the chat loop: a fragment must not be guarded as if it were the
+        // whole answer.
+        if let Completion::Truncated(why) = &completion {
+            warn!(reason = %why, "backend stream ended early");
+            emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("stream truncated: {why}")));
+            send_stream_error_message(
+                &body_tx,
+                StatusCode::BAD_GATEWAY,
+                "The upstream provider ended the response early.",
+            )
+            .await;
+            return;
         }
 
         // The backend names this turn on its terminal event, which the
@@ -871,7 +886,7 @@ async fn run_guardrail(
         // Run the assembler. Text lines go directly to body_tx if forward_text.
         // Tool-call lines are buffered inside the assembler.
         let tx = body_tx.clone();
-        let (assembled, attempt_usage) = assemble_stream(
+        let (assembled, attempt_usage, completion) = assemble_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -885,6 +900,23 @@ async fn run_guardrail(
         // whatever the outcome turns out to be.
         if let Some(attempt_usage) = attempt_usage {
             billed.add(attempt_usage);
+        }
+
+        // A stream that died mid-answer is a fragment, whatever it parsed as.
+        // Running the guardrails over it would validate half a tool call and
+        // spend the retry budget on a truncation the model never caused, and
+        // returning it as-is would hand the client an incomplete answer with a
+        // clean terminator and no sign anything went wrong.
+        if let Completion::Truncated(why) = &completion {
+            warn!(reason = %why, "backend stream ended early");
+            emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("stream truncated: {why}")));
+            send_stream_error_message(
+                &body_tx,
+                StatusCode::BAD_GATEWAY,
+                "The upstream provider ended the response early.",
+            )
+            .await;
+            return;
         }
 
         match assembled {
@@ -1016,9 +1048,20 @@ async fn run_guardrail(
 /// expect from a stream that fails mid-flight: a `data:` frame carrying an
 /// `error` object rather than a chunk.
 async fn send_stream_error(tx: &mpsc::Sender<String>, status: StatusCode) {
+    send_stream_error_message(tx, status, &format!("The upstream provider returned {status}.")).await
+}
+
+/// [`send_stream_error`] with the wording chosen by the caller, for failures
+/// that are not simply an upstream status — a stream that ended early carries no
+/// status of its own, since the response began as a success.
+async fn send_stream_error_message(
+    tx: &mpsc::Sender<String>,
+    status: StatusCode,
+    message: &str,
+) {
     let event = serde_json::json!({
         "error": {
-            "message": format!("The upstream provider returned {status}."),
+            "message": message,
             "type": "upstream_error",
             "code": status.as_u16(),
         }

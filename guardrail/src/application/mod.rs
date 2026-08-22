@@ -363,6 +363,13 @@ async fn run_responses_guardrail(
             match port.stream_post(&provider, &target, &headers, body_bytes).await {
                 Ok((_status, _resp_headers, rx, native)) => (rx, native),
                 Err(passthrough_resp) => {
+                    // See the chat loop: a streaming client already holds a
+                    // `200`, so a backend failure is reported in-band.
+                    let status = passthrough_resp.status();
+                    if !status.is_success() {
+                        emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                        send_stream_error(&body_tx, status).await;
+                    }
                     let _ = passthrough_tx.send(passthrough_resp);
                     return;
                 }
@@ -394,17 +401,19 @@ async fn run_responses_guardrail(
             }
         };
 
-        let (mut calls, template, rescued_parser) = match assembled {
+        let (mut calls, template, rescued_parser, rescued_text) = match assembled {
             AssembledResponses::Text { ref template, .. } => {
                 capture_id(template, &mut response_id);
                 emit_metric(billed, response_id, Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
                 return;
             }
-            AssembledResponses::Rescued { parser, calls, template } => {
+            AssembledResponses::Rescued { parser, calls, template, text } => {
                 info!(parser, count = calls.len(), "rescued tool calls from text");
-                (calls, template, Some(parser))
+                (calls, template, Some(parser), text)
             }
-            AssembledResponses::ToolCalls { calls, template, .. } => (calls, template, None),
+            AssembledResponses::ToolCalls { calls, template, .. } => {
+                (calls, template, None, String::new())
+            }
         };
         capture_id(&template, &mut response_id);
         let rescued = rescued_parser.is_some();
@@ -443,7 +452,13 @@ async fn run_responses_guardrail(
                     else if rescued { Outcome::Rescued }
                     else { Outcome::NativeValid };
                 emit_metric(billed, response_id.clone(), outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
-                send_responses_value(&body_tx, &responses::with_tool_calls(&template, &calls)).await;
+                // Text a rescue was recovered from was held back rather than
+                // forwarded, so emitting it here shows it to the client once —
+                // without the call syntax the rescue exists to hide.
+                let carried = crate::domain::rescue::prose_beside_call(&rescued_text)
+                    .unwrap_or_default();
+                let body = responses::with_tool_calls_and_text(&template, &calls, &carried);
+                send_responses_value(&body_tx, &body).await;
                 return;
             }
             Validation::NeedsRetry { category, nudge, offending } => {
@@ -832,7 +847,17 @@ async fn run_guardrail(
         let (mut sse_rx, is_native_sse) = match port.stream_post(&provider, &target, &headers, body_bytes).await {
             Ok((_status, _resp_headers, rx, native)) => (rx, native),
             Err(passthrough_resp) => {
-                // Non-JSON/non-SSE backend response — forward verbatim.
+                // A backend error or a non-JSON/non-SSE body — forward verbatim.
+                // A non-streaming client receives this response as-is. A
+                // streaming one has already been handed a `200` with SSE
+                // headers, so the status can no longer be changed; the failure
+                // is relayed in-band instead, which is what an OpenAI-compatible
+                // client reads on a stream that fails after it has begun.
+                let status = passthrough_resp.status();
+                if !status.is_success() {
+                    emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                    send_stream_error(&body_tx, status).await;
+                }
                 let _ = passthrough_tx.send(passthrough_resp);
                 return;
             }
@@ -864,9 +889,17 @@ async fn run_guardrail(
 
         match assembled {
             // ── Pure text ────────────────────────────────────────────────────
-            // Lines were already forwarded live. Just record and return.
-            AssembledResponse::Text { .. } => {
+            AssembledResponse::Text { ref template, ref content } => {
                 emit_metric(billed, None, Outcome::PassthroughNoCalls, None, None, None, tracker.attempts(), None);
+                // Live forwarding already delivered the text when it was on —
+                // but a JSON backend, or a retry, has `forward_text` off and
+                // nothing has reached the client yet. Emitting the assembled
+                // answer here is what keeps that case from returning an empty
+                // body (`null` once rebuilt for a non-streaming client).
+                if !forward_text {
+                    let value = response_with_text(template, content);
+                    send_value(&body_tx, &value).await;
+                }
                 return; // body_tx drops → stream closes
             }
 
@@ -874,9 +907,9 @@ async fn run_guardrail(
             AssembledResponse::ToolCalls { .. } | AssembledResponse::Rescued { .. } => {
                 let (mut calls, template, rescued_parser, native_content): (_, _, Option<&'static str>, String) =
                     match assembled {
-                        AssembledResponse::Rescued { parser, calls, template } => {
+                        AssembledResponse::Rescued { parser, calls, template, content } => {
                             info!(parser, count = calls.len(), "rescued tool calls from text");
-                            (calls, template, Some(parser), String::new())
+                            (calls, template, Some(parser), content)
                         }
                         AssembledResponse::ToolCalls { calls, template, content } => (calls, template, None, content),
                         AssembledResponse::Text { .. } => unreachable!(),
@@ -917,7 +950,17 @@ async fn run_guardrail(
                             else if rescued { Outcome::Rescued }
                             else { Outcome::NativeValid };
                         emit_metric(billed, None, outcome, None, rescued_parser.map(str::to_string), calls.first().map(|c| c.name.clone()), attempts, None);
-                        let value = response_with_tool_calls(&template, &calls);
+                        // A rescued call was recovered *from* the text, so what
+                        // the model wrote around it is its own answer and is
+                        // kept — minus the call syntax itself, which the rescue
+                        // exists to hide. Text that rode alongside a native
+                        // call was already forwarded live when `forward_text`
+                        // was set, and repeating it would show it twice.
+                        let carried = (rescued && !forward_text)
+                            .then(|| crate::domain::rescue::prose_beside_call(&native_content))
+                            .flatten()
+                            .unwrap_or_default();
+                        let value = crate::domain::decode::response_with_tool_calls_and_text(&template, &calls, &carried);
                         send_value(&body_tx, &value).await;
                         return;
                     }
@@ -964,6 +1007,24 @@ async fn run_guardrail(
             }
         }
     }
+}
+
+/// Relay a backend failure to a client that is already receiving a stream.
+///
+/// Once the SSE headers are out the status line is fixed, so a failure can only
+/// be reported inside the body. This is the shape OpenAI-compatible clients
+/// expect from a stream that fails mid-flight: a `data:` frame carrying an
+/// `error` object rather than a chunk.
+async fn send_stream_error(tx: &mpsc::Sender<String>, status: StatusCode) {
+    let event = serde_json::json!({
+        "error": {
+            "message": format!("The upstream provider returned {status}."),
+            "type": "upstream_error",
+            "code": status.as_u16(),
+        }
+    });
+    let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+    let _ = tx.send(format!("data: {line}\n\n")).await;
 }
 
 /// Send a chat-completion value as an SSE chunk into the body channel.
@@ -1091,8 +1152,16 @@ fn sse_chunks_to_json(sse: &str) -> Value {
     // Otherwise fall back to building a text response.
     match decode_response(&out) {
         ModelOutput::ToolCalls(calls) => {
-            use crate::domain::decode::response_with_tool_calls;
-            response_with_tool_calls(&out, &calls)
+            // Text the loop chose to keep beside the calls — a rescued call's
+            // surrounding prose — rides on the chunk's own `content`. Rebuilding
+            // with a hard `null` here would throw away what the guardrails just
+            // took care to preserve.
+            let carried = out
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            crate::domain::decode::response_with_tool_calls_and_text(&out, &calls, &carried)
         }
         ModelOutput::Text(_) => {
             response_with_text(&out, &text_content)

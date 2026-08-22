@@ -41,10 +41,13 @@ pub enum AssembledResponses {
         text: String,
     },
     /// Tool calls recovered from the model's text by a rescue parser.
+    /// `text` is what they were recovered from — kept rather than dropped, so
+    /// re-emitting the call does not delete the model's own answer.
     Rescued {
         parser: &'static str,
         calls: Vec<ToolCall>,
         template: Value,
+        text: String,
     },
 }
 
@@ -268,6 +271,7 @@ where
                 parser,
                 calls,
                 template,
+                text,
             },
             usage,
         );

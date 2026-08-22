@@ -103,6 +103,23 @@ pub fn canonical_tool_calls(calls: &[ToolCall]) -> Value {
 /// `"chat.completion"` (not `"chat.completion.chunk"`) since the rebuilt
 /// response is always a complete, non-streaming body.
 pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
+    response_with_tool_calls_and_text(template, calls, "")
+}
+
+/// [`response_with_tool_calls`], keeping assistant text the model emitted
+/// alongside the calls.
+///
+/// `content` is `null` when the text is empty, which is the canonical shape for
+/// a pure tool-call turn. When the model did write something — the usual case
+/// for a rescued call, where the calls were recovered *from* the text — it is
+/// preserved, because dropping it would delete what the model said to the user.
+/// The OpenAI schema allows both to be present, and clients that only read
+/// `tool_calls` are unaffected.
+pub fn response_with_tool_calls_and_text(
+    template: &Value,
+    calls: &[ToolCall],
+    content: &str,
+) -> Value {
     let mut out = template.clone();
     if let Some(obj) = out.as_object_mut() {
         obj.insert(
@@ -114,7 +131,7 @@ pub fn response_with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
         &mut out,
         json!({
             "role": "assistant",
-            "content": Value::Null,
+            "content": if content.is_empty() { Value::Null } else { Value::String(content.to_string()) },
             "tool_calls": canonical_tool_calls(calls),
         }),
         "tool_calls",

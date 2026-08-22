@@ -143,26 +143,33 @@ impl Config {
         Ok(providers)
     }
 
-    /// Reject an admin server exposed off-host while a credential is held.
+    /// Reject an admin server exposed off-host.
     ///
-    /// The admin server is unauthenticated by design, and with `--copilot` it
-    /// can both start a login and front a Copilot subscription. Binding it to a
-    /// non-loopback address would let anything that can reach the host use that
-    /// credential, so this is enforced rather than merely documented.
+    /// The admin server is unauthenticated by design, and it is not read-only:
+    /// the management API adds, edits, and removes providers, and a provider is
+    /// just a `base_url` that traffic is sent to. An unknown model falls back to
+    /// the default provider, so anyone who can reach the port can point the
+    /// proxy — and the prompts flowing through it — at a host they control.
+    /// `--copilot` raises the stakes further by putting a live credential behind
+    /// the same unauthenticated surface, but the management API alone is reason
+    /// enough, so this is enforced rather than merely documented.
     pub fn check_admin_exposure(&self) -> anyhow::Result<()> {
-        if !self.copilot {
+        let Some(addr) = self.admin_listen else {
+            return Ok(());
+        };
+        if addr.ip().is_loopback() {
             return Ok(());
         }
-        if let Some(addr) = self.admin_listen {
-            if !addr.ip().is_loopback() {
-                anyhow::bail!(
-                    "--admin-listen {addr} is not a loopback address, and --copilot makes the \
-                     admin server able to start a login and use a Copilot credential. Bind it to \
-                     127.0.0.1 (or [::1]) instead."
-                );
-            }
-        }
-        Ok(())
+        let credential = if self.copilot {
+            " It would also expose the Copilot login and credential."
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "--admin-listen {addr} is not a loopback address. The admin server is \
+             unauthenticated and its management API can repoint this proxy at another \
+             backend.{credential} Bind it to 127.0.0.1 (or [::1]) instead."
+        );
     }
 }
 
@@ -315,11 +322,32 @@ mod tests {
     }
 
     #[test]
-    fn without_copilot_the_admin_bind_is_unconstrained() {
-        // No credential is held, so this stays the operator's call.
-        config(&["--admin-listen", "0.0.0.0:8081"])
+    fn an_admin_server_bound_off_host_is_refused_without_copilot_too() {
+        // No credential is held, but the management API is mounted regardless
+        // and can repoint the proxy at another backend, so an unauthenticated
+        // off-host bind is refused on its own merits.
+        let error = config(&["--admin-listen", "0.0.0.0:8081"])
             .check_admin_exposure()
-            .expect("unchanged without --copilot");
+            .unwrap_err();
+        assert!(error.to_string().contains("loopback"), "got: {error}");
+        assert!(
+            !error.to_string().contains("Copilot"),
+            "the credential is not what is at stake here: {error}"
+        );
+    }
+
+    #[test]
+    fn a_loopback_admin_server_is_allowed_without_copilot() {
+        for addr in ["127.0.0.1:8081", "[::1]:8081"] {
+            config(&["--admin-listen", addr])
+                .check_admin_exposure()
+                .expect("loopback must be allowed");
+        }
+    }
+
+    #[test]
+    fn an_admin_server_that_is_not_configured_is_fine() {
+        config(&[]).check_admin_exposure().unwrap();
     }
 
     #[test]

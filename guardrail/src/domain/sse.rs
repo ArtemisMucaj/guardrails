@@ -25,15 +25,26 @@ struct CallSlot {
 /// The result of processing the complete SSE stream.
 #[derive(Debug)]
 pub enum AssembledResponse {
-    /// Stream contained only text / passthrough content. All chunks were
-    /// already forwarded to the client via `emit_sse`.
-    Text { template: Value },
+    /// Stream contained only text / passthrough content. Chunks were forwarded
+    /// to the client via `emit_sse` when the caller asked for live forwarding;
+    /// `content` is the same text assembled, which a caller that suppressed
+    /// forwarding (a JSON backend, or a retry) needs in order to answer at all.
+    Text { template: Value, content: String },
     /// Stream ended with native tool-call deltas (buffered, not forwarded).
     /// `content` holds any text the model also emitted alongside the tool calls
     /// (some models emit XML in content while also producing a native tool call).
     ToolCalls { calls: Vec<ToolCall>, template: Value, content: String },
     /// No native tool calls; accumulated text was parsed by a rescue parser.
-    Rescued { parser: &'static str, calls: Vec<ToolCall>, template: Value },
+    /// `content` is the text the calls were recovered from. A model that wrote
+    /// something around its call said it to the user, so it is carried here
+    /// rather than dropped — re-emitting only the calls would delete the
+    /// answer, and with it any question the model was still asking.
+    Rescued {
+        parser: &'static str,
+        calls: Vec<ToolCall>,
+        template: Value,
+        content: String,
+    },
 }
 
 /// Token usage seen on a stream, independent of what the stream turned out to
@@ -203,12 +214,15 @@ where
     if !accumulated_text.is_empty() {
         if let Some((parser, calls)) = crate::domain::rescue::rescue(&accumulated_text) {
             signal(false, &kind_tx); // rescue = treat like tool calls
-            return (AssembledResponse::Rescued { parser, calls, template }, usage);
+            return (
+                AssembledResponse::Rescued { parser, calls, template, content: accumulated_text },
+                usage,
+            );
         }
     }
 
     signal(true, &kind_tx); // pure text — signal at EOF
-    (AssembledResponse::Text { template }, usage)
+    (AssembledResponse::Text { template, content: accumulated_text }, usage)
 }
 
 /// Synchronous version for tests and non-streaming paths.
@@ -273,11 +287,14 @@ where
 
     if !accumulated_text.is_empty() {
         if let Some((parser, calls)) = crate::domain::rescue::rescue(&accumulated_text) {
-            return (AssembledResponse::Rescued { parser, calls, template }, usage);
+            return (
+                AssembledResponse::Rescued { parser, calls, template, content: accumulated_text },
+                usage,
+            );
         }
     }
 
-    (AssembledResponse::Text { template }, usage)
+    (AssembledResponse::Text { template, content: accumulated_text }, usage)
 }
 
 #[cfg(test)]

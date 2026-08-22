@@ -204,25 +204,40 @@ pub fn text(body: &Value) -> String {
 /// `template` supplies id, model, and any other envelope fields so the client
 /// sees a response shaped like the one the backend would have sent.
 pub fn with_tool_calls(template: &Value, calls: &[ToolCall]) -> Value {
+    with_tool_calls_and_text(template, calls, "")
+}
+
+/// [`with_tool_calls`], preceded by an assistant message carrying `text`.
+///
+/// `output[]` is ordered, so the message comes first: the model wrote it before
+/// the call it was recovered from. Empty text adds no message, which is the
+/// shape a pure tool-call turn already had.
+pub fn with_tool_calls_and_text(template: &Value, calls: &[ToolCall], text: &str) -> Value {
     let mut body = envelope(template);
-    let output: Vec<Value> = calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| {
-            let call_id = call
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("call_{index}"));
-            json!({
-                "type": FUNCTION_CALL,
-                "id": format!("fc_{index}"),
-                "call_id": call_id,
-                "name": call.name,
-                "arguments": call.arguments,
-                "status": "completed",
-            })
+    let mut output: Vec<Value> = Vec::with_capacity(calls.len() + 1);
+    if !text.is_empty() {
+        output.push(json!({
+            "type": MESSAGE,
+            "id": "msg_0",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": OUTPUT_TEXT, "text": text, "annotations": []}],
+        }));
+    }
+    output.extend(calls.iter().enumerate().map(|(index, call)| {
+        let call_id = call
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("call_{index}"));
+        json!({
+            "type": FUNCTION_CALL,
+            "id": format!("fc_{index}"),
+            "call_id": call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "status": "completed",
         })
-        .collect();
+    }));
     set(&mut body, "output", Value::Array(output));
     set(&mut body, "status", Value::String("completed".to_string()));
     body

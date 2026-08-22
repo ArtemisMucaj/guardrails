@@ -554,3 +554,65 @@ async fn the_index_advertises_the_activity_endpoint() {
         .iter()
         .any(|e| e == "/activity"));
 }
+
+#[tokio::test]
+async fn a_seconds_precision_bound_includes_its_own_boundary_row() {
+    // Rows are stored with milliseconds, and the comparison is lexicographic:
+    // `...T00:00:00.000Z` sorts BELOW `...T00:00:00Z`, because '.' (0x2E) is
+    // less than 'Z' (0x5A). So the most natural way to write a bound — the form
+    // the README documents — would silently drop the row sitting exactly on it,
+    // and the matching `until` would wrongly keep it. Half-open bounds have to
+    // mean what they say at the boundary, or two adjacent windows both miss a
+    // row that neither should.
+    let db = temp_db("boundary-precision");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(rec_at("2026-08-05T00:00:00.000Z", "m", 100, 10));
+    recorder.record(rec_at("2026-08-05T12:00:00.000Z", "m", 200, 20));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+
+    // `since` on the boundary includes the row at that instant.
+    let from: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?since=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(from["per_model"][0]["total"], 2, "the midnight row must be included");
+    assert_eq!(from["per_model"][0]["usage"]["prompt_tokens"], 300);
+
+    // `until` on the same boundary excludes it — the other half of half-open.
+    let upto: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?until=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(
+        upto["per_model"].as_array().unwrap().is_empty(),
+        "the midnight row must be excluded by an equal `until`"
+    );
+
+    // The two windows partition the data: nothing counted twice, nothing lost.
+    let later: serde_json::Value =
+        reqwest::get(format!("{admin}/stats?since=2026-08-05T12:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(later["per_model"][0]["total"], 1);
+
+    // `/activity` takes the same bounds, so it must agree.
+    let activity: serde_json::Value =
+        reqwest::get(format!("{admin}/activity?since=2026-08-05T00:00:00Z"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(activity["activity"][0]["requests"], 2);
+}

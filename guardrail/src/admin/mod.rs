@@ -210,15 +210,16 @@ struct RangeQuery {
 
 impl From<&RangeQuery> for Range {
     fn from(q: &RangeQuery) -> Self {
-        // Not validated as timestamps: the comparison is lexicographic against
-        // a fixed-width format, so a prefix like `2026-08-22` is a legitimate
-        // and useful bound. Anything that is not a prefix of a real timestamp
-        // simply selects nothing, which is the honest answer to a window that
-        // matches nothing.
-        Self {
-            since: q.since.clone(),
-            until: q.until.clone(),
-        }
+        // `Range::parse` normalizes a seconds-precision instant to the
+        // millisecond form the rows are stored in, so `...T00:00:00Z` matches
+        // its own midnight row rather than falling on the wrong side of it.
+        //
+        // Bounds are otherwise not validated as timestamps: the comparison is
+        // lexicographic against a fixed-width format, so a prefix like
+        // `2026-08-22` is a legitimate and useful bound. Anything that is not a
+        // prefix of a real timestamp simply selects nothing, which is the
+        // honest answer to a window that matches nothing.
+        Range::parse(q.since.as_deref(), q.until.as_deref())
     }
 }
 

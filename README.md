@@ -476,6 +476,13 @@ are fixed-width UTC and therefore sort chronologically. A prefix like
 timestamp simply selects nothing, which is the honest answer for a window that
 matches nothing.
 
+Rows are stored with milliseconds, so a seconds-precision instant
+(`2026-08-05T00:00:00Z`) is normalized to `2026-08-05T00:00:00.000Z` before the
+comparison. Without that it would sort *above* its own midnight row — `.` is
+below `Z` in ASCII — and a `since` on the boundary would drop the row sitting
+exactly on it while the matching `until` kept it, so two adjacent windows would
+both miss it.
+
 Deduplication survives the window. A conversation that began *before* `since`
 still resolves to its true root, so turns inside the window group together
 rather than each counting as a conversation of one — which would restore exactly
@@ -520,6 +527,12 @@ Two things to know when drawing this:
   on the boundary. Relabel client-side if that matters.
 - **A day with no traffic is absent, not zero.** The consumer already owns the
   calendar it is drawing, so the response carries only what happened.
+- **`days` bounds the work, not just the output.** `LIMIT` applies after the
+  grouping, and the group key (`substr(ts, 1, 10)`) is not something the `ts`
+  index can serve — so the read derives a `since` floor from `days` and counts
+  back from the newest *recorded* day, turning a full scan into an index range.
+  A proxy idle for a month therefore still answers with its last `days` of
+  traffic rather than an empty series. An explicit `?since=` takes precedence.
 
 `usage_requests` is what separates "no tokens" from "not measured": a day whose
 backend reported no usage still counts its requests, with the token figures at

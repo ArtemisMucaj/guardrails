@@ -351,6 +351,14 @@ async fn run_responses_guardrail(
     };
 
     loop {
+        // See the chat loop: no listener, nothing to guard for, and a retry
+        // would bill for output nobody receives.
+        if body_tx.is_closed() {
+            debug!(attempts = tracker.attempts(), "client went away; abandoning the request");
+            emit_metric(billed, response_id.clone(), Outcome::ClientDisconnected, None, None, None, tracker.attempts(), None);
+            return;
+        }
+
         let body_bytes = match serde_json::to_vec(&request) {
             Ok(b) => b,
             Err(e) => {
@@ -850,6 +858,18 @@ async fn run_guardrail(
     };
 
     loop {
+        // Nobody is listening any more, so there is nothing to guard for. This
+        // matters more here than in a plain proxy: the loop *retries*, so a
+        // client that hangs up during an invalid tool call would otherwise pay
+        // for `max_retries + 1` inferences whose output is discarded. Checked
+        // before each attempt rather than only the first, since the disconnect
+        // usually happens while an earlier attempt is in flight.
+        if body_tx.is_closed() {
+            debug!(attempts = tracker.attempts(), "client went away; abandoning the request");
+            emit_metric(billed, None, Outcome::ClientDisconnected, None, None, None, tracker.attempts(), None);
+            return;
+        }
+
         let body_bytes = match serde_json::to_vec(&request) {
             Ok(b) => b,
             Err(e) => {

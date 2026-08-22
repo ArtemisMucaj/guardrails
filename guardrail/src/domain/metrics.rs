@@ -57,6 +57,11 @@ pub enum Outcome {
     BackendError,
     /// The proxy could not serialize the (re)built request — an internal error.
     InternalError,
+    /// The client hung up before the request was answered, so the proxy stopped
+    /// working on it. Recorded rather than dropped because the attempts already
+    /// made were still billed: this is the population that shows what abandoned
+    /// requests cost.
+    ClientDisconnected,
 }
 
 impl Outcome {
@@ -76,6 +81,7 @@ impl Outcome {
             Outcome::NonJson => "non_json",
             Outcome::BackendError => "backend_error",
             Outcome::InternalError => "internal_error",
+            Outcome::ClientDisconnected => "client_disconnected",
         }
     }
 

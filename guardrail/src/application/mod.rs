@@ -373,12 +373,13 @@ async fn run_responses_guardrail(
                 Ok((_status, _resp_headers, rx, native)) => (rx, native),
                 Err(passthrough_resp) => {
                     // See the chat loop: a streaming client already holds a
-                    // `200`, so a backend failure is reported in-band.
+                    // `200`, so anything that could not be guarded — a failed
+                    // status or a `2xx` whose body was unusable — is reported
+                    // in-band rather than left as a bare `[DONE]`.
                     let status = passthrough_resp.status();
-                    if !status.is_success() {
-                        emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
-                        send_stream_error(&body_tx, status).await;
-                    }
+                    let (outcome, reported, message) = unguardable_response(status);
+                    emit_metric(billed, response_id.clone(), outcome, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                    send_stream_error_message(&body_tx, reported, &message).await;
                     let _ = passthrough_tx.send(passthrough_resp);
                     return;
                 }
@@ -888,11 +889,18 @@ async fn run_guardrail(
                 // headers, so the status can no longer be changed; the failure
                 // is relayed in-band instead, which is what an OpenAI-compatible
                 // client reads on a stream that fails after it has begun.
+                //
+                // A `2xx` lands here too, when the body was neither JSON nor
+                // SSE: the status says success but nothing guardable arrived,
+                // and a streaming client cannot be handed the verbatim body
+                // because it is already committed to an event stream. Left
+                // unreported it would see a bare `[DONE]` and read that as an
+                // empty answer, so it is described in-band like any other
+                // failure to produce a response.
                 let status = passthrough_resp.status();
-                if !status.is_success() {
-                    emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
-                    send_stream_error(&body_tx, status).await;
-                }
+                let (outcome, reported, message) = unguardable_response(status);
+                emit_metric(billed, None, outcome, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                send_stream_error_message(&body_tx, reported, &message).await;
                 let _ = passthrough_tx.send(passthrough_resp);
                 return;
             }
@@ -1061,19 +1069,42 @@ async fn run_guardrail(
     }
 }
 
+/// How a backend response that could not be guarded is reported.
+///
+/// `stream_post` takes the error path for two different situations, and a
+/// streaming client — already committed to an event stream, so unable to
+/// receive the verbatim body — needs both described in-band. A bare `[DONE]`
+/// would read as an empty answer either way.
+///
+/// Returns the outcome to record, the status to name, and the wording.
+fn unguardable_response(status: StatusCode) -> (Outcome, StatusCode, String) {
+    if status.is_success() {
+        // Success status, unusable body: neither JSON nor SSE arrived, so
+        // there is nothing to relay but the fact that it could not be read.
+        (
+            Outcome::NonJson,
+            StatusCode::BAD_GATEWAY,
+            "The upstream provider returned a response the proxy could not read.".to_string(),
+        )
+    } else {
+        (
+            Outcome::InternalError,
+            status,
+            format!("The upstream provider returned {status}."),
+        )
+    }
+}
+
 /// Relay a backend failure to a client that is already receiving a stream.
 ///
 /// Once the SSE headers are out the status line is fixed, so a failure can only
 /// be reported inside the body. This is the shape OpenAI-compatible clients
 /// expect from a stream that fails mid-flight: a `data:` frame carrying an
 /// `error` object rather than a chunk.
-async fn send_stream_error(tx: &mpsc::Sender<String>, status: StatusCode) {
-    send_stream_error_message(tx, status, &format!("The upstream provider returned {status}.")).await
-}
-
-/// [`send_stream_error`] with the wording chosen by the caller, for failures
-/// that are not simply an upstream status — a stream that ended early carries no
-/// status of its own, since the response began as a success.
+///
+/// `status` is what the frame names, which is not always the upstream's own: a
+/// stream that ended early, or a `2xx` whose body could not be read, has no
+/// failing status of its own and is reported as a `502`.
 async fn send_stream_error_message(
     tx: &mpsc::Sender<String>,
     status: StatusCode,

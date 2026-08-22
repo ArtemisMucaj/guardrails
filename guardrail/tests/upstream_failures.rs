@@ -241,3 +241,93 @@ async fn a_streaming_client_is_told_in_band_when_the_backend_fails() {
         "a failed call must not look like a text answer"
     );
 }
+
+/// The `error` frame a streaming client received, if any.
+fn error_frame(body: &str) -> Option<Value> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .find(|v| v.get("error").is_some())
+}
+
+async fn streamed_against(server: &MockServer) -> String {
+    let proxy = spawn(&server.uri()).await;
+    reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_success_status_with_an_unreadable_body_is_still_reported() {
+    // The status says the call worked, but the body is neither JSON nor SSE, so
+    // nothing guardable arrived. A streaming client is already committed to an
+    // event stream and cannot be handed the verbatim body, so without a frame
+    // of its own it would see a bare `[DONE]` and read it as an empty answer.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("not json, not sse".as_bytes(), "text/plain"),
+        )
+        .mount(&server)
+        .await;
+
+    let body = streamed_against(&server).await;
+    let error = error_frame(&body)
+        .unwrap_or_else(|| panic!("an unreadable 200 must still be described: {body}"));
+    assert_eq!(error["error"]["type"], "upstream_error");
+    assert_eq!(
+        error["error"]["code"], 502,
+        "a 2xx has no failing status of its own, so the proxy names one"
+    );
+    assert!(
+        streamed_text(&body).is_empty(),
+        "nothing readable arrived, so there is no answer to show: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_status_with_an_sse_body_is_reported_rather_than_streamed() {
+    // A native `text/event-stream` body on a non-success status used to take the
+    // success path, so the failure streamed as though the turn had worked.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_raw(
+            "data: {\"error\":\"overloaded\"}\n\n".as_bytes(),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let body = streamed_against(&server).await;
+    let error = error_frame(&body)
+        .unwrap_or_else(|| panic!("a 503 must be described even as SSE: {body}"));
+    assert_eq!(error["error"]["code"], 503, "the upstream status is kept");
+}
+
+#[tokio::test]
+async fn a_failing_status_with_a_json_body_is_reported_rather_than_assembled() {
+    // The other half: a JSON error body on a non-success status. Assembling it
+    // would find no `choices` and yield an empty text answer.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_json(json!({"error": {"message": "boom"}})),
+        )
+        .mount(&server)
+        .await;
+
+    let body = streamed_against(&server).await;
+    let error = error_frame(&body).unwrap_or_else(|| panic!("a 500 must be described: {body}"));
+    assert_eq!(error["error"]["code"], 500);
+}

@@ -313,8 +313,9 @@ struct UsageDto {
     calls_per_request: Option<f64>,
     /// Prompt tokens with resent transcript prefixes counted once — a
     /// conversation contributes its largest prompt, not the sum of its turns.
-    /// `null` when conversations cannot be reconstructed (any Chat Completions
-    /// traffic), rather than repeating the inflated sum under a better name.
+    /// `null` when conversations cannot be reconstructed — Chat Completions
+    /// without `--match-conversations` — rather than repeating the inflated
+    /// sum under a better name.
     distinct_prompt_tokens: Option<i64>,
     /// `distinct_prompt_tokens + completion_tokens`; `null` with the above.
     distinct_tokens: Option<i64>,

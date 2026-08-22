@@ -716,10 +716,11 @@ mod sqlite {
         /// contains every earlier one. Unchained requests each count in full,
         /// being conversations of one turn.
         ///
-        /// `None` when no request carried a conversation key — every Chat
-        /// Completions deployment — since there is then no basis to tell a
-        /// second turn from an unrelated request, and reporting the plain sum
-        /// as if it were deduplicated would be a lie. See [`Conversation`].
+        /// `None` when no request carried a conversation key — Chat
+        /// Completions traffic without `--match-conversations`, which is the
+        /// default — since there is then no basis to tell a second turn from
+        /// an unrelated request, and reporting the plain sum as if it were
+        /// deduplicated would be a lie. See [`Conversation`].
         pub distinct_prompt_tokens: Option<i64>,
         /// Conversations the measured requests span, when chains are known.
         pub conversations: Option<i64>,

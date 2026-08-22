@@ -393,7 +393,16 @@ The grouping is approximate, and both the report (`~`) and the `/stats` JSON
 
 - A **regenerated or edited turn** sends an array that diverges rather than
   extends, so it reads as a new conversation.
-- Two clients **replaying an identical transcript** are indistinguishable.
+- Two clients **replaying an identical transcript** are indistinguishable. A
+  resend also starts its own chain rather than continuing the request it
+  repeats, since an identical array does not *extend* anything — which is the
+  honest reading, a retry being a distinct billed request rather than a later
+  turn.
+- **Only tool-declaring requests carry a chain.** A chat request with no `tools`
+  is forwarded without the proxy reading the response, so it reports no usage
+  and no prefix — it is absent from the token figures entirely, and a client
+  that interleaves tool turns with plain chat turns sees its chain break at each
+  unguarded one.
 - **Parallel turns** on one conversation form a tree rather than a chain. That is
   handled correctly — a conversation contributes its largest prompt regardless of
   branching — and the siblings remain separable in the raw rows, since the second
@@ -472,8 +481,9 @@ database runs in WAL mode, these reads never block the proxy's writes.
         "billed_calls": 183,        // backend calls, retries included
         "requests": 168,
         "calls_per_request": 1.089,
-        // Resent prefixes counted once. null on Chat Completions, which
-        // carries no conversation key — never the inflated sum renamed.
+        // Resent prefixes counted once. On Chat Completions this is null
+        // unless --match-conversations is on, since that API carries no
+        // conversation key — never the inflated sum renamed.
         "distinct_prompt_tokens": null,
         "distinct_tokens": null,
         "conversations": null,

@@ -541,6 +541,7 @@ mod tests {
 
 pub use sqlite::{
     default_db_path, Distribution, ErrorGroup, ModelStats, RequestRow, SqliteRecorder, Stats,
+    MAX_ROWS,
 };
 
 
@@ -643,6 +644,14 @@ mod sqlite {
     /// proxy produces but a corrupted database could; well beyond any real
     /// conversation length, so it never truncates honest data.
     const MAX_CHAIN_DEPTH: u32 = 1024;
+
+    /// Hard ceiling on rows one [`Stats::read_rows`] call returns.
+    ///
+    /// A long-running proxy accumulates rows without bound, and materialising
+    /// the whole history into one `Vec` is not a useful answer for any caller.
+    /// A consumer wanting more than this should query the database directly,
+    /// which is what the file being local allows.
+    pub const MAX_ROWS: i64 = 10_000;
 
     /// Per-provider-and-model rollup, in the total → tool calls → errors
     /// hierarchy.
@@ -1191,12 +1200,21 @@ mod sqlite {
         /// The rollups answer the questions the report asks. This exposes the
         /// rows behind them so a consumer can ask its own — group by hour, by
         /// outcome, or (on Chat Completions, where the proxy has no conversation
-        /// key) by whatever key that consumer *does* have. `limit` bounds the
-        /// read so a long history cannot produce an unbounded response.
+        /// key) by whatever key that consumer *does* have.
+        ///
+        /// `limit` is clamped to `[1, MAX_ROWS]` here rather than trusted. The
+        /// bound is the method's own contract, not the caller's to keep: SQLite
+        /// reads a *negative* `LIMIT` as unbounded, so passing one through
+        /// would return the entire history — the precise thing this promises
+        /// not to do — and the guarantee would hold only for callers that
+        /// happened to validate first. Clamping rather than erroring keeps it
+        /// consistent with the HTTP handler, where a hand-typed `?limit=0` is
+        /// better answered with the nearest sane read than with a 400.
         ///
         /// Only requests that carried a usage report are returned, matching the
         /// population every token figure elsewhere is computed over.
         pub fn read_rows(path: impl AsRef<Path>, limit: i64) -> anyhow::Result<Vec<RequestRow>> {
+            let limit = limit.clamp(1, MAX_ROWS);
             if !path.as_ref().exists() {
                 return Ok(Vec::new());
             }
@@ -1484,7 +1502,7 @@ mod sqlite {
     #[cfg(test)]
     mod tests {
         use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
-        use super::{Distribution, SqliteRecorder, Stats};
+        use super::{Distribution, SqliteRecorder, Stats, MAX_ROWS};
         use crate::domain::validate::ErrorCategory;
 
         fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
@@ -2310,6 +2328,42 @@ mod sqlite {
 
             // The limit bounds the read.
             assert_eq!(Stats::read_rows(&db, 1).unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_negative_row_limit_does_not_read_the_whole_history() {
+            // SQLite reads a negative LIMIT as *unbounded*, so passing one
+            // through would return every row ever recorded — the exact thing
+            // the bounded read promises not to do. `read_rows` is public, so
+            // the guarantee has to hold here rather than only for callers that
+            // remembered to validate first.
+            let dir = std::env::temp_dir().join(format!("guardrail-limit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("limit.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            for i in 0..5 {
+                recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(100 + i, 10)));
+            }
+            drop(recorder);
+
+            // The value SQLite treats as "no limit", and an absurd one.
+            for limit in [-1, -9999, i64::MIN] {
+                let rows = Stats::read_rows(&db, limit).unwrap();
+                assert_eq!(rows.len(), 1, "limit {limit} must clamp to one row, not five");
+            }
+            // Zero clamps up to one for the same reason the handler does.
+            assert_eq!(Stats::read_rows(&db, 0).unwrap().len(), 1);
+
+            // A limit past the ceiling is capped rather than honoured, and a
+            // valid one is still passed through untouched.
+            assert_eq!(Stats::read_rows(&db, MAX_ROWS + 1).unwrap().len(), 5);
+            assert_eq!(Stats::read_rows(&db, i64::MAX).unwrap().len(), 5);
+            assert_eq!(Stats::read_rows(&db, 3).unwrap().len(), 3);
+            assert_eq!(Stats::read_rows(&db, 100).unwrap().len(), 5);
 
             let _ = std::fs::remove_dir_all(&dir);
         }

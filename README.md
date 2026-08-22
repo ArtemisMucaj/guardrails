@@ -380,7 +380,7 @@ authenticated.
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
 | `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
-| `GET /requests` | The individual recorded requests, newest first, so a consumer can group them itself. `?limit=` (default 1000, max 10000). |
+| `GET /requests` | The individual recorded requests, newest first, so a consumer can group them itself. `?limit=` (default 1000), clamped to `[1, 10000]`. |
 | `GET /providers` | Providers, their discovered models, and exposure. |
 | `POST /providers` | Add a provider. |
 | `PATCH /providers/{name}` | Change exposure for one provider. |

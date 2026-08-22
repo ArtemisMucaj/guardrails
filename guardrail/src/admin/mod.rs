@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
 
-use crate::domain::metrics::{Distribution, ErrorGroup, ModelStats, RequestRow, Stats};
+use crate::domain::metrics::{
+    Distribution, ErrorGroup, ModelStats, RequestRow, Stats, MAX_ROWS,
+};
 
 /// Static description of the running proxy, surfaced at `/info` so an embedding
 /// UI can show what it is connected to without parsing logs. Holds nothing
@@ -215,12 +217,6 @@ async fn stats(State(state): State<AdminState>) -> Response {
 /// Default number of request rows `GET /requests` returns.
 const DEFAULT_ROW_LIMIT: i64 = 1000;
 
-/// Hard ceiling on `?limit=`. A long-running proxy accumulates rows without
-/// bound, and the whole history serialized into one JSON body is not a useful
-/// response for anyone — a consumer wanting more than this should page by
-/// reading the database directly, which is what the file being local allows.
-const MAX_ROW_LIMIT: i64 = 10_000;
-
 #[derive(Deserialize)]
 struct RequestsQuery {
     limit: Option<i64>,
@@ -239,8 +235,10 @@ async fn requests(
 ) -> Response {
     // A nonsensical limit is clamped rather than rejected: this is a read-only
     // diagnostic endpoint, and answering with the sane neighbouring value is
-    // more useful than a 400 for a hand-typed URL.
-    let limit = query.limit.unwrap_or(DEFAULT_ROW_LIMIT).clamp(1, MAX_ROW_LIMIT);
+    // more useful than a 400 for a hand-typed URL. `read_rows` clamps to the
+    // same bound itself — this is here so the applied value can be echoed back
+    // in the response, not because the read depends on it.
+    let limit = query.limit.unwrap_or(DEFAULT_ROW_LIMIT).clamp(1, MAX_ROWS);
     match Stats::read_rows(&state.db_path, limit) {
         Ok(rows) => Json(RequestsResponse {
             count: rows.len(),

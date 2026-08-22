@@ -58,6 +58,75 @@ fn headers_for(provider: &Provider, headers: &HeaderMap) -> HeaderMap {
     forward_headers_reserving(headers, |name| provider.reserves(name))
 }
 
+// ── Transport retry ─────────────────────────────────────────────────────────
+//
+// Distinct from the guardrails' own retries, which answer a model that produced
+// a bad tool call. These answer a backend that did not answer at all: a refused
+// connection, a rate limit, a restarting server. The guardrail loop cannot do
+// anything useful with those — it has no response to guard — so they are
+// absorbed here, before the loop ever sees them.
+
+/// Attempts beyond the first for a request that failed in a way a retry could
+/// fix. Small on purpose: the client is waiting, and a backend that is properly
+/// down should surface as an error rather than as a long stall.
+const MAX_TRANSPORT_RETRIES: u32 = 2;
+/// First backoff, doubled per attempt.
+const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+/// Ceiling for the doubling, and for a `Retry-After` a backend asks for — an
+/// upstream must not be able to stall a request indefinitely by naming a
+/// large delay.
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a status is worth another attempt.
+///
+/// `408` and `429` are the server saying "not now"; `5xx` is it failing in a way
+/// that is often a single bad instance or a restart. Every `4xx` is the request
+/// itself being wrong, and resending it unchanged would fail identically.
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// Whether a `reqwest` failure is worth another attempt.
+///
+/// A connection that was refused, reset, or timed out never reached the model,
+/// so resending is safe and often works. A malformed URL or a body that could
+/// not be built will fail the same way every time.
+fn is_retryable_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+/// How long a backend asked us to wait, capped.
+///
+/// `Retry-After` is either a count of seconds or an HTTP date; both are
+/// accepted, and a date already in the past yields no delay.
+fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let value = headers.get(axum::http::header::RETRY_AFTER)?.to_str().ok()?;
+    let delay = match value.trim().parse::<u64>() {
+        Ok(seconds) => std::time::Duration::from_secs(seconds),
+        Err(_) => {
+            let target = httpdate::parse_http_date(value.trim()).ok()?;
+            target
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or(std::time::Duration::ZERO)
+        }
+    };
+    Some(delay.min(MAX_BACKOFF))
+}
+
+/// Delay before attempt `retry_number` (0-based), honouring `Retry-After`.
+///
+/// A backend that names a delay knows better than a fixed schedule does, so its
+/// figure wins; otherwise the wait doubles from [`INITIAL_BACKOFF`].
+fn backoff(retry_number: u32, asked_for: Option<std::time::Duration>) -> std::time::Duration {
+    asked_for.unwrap_or_else(|| {
+        INITIAL_BACKOFF
+            .saturating_mul(1 << retry_number.min(3))
+            .min(MAX_BACKOFF)
+    })
+}
+
 #[async_trait::async_trait]
 impl BackendPort for Backend {
     async fn post(
@@ -79,17 +148,58 @@ impl BackendPort for Backend {
     ) -> Result<(StatusCode, HeaderMap, tokio::sync::mpsc::Receiver<StreamItem>, bool), Response> {
         use futures_util::StreamExt;
 
-        let resp = self
-            .client_for(provider)
-            .post(target)
-            .headers(headers_for(provider, headers))
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, target = %target, "backend stream request failed");
-                (StatusCode::BAD_GATEWAY, "backend request failed").into_response()
-            })?;
+        // Retry loop. Only the request-and-status phase is retried: once a
+        // successful response starts streaming, its body has already begun
+        // reaching the client and resending would duplicate what was sent.
+        //
+        // The loop always breaks with the last attempt's outcome, retryable or
+        // not — exhausting the budget is not a separate path, it just stops the
+        // retrying. Whatever comes out is reported as it stands below.
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let sent = self
+                .client_for(provider)
+                .post(target)
+                .headers(headers_for(provider, headers))
+                .body(body.clone())
+                .send()
+                .await;
+
+            let exhausted = attempt >= MAX_TRANSPORT_RETRIES;
+            let (failure, delay) = match sent {
+                Ok(resp) => {
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    if exhausted || status.is_success() || !is_retryable_status(status) {
+                        break resp;
+                    }
+                    (
+                        format!("status {status}"),
+                        backoff(attempt, retry_after(resp.headers())),
+                    )
+                }
+                Err(e) => {
+                    if exhausted || !is_retryable_error(&e) {
+                        tracing::error!(
+                            error = %e, target = %target, attempts = attempt + 1,
+                            "backend stream request failed"
+                        );
+                        return Err(
+                            (StatusCode::BAD_GATEWAY, "backend request failed").into_response()
+                        );
+                    }
+                    (e.to_string(), backoff(attempt, None))
+                }
+            };
+
+            tracing::warn!(
+                %failure, target = %target, attempt = attempt + 1,
+                delay_ms = delay.as_millis() as u64,
+                "backend call failed; retrying"
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        };
 
         let status = StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

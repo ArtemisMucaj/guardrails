@@ -6,7 +6,9 @@
 use std::net::SocketAddr;
 
 use guardrail::admin::{build_admin_app, AdminInfo, AdminState};
-use guardrail::domain::metrics::{now_rfc3339, Outcome, OutcomeRecord, Recorder, SqliteRecorder};
+use guardrail::domain::metrics::{
+    now_rfc3339, Outcome, OutcomeRecord, Recorder, SqliteRecorder, Usage,
+};
 use guardrail::domain::validate::ErrorCategory;
 
 /// Spawn the admin server reading from `db_path`, return its base URL.
@@ -138,6 +140,135 @@ async fn stats_returns_the_metrics_rollup_as_json() {
     assert_eq!(err["tool_name"], "Edit");
     assert_eq!(err["error_category"], "missing_argument");
     assert_eq!(err["count"], 1);
+}
+
+/// A recorded request carrying a usage report.
+fn rec_usage(model: &str, prompt: i64, completion: i64) -> OutcomeRecord {
+    OutcomeRecord {
+        usage: Some(Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: 0,
+            attempts: 1,
+        }),
+        ..rec(model, Outcome::NativeValid)
+    }
+}
+
+#[tokio::test]
+async fn stats_carries_per_request_distributions_for_ungroupable_traffic() {
+    // Chat Completions cannot be grouped into conversations, so the
+    // deduplicated fields stay null. The distribution is what it does get, and
+    // it is the figure that distinguishes a uniformly-sized workload from one
+    // with a long tail — the same average describes both.
+    let db = temp_db("distribution");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    for _ in 0..9 {
+        recorder.record(rec_usage("m", 500, 50));
+    }
+    recorder.record(rec_usage("m", 100_000, 900));
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let usage = &body["per_model"][0]["usage"];
+    // Still honestly absent: there is no conversation key to group on.
+    assert!(usage["distinct_prompt_tokens"].is_null());
+    assert!(usage["conversations"].is_null());
+
+    let prompt = &usage["prompt_distribution"];
+    assert_eq!(prompt["count"], 10);
+    assert_eq!(prompt["min"], 500);
+    assert_eq!(prompt["p50"], 500);
+    assert_eq!(prompt["max"], 100_000);
+    assert_eq!(usage["completion_distribution"]["max"], 900);
+}
+
+#[tokio::test]
+async fn requests_serves_the_raw_rows_for_consumers_to_group_themselves() {
+    // The endpoint exists so a client that knows its own session boundaries can
+    // group Chat Completions traffic the proxy cannot.
+    let db = temp_db("requests");
+    let recorder = SqliteRecorder::open(&db).unwrap();
+    recorder.record(rec_usage("m", 100, 10));
+    recorder.record(rec_usage("m", 200, 20));
+    recorder.record(rec("m", Outcome::NativeValid)); // no usage reported
+    drop(recorder);
+
+    let admin = spawn_admin(db).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/requests"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["count"], 2, "the unmeasured request is not served");
+    let rows = body["requests"].as_array().unwrap();
+    // Newest first.
+    assert_eq!(rows[0]["prompt_tokens"], 200);
+    assert_eq!(rows[1]["prompt_tokens"], 100);
+    assert_eq!(rows[0]["model"], "m");
+    assert_eq!(rows[0]["provider"], "default");
+    assert_eq!(rows[0]["outcome"], "native_valid");
+    assert_eq!(rows[0]["billed_calls"], 1);
+    // Chat Completions rows carry no conversation key — that is the caller's to
+    // supply, and its absence here is the whole reason the endpoint exists.
+    assert!(rows[0]["response_id"].is_null());
+
+    // `?limit=` bounds the read, and is reported back as applied.
+    let body: serde_json::Value = reqwest::get(format!("{admin}/requests?limit=1"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["limit"], 1);
+
+    // A nonsensical limit is clamped rather than rejected: this is a read-only
+    // diagnostic a human may well hand-type.
+    let body: serde_json::Value = reqwest::get(format!("{admin}/requests?limit=0"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["limit"], 1);
+}
+
+#[tokio::test]
+async fn requests_for_a_missing_database_is_empty() {
+    // Same posture as `/stats`: the proxy may never have run.
+    let db = temp_db("norows");
+    let _ = std::fs::remove_file(&db);
+    let admin = spawn_admin(db).await;
+    let response = reqwest::get(format!("{admin}/requests")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 0);
+    assert!(body["requests"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_index_advertises_the_requests_endpoint() {
+    // The port is meant to be self-describing; a new route that is not listed
+    // is a route nobody finds.
+    let admin = spawn_admin(temp_db("index")).await;
+    let body: serde_json::Value = reqwest::get(format!("{admin}/"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let endpoints = body["endpoints"].as_array().unwrap();
+    assert!(endpoints.iter().any(|e| e == "/requests"), "got: {endpoints:?}");
 }
 
 #[tokio::test]

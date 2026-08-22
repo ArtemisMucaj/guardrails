@@ -539,7 +539,9 @@ mod tests {
     }
 }
 
-pub use sqlite::{default_db_path, ErrorGroup, ModelStats, SqliteRecorder, Stats};
+pub use sqlite::{
+    default_db_path, Distribution, ErrorGroup, ModelStats, RequestRow, SqliteRecorder, Stats,
+};
 
 
 mod sqlite {
@@ -683,6 +685,13 @@ mod sqlite {
         pub distinct_prompt_tokens: Option<i64>,
         /// Conversations the measured requests span, when chains are known.
         pub conversations: Option<i64>,
+        /// Spread of per-request prompt tokens, over the requests that reported
+        /// usage. Available for all traffic, chained or not: it describes
+        /// single requests, so it needs no conversation key. `None` when no
+        /// request reported usage.
+        pub prompt_distribution: Option<Distribution>,
+        /// Spread of per-request completion tokens, same population.
+        pub completion_distribution: Option<Distribution>,
     }
 
     impl ModelStats {
@@ -743,6 +752,103 @@ mod sqlite {
                 Some(self.succeeded() as f64 / self.tool_calls as f64)
             }
         }
+    }
+
+    /// How a single figure was spread across the requests that reported it.
+    ///
+    /// Sums answer "what did this cost in total"; they say nothing about the
+    /// shape of the traffic. A model averaging 4k prompt tokens over a thousand
+    /// requests is a different workload depending on whether every request is
+    /// 4k or most are 500 and a handful are 100k, and only the second is worth
+    /// tuning a context budget around. The percentiles make that visible
+    /// without needing to know which requests belonged together — which is
+    /// exactly what Chat Completions cannot tell us (see
+    /// [`ModelStats::distinct_prompt_tokens`]).
+    ///
+    /// Every field is over the same population: the requests that carried a
+    /// usage report, one entry per request (not per backend attempt — a retried
+    /// request is one row whose totals span its attempts).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Distribution {
+        /// Requests the percentiles are computed over.
+        pub count: i64,
+        /// Smallest value observed.
+        pub min: i64,
+        /// Median.
+        pub p50: i64,
+        /// 90th percentile.
+        pub p90: i64,
+        /// 99th percentile — where the context-blowing outliers show up.
+        pub p99: i64,
+        /// Largest value observed.
+        pub max: i64,
+    }
+
+    impl Distribution {
+        /// Summarise a set of per-request values.
+        ///
+        /// Returns `None` for an empty input rather than a zeroed struct, so
+        /// "no requests reported usage" stays distinguishable from "every
+        /// request reported zero" — the same distinction the `Option` fields on
+        /// [`ModelStats`] preserve.
+        pub fn of(values: &mut [i64]) -> Option<Self> {
+            if values.is_empty() {
+                return None;
+            }
+            values.sort_unstable();
+            Some(Self {
+                count: values.len() as i64,
+                min: values[0],
+                p50: percentile(values, 50),
+                p90: percentile(values, 90),
+                p99: percentile(values, 99),
+                max: values[values.len() - 1],
+            })
+        }
+    }
+
+    /// Nearest-rank percentile of an already-sorted slice.
+    ///
+    /// Nearest-rank rather than an interpolating definition because every value
+    /// here is a token count actually observed on some request: reporting a p90
+    /// of 4096.5 tokens would name a request that does not exist. The rank is
+    /// the ceiling of `p/100 * n`, clamped into the slice, so `p99` of a short
+    /// series is its largest element rather than an out-of-bounds index.
+    fn percentile(sorted: &[i64], p: i64) -> i64 {
+        debug_assert!(!sorted.is_empty());
+        let n = sorted.len() as i64;
+        // Ceiling division, then to a 0-based index; `max(1)` keeps p0 in range.
+        let rank = ((p * n) + 99) / 100;
+        let index = (rank.max(1) - 1).min(n - 1) as usize;
+        sorted[index]
+    }
+
+    /// One recorded request, as stored.
+    ///
+    /// The rollups above answer fixed questions. This is the underlying row, so
+    /// a consumer that wants a different grouping — by hour, by outcome, a
+    /// histogram with its own buckets — can compute it rather than asking for
+    /// another aggregate to be added here. Only requests that carried a usage
+    /// report are exposed, since the token fields are the point.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RequestRow {
+        /// RFC3339 UTC timestamp of the outcome.
+        pub ts: String,
+        pub provider: String,
+        pub model: String,
+        /// Terminal outcome tag (see [`super::Outcome::as_str`]).
+        pub outcome: String,
+        pub prompt_tokens: i64,
+        pub completion_tokens: i64,
+        pub cached_tokens: i64,
+        /// Backend calls this request made, retries included.
+        pub billed_calls: i64,
+        /// This turn's conversation id, when the API supplied one. Always
+        /// absent on Chat Completions — a consumer grouping these rows has to
+        /// supply its own key there.
+        pub response_id: Option<String>,
+        /// The turn this one continues, when known.
+        pub parent_id: Option<String>,
     }
 
     /// One group of identical errors the guardrails could not fix, awaiting
@@ -846,11 +952,15 @@ mod sqlite {
                     // Filled by the deduplication pass below.
                     distinct_prompt_tokens: None,
                     conversations: None,
+                    // Filled by the distribution pass below.
+                    prompt_distribution: None,
+                    completion_distribution: None,
                 })
             })?;
             let mut per_model: Vec<ModelStats> = rows.collect::<rusqlite::Result<_>>()?;
 
             Self::fold_distinct_prompts(&conn, &column, &provider_col, &mut per_model)?;
+            Self::fold_distributions(&conn, &prompt, &completion, &provider_col, &mut per_model)?;
 
             // Outcome breakdown per provider and model, folded into the rows
             // above.
@@ -1015,6 +1125,125 @@ mod sqlite {
             Ok(())
         }
 
+        /// Fold per-request token distributions into `per_model`.
+        ///
+        /// Unlike the deduplication pass this needs no conversation key: a
+        /// percentile describes single requests, so it is computed the same way
+        /// for Chat Completions and Responses traffic. It is the answer
+        /// available to *all* traffic when grouping is not.
+        ///
+        /// Percentiles are computed in Rust rather than SQL because SQLite has
+        /// no percentile function in its default build, and the alternative —
+        /// `LIMIT`/`OFFSET` against an ordered subquery, once per percentile
+        /// per model — is several round trips to say what one pass over the
+        /// values says directly.
+        fn fold_distributions(
+            conn: &Connection,
+            prompt_col: &str,
+            completion_col: &str,
+            provider_col: &str,
+            per_model: &mut [ModelStats],
+        ) -> anyhow::Result<()> {
+            // A database predating the token columns selects them as NULL;
+            // there are no per-request values to summarise.
+            if prompt_col == "NULL" || completion_col == "NULL" {
+                return Ok(());
+            }
+            let query = format!(
+                "SELECT COALESCE({provider_col}, 'unknown'), model, \
+                    {prompt_col}, {completion_col} \
+                 FROM outcomes WHERE {prompt_col} IS NOT NULL"
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ))
+            })?;
+
+            // Collect per (provider, model), then summarise once each. Keyed by
+            // the row's index in `per_model` so the lookup happens once per row
+            // rather than once per percentile.
+            let mut prompts: Vec<Vec<i64>> = vec![Vec::new(); per_model.len()];
+            let mut completions: Vec<Vec<i64>> = vec![Vec::new(); per_model.len()];
+            for row in rows {
+                let (provider, model, prompt, completion) = row?;
+                if let Some(i) = per_model
+                    .iter()
+                    .position(|m| m.provider == provider && m.model == model)
+                {
+                    prompts[i].push(prompt);
+                    completions[i].push(completion);
+                }
+            }
+            for (i, m) in per_model.iter_mut().enumerate() {
+                m.prompt_distribution = Distribution::of(&mut prompts[i]);
+                m.completion_distribution = Distribution::of(&mut completions[i]);
+            }
+            Ok(())
+        }
+
+        /// Read the individual recorded requests, most recent first.
+        ///
+        /// The rollups answer the questions the report asks. This exposes the
+        /// rows behind them so a consumer can ask its own — group by hour, by
+        /// outcome, or (on Chat Completions, where the proxy has no conversation
+        /// key) by whatever key that consumer *does* have. `limit` bounds the
+        /// read so a long history cannot produce an unbounded response.
+        ///
+        /// Only requests that carried a usage report are returned, matching the
+        /// population every token figure elsewhere is computed over.
+        pub fn read_rows(path: impl AsRef<Path>, limit: i64) -> anyhow::Result<Vec<RequestRow>> {
+            if !path.as_ref().exists() {
+                return Ok(Vec::new());
+            }
+            let conn = Connection::open(path.as_ref())?;
+            // Every column this reads arrived in one migration, but checking
+            // the one the query needs first — rather than assuming the rest
+            // followed — keeps an unexpected schema returning nothing instead
+            // of erroring the whole request out.
+            let present = |name: &str| -> bool {
+                conn.prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = ?1")
+                    .and_then(|mut s| s.exists([name]))
+                    .unwrap_or(false)
+            };
+            if !["prompt_tokens", "response_id"].iter().all(|c| present(c)) {
+                // A database predating the token columns has no rows to serve
+                // here; the outcome history is still readable through `read`.
+                return Ok(Vec::new());
+            }
+
+            // Ordered by `id` rather than `ts`: the timestamp has one-second
+            // resolution, so a burst shares one value and would order
+            // arbitrarily. The primary key is monotonic in insertion order,
+            // which is the order the rows actually happened in.
+            let mut stmt = conn.prepare(
+                "SELECT ts, COALESCE(provider, 'unknown'), model, outcome, \
+                    prompt_tokens, completion_tokens, cached_tokens, billed_calls, \
+                    response_id, parent_id \
+                 FROM outcomes WHERE prompt_tokens IS NOT NULL \
+                 ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit], |r| {
+                Ok(RequestRow {
+                    ts: r.get(0)?,
+                    provider: r.get(1)?,
+                    model: r.get(2)?,
+                    outcome: r.get(3)?,
+                    prompt_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    completion_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    cached_tokens: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    billed_calls: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    response_id: r.get(8)?,
+                    parent_id: r.get(9)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        }
+
         /// Render a plain-text report for the CLI.
         pub fn render(&self) -> String {
             use std::fmt::Write;
@@ -1085,6 +1314,24 @@ mod sqlite {
                         let _ = writeln!(
                             out,
                             "  distinct tokens: {distinct} over {conversations} conversation(s)",
+                        );
+                    }
+                    // Per-request spread. Unlike the line above this needs no
+                    // conversation key, so it is the shape Chat Completions
+                    // traffic does get — a sum says what the traffic cost, the
+                    // percentiles say what it looked like.
+                    if let Some(d) = m.prompt_distribution {
+                        let _ = writeln!(
+                            out,
+                            "  prompt per request:     min {} | p50 {} | p90 {} | p99 {} | max {}",
+                            d.min, d.p50, d.p90, d.p99, d.max,
+                        );
+                    }
+                    if let Some(d) = m.completion_distribution {
+                        let _ = writeln!(
+                            out,
+                            "  completion per request: min {} | p50 {} | p90 {} | p99 {} | max {}",
+                            d.min, d.p50, d.p90, d.p99, d.max,
                         );
                     }
                 }
@@ -1237,7 +1484,7 @@ mod sqlite {
     #[cfg(test)]
     mod tests {
         use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
-        use super::{SqliteRecorder, Stats};
+        use super::{Distribution, SqliteRecorder, Stats};
         use crate::domain::validate::ErrorCategory;
 
         fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
@@ -1653,7 +1900,9 @@ mod sqlite {
         fn chat_completions_traffic_reports_no_deduplication_rather_than_a_false_one() {
             // Chat Completions carries no conversation key, so resends are
             // invisible. Reporting the inflated sum as "distinct" would be a
-            // lie; absence is the honest answer.
+            // lie; absence is the honest answer. What it *does* get is the
+            // per-request distribution, which needs no such key — see
+            // `per_request_distributions_are_reported_without_a_conversation_key`.
             let dir = std::env::temp_dir().join(format!("guardrail-nochain-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let db = dir.join("nochain.sqlite");
@@ -1878,6 +2127,225 @@ mod sqlite {
             let m = &stats.per_model[0];
             assert_eq!(m.total, 1);
             assert_eq!(m.billed_tokens(), 10);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn per_request_distributions_are_reported_without_a_conversation_key() {
+            // The gap this closes. Chat Completions cannot be grouped into
+            // conversations, so `distinct_prompt_tokens` stays absent — but the
+            // spread of individual requests needs no grouping at all, and it is
+            // what says whether a 4k average is every request or a long tail.
+            let dir = std::env::temp_dir().join(format!("guardrail-dist-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("dist.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            // Nine small requests and one very large one: the same shape a
+            // sum-and-average would flatten into "1.4k average, nothing to see".
+            for _ in 0..9 {
+                recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(500, 50)));
+            }
+            recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(100_000, 900)));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+
+            // Grouping is still impossible, and still reported as such.
+            assert_eq!(m.distinct_prompt_tokens, None);
+            assert_eq!(m.conversations, None);
+
+            let d = m.prompt_distribution.expect("prompt distribution");
+            assert_eq!(d.count, 10);
+            assert_eq!(d.min, 500);
+            assert_eq!(d.p50, 500, "the median request is small");
+            assert_eq!(d.max, 100_000, "and the outlier is visible");
+            // The average alone (10.4k) describes neither of those requests.
+            assert!(d.p50 < 1_000 && d.max > 50_000);
+
+            let c = m.completion_distribution.expect("completion distribution");
+            assert_eq!(c.count, 10);
+            assert_eq!(c.min, 50);
+            assert_eq!(c.max, 900);
+
+            // And the report shows them.
+            let report = stats.render();
+            assert!(report.contains("prompt per request"), "got: {report}");
+            assert!(report.contains("completion per request"));
+            assert!(!report.contains("distinct tokens"), "still not deduplicated");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn percentiles_name_values_that_were_actually_observed() {
+            // Nearest-rank, not interpolated: every figure in the report is a
+            // token count some real request had. An interpolating definition
+            // would report a p90 of 4096.5 tokens — a request that never
+            // happened.
+            let mut values: Vec<i64> = (1..=100).collect();
+            let d = Distribution::of(&mut values).expect("100 values");
+            assert_eq!(d.count, 100);
+            assert_eq!(d.min, 1);
+            assert_eq!(d.p50, 50);
+            assert_eq!(d.p90, 90);
+            assert_eq!(d.p99, 99);
+            assert_eq!(d.max, 100);
+
+            // A single request is its own every percentile, rather than
+            // indexing past the end of the series.
+            let d = Distribution::of(&mut [42]).expect("one value");
+            assert_eq!((d.count, d.min, d.p50, d.p99, d.max), (1, 42, 42, 42, 42));
+
+            // Two values: p50 is the lower, p99 the upper — no rank escapes
+            // the slice in either direction.
+            let d = Distribution::of(&mut [10, 20]).expect("two values");
+            assert_eq!((d.p50, d.p90, d.p99, d.max), (10, 20, 20, 20));
+
+            // Unsorted input is summarised by value, not by arrival order.
+            let d = Distribution::of(&mut [900, 100, 500]).expect("three values");
+            assert_eq!((d.min, d.p50, d.max), (100, 500, 900));
+
+            // No requests is absence, not a zeroed distribution.
+            assert_eq!(Distribution::of(&mut []), None);
+        }
+
+        #[test]
+        fn a_model_without_usage_reports_has_no_distribution() {
+            // Same reasoning as the other `Option` fields: an unmeasured model
+            // must read as unmeasured, not as a model whose every request was
+            // zero tokens.
+            let dir = std::env::temp_dir().join(format!("guardrail-nodist-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("nodist.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec("m", Outcome::NativeValid));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.total, 1);
+            assert_eq!(m.prompt_distribution, None);
+            assert_eq!(m.completion_distribution, None);
+            assert!(!stats.render().contains("per request"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn distributions_are_kept_separate_per_provider_and_model() {
+            // A percentile pooled across two providers describes neither. Same
+            // reasoning as the per-(provider, model) rollup itself.
+            let dir = std::env::temp_dir().join(format!("guardrail-distsep-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("distsep.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            for _ in 0..3 {
+                recorder.record(OutcomeRecord {
+                    usage: Some(usage_of(100, 10)),
+                    ..rec_from("small", "gpt-4o", Outcome::NativeValid)
+                });
+                recorder.record(OutcomeRecord {
+                    usage: Some(usage_of(9_000, 800)),
+                    ..rec_from("large", "gpt-4o", Outcome::NativeValid)
+                });
+            }
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let small = stats
+                .per_model
+                .iter()
+                .find(|m| m.provider == "small")
+                .expect("small provider");
+            let large = stats
+                .per_model
+                .iter()
+                .find(|m| m.provider == "large")
+                .expect("large provider");
+
+            assert_eq!(small.prompt_distribution.unwrap().max, 100);
+            assert_eq!(large.prompt_distribution.unwrap().min, 9_000);
+            assert_eq!(small.prompt_distribution.unwrap().count, 3);
+            assert_eq!(large.prompt_distribution.unwrap().count, 3);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn raw_rows_are_exposed_newest_first_for_consumers_to_group_themselves() {
+            // The proxy cannot group Chat Completions into conversations, but a
+            // client that knows its own session boundaries can. Serving the
+            // rows lets it, instead of waiting for another aggregate here.
+            let dir = std::env::temp_dir().join(format!("guardrail-rows-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("rows.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            recorder.record(rec_with_usage("m", Outcome::NativeValid, usage_of(100, 10)));
+            recorder.record(rec_with_usage("m", Outcome::RetriesExhausted, usage_of(200, 20)));
+            // No usage reported: not part of the measured population.
+            recorder.record(rec("m", Outcome::NativeValid));
+            drop(recorder);
+
+            let rows = Stats::read_rows(&db, 100).unwrap();
+            assert_eq!(rows.len(), 2, "the unmeasured request is not served");
+            // Newest first, by insertion order rather than the one-second
+            // timestamp, which a burst shares.
+            assert_eq!(rows[0].prompt_tokens, 200);
+            assert_eq!(rows[0].outcome, "retries_exhausted");
+            assert_eq!(rows[1].prompt_tokens, 100);
+            assert_eq!(rows[0].provider, "default");
+            // Chat Completions rows carry no conversation key, which is exactly
+            // what the consumer has to supply itself.
+            assert_eq!(rows[0].response_id, None);
+
+            // The limit bounds the read.
+            assert_eq!(Stats::read_rows(&db, 1).unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn reading_rows_from_a_database_without_token_columns_is_empty_not_an_error() {
+            // Same posture as `read`: an older database reports what it has
+            // rather than failing the command outright.
+            let dir = std::env::temp_dir().join(format!("guardrail-oldrows-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("oldrows.sqlite");
+            let _ = std::fs::remove_file(&db);
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE outcomes (\
+                        id INTEGER PRIMARY KEY, ts TEXT NOT NULL, model TEXT NOT NULL,\
+                        outcome TEXT NOT NULL, error_category TEXT, parser TEXT,\
+                        tool_name TEXT, retries INTEGER NOT NULL DEFAULT 0,\
+                        fixed INTEGER NOT NULL, detail TEXT);\
+                     INSERT INTO outcomes (ts, model, outcome, retries, fixed) \
+                        VALUES ('t', 'old-model', 'native_valid', 0, 1);",
+                )
+                .unwrap();
+            }
+
+            assert!(Stats::read_rows(&db, 100).unwrap().is_empty());
+            // And the aggregate read still degrades rather than failing.
+            assert!(Stats::read(&db).unwrap().per_model[0]
+                .prompt_distribution
+                .is_none());
+
+            // A database that was never created reads as empty too.
+            assert!(Stats::read_rows(dir.join("absent.sqlite"), 100)
+                .unwrap()
+                .is_empty());
 
             let _ = std::fs::remove_dir_all(&dir);
         }

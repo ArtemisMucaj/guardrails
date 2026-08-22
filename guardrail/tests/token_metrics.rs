@@ -548,6 +548,7 @@ async fn a_responses_chain_is_not_marked_approximate() {
             prompt_tokens: prompt,
             completion_tokens: 10,
             cached_tokens: 0,
+            reasoning_tokens: 0,
             attempts: 1,
         }),
         conversation: Some(Conversation { id: id.into(), parent: parent.map(str::to_string) }),

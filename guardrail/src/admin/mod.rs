@@ -376,6 +376,10 @@ struct UsageDto {
     billed_tokens: i64,
     /// Of `prompt_tokens`, the portion served from the prompt cache.
     cached_tokens: i64,
+    /// Of `completion_tokens`, the portion a reasoning model spent thinking —
+    /// billed as output but never shown to the client. `0` from models that do
+    /// not reason, and from rows recorded before this was measured.
+    reasoning_tokens: i64,
     /// Of `prompt_tokens`, the portion billed at full rate.
     uncached_prompt_tokens: i64,
     /// Cache hit rate over prompt tokens in `[0, 1]`, `null` without any.
@@ -561,6 +565,7 @@ impl From<ModelStats> for ModelStatsDto {
             completion_tokens: m.usage.completion_tokens,
             billed_tokens: m.billed_tokens(),
             cached_tokens: m.usage.cached_tokens,
+            reasoning_tokens: m.usage.reasoning_tokens,
             uncached_prompt_tokens: m.usage.uncached_prompt_tokens(),
             cache_hit_rate: m.cache_hit_rate(),
             billed_calls: m.usage.attempts,

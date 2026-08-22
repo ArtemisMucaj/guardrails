@@ -45,7 +45,7 @@ use crate::domain::respond;
 use crate::domain::responses::{self, ResponsesRequest};
 use crate::domain::responses_sse::{assemble_responses_stream, AssembledResponses};
 use crate::domain::retry::ErrorTracker;
-use crate::domain::sse::{assemble_stream, AssembledResponse};
+use crate::domain::sse::{assemble_stream, AssembledResponse, Completion, StreamItem};
 use crate::domain::validate::{
     coerce_arguments, repair_argument_names, validate, ErrorCategory, Validation,
 };
@@ -67,7 +67,8 @@ pub trait BackendPort: Send + Sync {
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>), Response>;
 
     /// POST with `stream: true`. Returns status, headers, a channel of raw SSE
-    /// lines (`None` = end-of-stream), and a bool indicating whether the backend
+    /// lines terminated by [`StreamItem::Eof`] or [`StreamItem::Failed`], and a
+    /// bool indicating whether the backend
     /// responded with a native `text/event-stream` (`true`) or a JSON body that
     /// was synthetically converted to SSE (`false`).
     ///
@@ -81,7 +82,7 @@ pub trait BackendPort: Send + Sync {
         target: &str,
         headers: &HeaderMap,
         body: Vec<u8>,
-    ) -> Result<(StatusCode, HeaderMap, mpsc::Receiver<Option<String>>, bool), Response>;
+    ) -> Result<(StatusCode, HeaderMap, mpsc::Receiver<StreamItem>, bool), Response>;
 
     async fn forward(
         &self,
@@ -350,6 +351,14 @@ async fn run_responses_guardrail(
     };
 
     loop {
+        // See the chat loop: no listener, nothing to guard for, and a retry
+        // would bill for output nobody receives.
+        if body_tx.is_closed() {
+            debug!(attempts = tracker.attempts(), "client went away; abandoning the request");
+            emit_metric(billed, response_id.clone(), Outcome::ClientDisconnected, None, None, None, tracker.attempts(), None);
+            return;
+        }
+
         let body_bytes = match serde_json::to_vec(&request) {
             Ok(b) => b,
             Err(e) => {
@@ -364,12 +373,13 @@ async fn run_responses_guardrail(
                 Ok((_status, _resp_headers, rx, native)) => (rx, native),
                 Err(passthrough_resp) => {
                     // See the chat loop: a streaming client already holds a
-                    // `200`, so a backend failure is reported in-band.
+                    // `200`, so anything that could not be guarded — a failed
+                    // status or a `2xx` whose body was unusable — is reported
+                    // in-band rather than left as a bare `[DONE]`.
                     let status = passthrough_resp.status();
-                    if !status.is_success() {
-                        emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
-                        send_stream_error(&body_tx, status).await;
-                    }
+                    let (outcome, reported, message) = unguardable_response(status);
+                    emit_metric(billed, response_id.clone(), outcome, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                    send_stream_error_message(&body_tx, reported, &message).await;
                     let _ = passthrough_tx.send(passthrough_resp);
                     return;
                 }
@@ -377,7 +387,7 @@ async fn run_responses_guardrail(
 
         let forward_text = tracker.attempts() == 0 && is_native_sse;
         let tx = body_tx.clone();
-        let (assembled, attempt_usage) = assemble_responses_stream(
+        let (assembled, attempt_usage, completion) = assemble_responses_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -389,6 +399,20 @@ async fn run_responses_guardrail(
         .await;
         if let Some(attempt_usage) = attempt_usage {
             billed.add(attempt_usage);
+        }
+
+        // See the chat loop: a fragment must not be guarded as if it were the
+        // whole answer.
+        if let Completion::Truncated(why) = &completion {
+            warn!(reason = %why, "backend stream ended early");
+            emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("stream truncated: {why}")));
+            send_stream_error_message(
+                &body_tx,
+                StatusCode::BAD_GATEWAY,
+                "The upstream provider ended the response early.",
+            )
+            .await;
+            return;
         }
 
         // The backend names this turn on its terminal event, which the
@@ -813,8 +837,8 @@ async fn run_guardrail(
     // `request.messages`, and hashing the rewritten array would describe a
     // transcript the client never sent: the next real turn extends what the
     // client sent, not what the guardrails asked in between, and would fail to
-    // match. This is the one place the metrics path reads message content, and
-    // it reads it only to hash: the digests are what is stored, never the text.
+    // match. Captured only when matching is enabled -- this is the one place
+    // the metrics path reads message content, so it does not happen by default.
     let prefix_chain = Some(PrefixChain::of(&request.messages));
 
     let emit_metric = |billed: Usage,
@@ -835,6 +859,18 @@ async fn run_guardrail(
     };
 
     loop {
+        // Nobody is listening any more, so there is nothing to guard for. This
+        // matters more here than in a plain proxy: the loop *retries*, so a
+        // client that hangs up during an invalid tool call would otherwise pay
+        // for `max_retries + 1` inferences whose output is discarded. Checked
+        // before each attempt rather than only the first, since the disconnect
+        // usually happens while an earlier attempt is in flight.
+        if body_tx.is_closed() {
+            debug!(attempts = tracker.attempts(), "client went away; abandoning the request");
+            emit_metric(billed, None, Outcome::ClientDisconnected, None, None, None, tracker.attempts(), None);
+            return;
+        }
+
         let body_bytes = match serde_json::to_vec(&request) {
             Ok(b) => b,
             Err(e) => {
@@ -853,11 +889,18 @@ async fn run_guardrail(
                 // headers, so the status can no longer be changed; the failure
                 // is relayed in-band instead, which is what an OpenAI-compatible
                 // client reads on a stream that fails after it has begun.
+                //
+                // A `2xx` lands here too, when the body was neither JSON nor
+                // SSE: the status says success but nothing guardable arrived,
+                // and a streaming client cannot be handed the verbatim body
+                // because it is already committed to an event stream. Left
+                // unreported it would see a bare `[DONE]` and read that as an
+                // empty answer, so it is described in-band like any other
+                // failure to produce a response.
                 let status = passthrough_resp.status();
-                if !status.is_success() {
-                    emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
-                    send_stream_error(&body_tx, status).await;
-                }
+                let (outcome, reported, message) = unguardable_response(status);
+                emit_metric(billed, None, outcome, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                send_stream_error_message(&body_tx, reported, &message).await;
                 let _ = passthrough_tx.send(passthrough_resp);
                 return;
             }
@@ -871,7 +914,7 @@ async fn run_guardrail(
         // Run the assembler. Text lines go directly to body_tx if forward_text.
         // Tool-call lines are buffered inside the assembler.
         let tx = body_tx.clone();
-        let (assembled, attempt_usage) = assemble_stream(
+        let (assembled, attempt_usage, completion) = assemble_stream(
             &mut sse_rx,
             |line: &str| {
                 if forward_text {
@@ -885,6 +928,23 @@ async fn run_guardrail(
         // whatever the outcome turns out to be.
         if let Some(attempt_usage) = attempt_usage {
             billed.add(attempt_usage);
+        }
+
+        // A stream that died mid-answer is a fragment, whatever it parsed as.
+        // Running the guardrails over it would validate half a tool call and
+        // spend the retry budget on a truncation the model never caused, and
+        // returning it as-is would hand the client an incomplete answer with a
+        // clean terminator and no sign anything went wrong.
+        if let Completion::Truncated(why) = &completion {
+            warn!(reason = %why, "backend stream ended early");
+            emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("stream truncated: {why}")));
+            send_stream_error_message(
+                &body_tx,
+                StatusCode::BAD_GATEWAY,
+                "The upstream provider ended the response early.",
+            )
+            .await;
+            return;
         }
 
         match assembled {
@@ -1009,16 +1069,50 @@ async fn run_guardrail(
     }
 }
 
+/// How a backend response that could not be guarded is reported.
+///
+/// `stream_post` takes the error path for two different situations, and a
+/// streaming client — already committed to an event stream, so unable to
+/// receive the verbatim body — needs both described in-band. A bare `[DONE]`
+/// would read as an empty answer either way.
+///
+/// Returns the outcome to record, the status to name, and the wording.
+fn unguardable_response(status: StatusCode) -> (Outcome, StatusCode, String) {
+    if status.is_success() {
+        // Success status, unusable body: neither JSON nor SSE arrived, so
+        // there is nothing to relay but the fact that it could not be read.
+        (
+            Outcome::NonJson,
+            StatusCode::BAD_GATEWAY,
+            "The upstream provider returned a response the proxy could not read.".to_string(),
+        )
+    } else {
+        (
+            Outcome::InternalError,
+            status,
+            format!("The upstream provider returned {status}."),
+        )
+    }
+}
+
 /// Relay a backend failure to a client that is already receiving a stream.
 ///
 /// Once the SSE headers are out the status line is fixed, so a failure can only
 /// be reported inside the body. This is the shape OpenAI-compatible clients
 /// expect from a stream that fails mid-flight: a `data:` frame carrying an
 /// `error` object rather than a chunk.
-async fn send_stream_error(tx: &mpsc::Sender<String>, status: StatusCode) {
+///
+/// `status` is what the frame names, which is not always the upstream's own: a
+/// stream that ended early, or a `2xx` whose body could not be read, has no
+/// failing status of its own and is reported as a `502`.
+async fn send_stream_error_message(
+    tx: &mpsc::Sender<String>,
+    status: StatusCode,
+    message: &str,
+) {
     let event = serde_json::json!({
         "error": {
-            "message": format!("The upstream provider returned {status}."),
+            "message": message,
             "type": "upstream_error",
             "code": status.as_u16(),
         }

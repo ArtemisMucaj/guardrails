@@ -24,6 +24,8 @@ futures-util = "0.3"
 tokio-stream = "0.1"
 async-trait = "0.1"
 bytes = "1"
+# Parses the HTTP-date form of `Retry-After`; already in the tree via hyper.
+httpdate = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 gh-copilot-rs = { git = "https://github.com/ArtemisMucaj/gh-copilot-rs" }
 openai-rs = { git = "https://github.com/ArtemisMucaj/openai-rs" }

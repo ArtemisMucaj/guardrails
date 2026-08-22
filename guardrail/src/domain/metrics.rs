@@ -57,6 +57,11 @@ pub enum Outcome {
     BackendError,
     /// The proxy could not serialize the (re)built request — an internal error.
     InternalError,
+    /// The client hung up before the request was answered, so the proxy stopped
+    /// working on it. Recorded rather than dropped because the attempts already
+    /// made were still billed: this is the population that shows what abandoned
+    /// requests cost.
+    ClientDisconnected,
 }
 
 impl Outcome {
@@ -76,6 +81,7 @@ impl Outcome {
             Outcome::NonJson => "non_json",
             Outcome::BackendError => "backend_error",
             Outcome::InternalError => "internal_error",
+            Outcome::ClientDisconnected => "client_disconnected",
         }
     }
 
@@ -150,6 +156,15 @@ pub struct Usage {
     pub completion_tokens: i64,
     /// Of `prompt_tokens`, the portion served from the prompt cache.
     pub cached_tokens: i64,
+    /// Of `completion_tokens`, the portion a reasoning model spent thinking.
+    ///
+    /// Billed as output but never shown to the client, so a request can cost
+    /// far more than its visible answer suggests. Reported by reasoning models
+    /// under `completion_tokens_details.reasoning_tokens` (Chat Completions) or
+    /// `output_tokens_details.reasoning_tokens` (Responses); `0` from a model
+    /// that does not reason, which is indistinguishable from one that reasoned
+    /// for free and equally correct.
+    pub reasoning_tokens: i64,
     /// Backend calls these totals span. `1` for a request answered on the first
     /// attempt; higher when the guardrails retried.
     pub attempts: i64,
@@ -181,6 +196,7 @@ impl Usage {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.cached_tokens += other.cached_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
         self.attempts += other.attempts;
     }
 }
@@ -199,21 +215,27 @@ pub fn extract_usage(value: &serde_json::Value) -> Option<Usage> {
             .find_map(|n| usage.get(*n).and_then(serde_json::Value::as_i64))
             .unwrap_or(0)
     };
-    // Both dialects nest the cache read count one level down, under a details
-    // object named after their own input field.
-    let cached = ["prompt_tokens_details", "input_tokens_details"]
-        .iter()
-        .find_map(|d| {
-            usage
-                .get(*d)
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(serde_json::Value::as_i64)
-        })
-        .unwrap_or(0);
+    // Both dialects nest their detail counts one level down, under an object
+    // named after their own input or output field.
+    let nested = |objects: [&str; 2], key: &str| -> i64 {
+        objects
+            .iter()
+            .find_map(|d| {
+                usage
+                    .get(*d)
+                    .and_then(|d| d.get(key))
+                    .and_then(serde_json::Value::as_i64)
+            })
+            .unwrap_or(0)
+    };
     Some(Usage {
         prompt_tokens: field(["prompt_tokens", "input_tokens"]),
         completion_tokens: field(["completion_tokens", "output_tokens"]),
-        cached_tokens: cached,
+        cached_tokens: nested(["prompt_tokens_details", "input_tokens_details"], "cached_tokens"),
+        reasoning_tokens: nested(
+            ["completion_tokens_details", "output_tokens_details"],
+            "reasoning_tokens",
+        ),
         attempts: 1,
     })
 }
@@ -466,6 +488,55 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_tokens_are_read_from_both_api_dialects() {
+        // A reasoning model bills its thinking as output without ever showing
+        // it, so a request can cost far more than its visible answer suggests.
+        let chat = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 10, "completion_tokens": 500,
+                "completion_tokens_details": {"reasoning_tokens": 480}
+            }
+        });
+        let u = extract_usage(&chat).expect("chat usage");
+        assert_eq!(u.completion_tokens, 500);
+        assert_eq!(u.reasoning_tokens, 480, "thinking is billed but unseen");
+
+        let responses = serde_json::json!({
+            "usage": {
+                "input_tokens": 10, "output_tokens": 500,
+                "output_tokens_details": {"reasoning_tokens": 480}
+            }
+        });
+        assert_eq!(extract_usage(&responses), Some(u));
+    }
+
+    #[test]
+    fn a_non_reasoning_model_reports_zero_reasoning() {
+        // The overwhelmingly common case: no details object at all. That must
+        // read as "did not reason", not as a parse failure.
+        let value = serde_json::json!({
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        });
+        assert_eq!(extract_usage(&value).expect("usage").reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn reasoning_totals_sum_across_attempts() {
+        // A retry is a second billed call, and its thinking is billed too.
+        let mut billed = Usage::default();
+        billed.add(Usage {
+            prompt_tokens: 10, completion_tokens: 100,
+            cached_tokens: 0, reasoning_tokens: 90, attempts: 1,
+        });
+        billed.add(Usage {
+            prompt_tokens: 12, completion_tokens: 120,
+            cached_tokens: 0, reasoning_tokens: 110, attempts: 1,
+        });
+        assert_eq!(billed.reasoning_tokens, 200);
+        assert_eq!(billed.attempts, 2);
+    }
+
+    #[test]
     fn a_backend_reporting_no_cache_details_reads_as_zero_cached() {
         // Most local backends omit the details object entirely. That must read
         // as "nothing cached", not as a parse failure that drops the usage.
@@ -499,6 +570,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 10,
                 cached_tokens: 40,
+                reasoning_tokens: 0,
                 attempts: 1,
             });
         }
@@ -515,7 +587,7 @@ mod tests {
         // combining two running totals gives the same count as adding every
         // attempt individually. Callers all pass single attempts today; this
         // keeps that from being load-bearing.
-        let attempt = Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, attempts: 1 };
+        let attempt = Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 40, reasoning_tokens: 0, attempts: 1 };
 
         let mut one_at_a_time = Usage::default();
         for _ in 0..4 {
@@ -539,7 +611,7 @@ mod tests {
     fn cached_tokens_never_exceed_the_prompt_in_the_uncached_split() {
         // A backend reporting more cached than prompt tokens would otherwise
         // yield a negative "new tokens" figure in the report.
-        let u = Usage { prompt_tokens: 10, completion_tokens: 0, cached_tokens: 25, attempts: 1 };
+        let u = Usage { prompt_tokens: 10, completion_tokens: 0, cached_tokens: 25, reasoning_tokens: 0, attempts: 1 };
         assert_eq!(u.uncached_prompt_tokens(), 0);
     }
 
@@ -1188,6 +1260,7 @@ mod sqlite {
             let provider_col = column("provider");
             let (prompt, completion) = (column("prompt_tokens"), column("completion_tokens"));
             let (cached, billed) = (column("cached_tokens"), column("billed_calls"));
+            let reasoning = column("reasoning_tokens");
 
             // Per-model totals. The tool-call set is formatted from the single
             // source of truth in `Outcome` so it can never drift from the Rust
@@ -1207,7 +1280,7 @@ mod sqlite {
                     COUNT(*), \
                     SUM(CASE WHEN outcome IN ({in_list}) THEN 1 ELSE 0 END), \
                     SUM(CASE WHEN fixed = 0 THEN 1 ELSE 0 END), \
-                    SUM({prompt}), SUM({completion}), SUM({cached}), \
+                    SUM({prompt}), SUM({completion}), SUM({cached}), SUM({reasoning}), \
                     SUM({billed}), COUNT({prompt}) \
                  FROM outcomes{} GROUP BY 1, model ORDER BY 1, model",
                 range.clauses_where("")
@@ -1225,9 +1298,10 @@ mod sqlite {
                         prompt_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
                         completion_tokens: r.get::<_, Option<i64>>(6)?.unwrap_or(0),
                         cached_tokens: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                        attempts: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                        reasoning_tokens: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                        attempts: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
                     },
-                    usage_requests: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    usage_requests: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
                     // Filled by the deduplication pass below.
                     distinct_prompt_tokens: None,
                     conversations: None,
@@ -1934,9 +2008,9 @@ mod sqlite {
         conn.execute(
             "INSERT INTO outcomes \
              (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail, \
-              prompt_tokens, completion_tokens, cached_tokens, billed_calls, response_id, parent_id, \
-              prefix_chain, head_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+              prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, billed_calls, \
+              response_id, parent_id, prefix_chain, head_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             rusqlite::params![
                 record.ts,
                 record.provider,
@@ -1951,6 +2025,7 @@ mod sqlite {
                 usage.map(|u| u.prompt_tokens),
                 usage.map(|u| u.completion_tokens),
                 usage.map(|u| u.cached_tokens),
+                usage.map(|u| u.reasoning_tokens),
                 usage.map(|u| u.attempts),
                 record.conversation.as_ref().map(|c| c.id.as_str()),
                 record.conversation.as_ref().and_then(|c| c.parent.as_deref()),
@@ -2035,6 +2110,17 @@ mod sqlite {
                  DROP INDEX IF EXISTS idx_outcomes_unfixed;\
                  DROP TABLE IF EXISTS outcomes;",
             )?;
+            return Ok(());
+        }
+        // `reasoning_tokens` is added in place rather than by reset: it is a new
+        // measurement, not a change to an existing one, so every prior row stays
+        // correct with it left NULL. Discarding history for an additive column
+        // would cost more than the column is worth.
+        let has_reasoning = conn
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'reasoning_tokens'")?
+            .exists([])?;
+        if !has_reasoning {
+            conn.execute_batch("ALTER TABLE outcomes ADD COLUMN reasoning_tokens INTEGER;")?;
         }
         Ok(())
     }
@@ -2055,6 +2141,7 @@ mod sqlite {
             prompt_tokens     INTEGER,\
             completion_tokens INTEGER,\
             cached_tokens     INTEGER,\
+            reasoning_tokens  INTEGER,\
             billed_calls      INTEGER,\
             response_id       TEXT,\
             parent_id         TEXT,\
@@ -2166,6 +2253,46 @@ mod sqlite {
             assert_eq!(outcome, "retries_exhausted");
             assert_eq!(category.as_deref(), Some("missing_argument"));
             assert_eq!(fixed, 0);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn adding_reasoning_tokens_keeps_the_existing_history() {
+            // Unlike the resets above, this column is a new measurement rather
+            // than a change to an existing one: every prior row stays correct
+            // with it NULL, so the history must survive the upgrade.
+            let dir = std::env::temp_dir()
+                .join(format!("guardrail-reasoning-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("prior.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            // A current-schema database, minus the new column.
+            {
+                let recorder = SqliteRecorder::open(&db).unwrap();
+                recorder.record(rec_from("lmstudio", "old-model", Outcome::NativeValid));
+                drop(recorder);
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE outcomes DROP COLUMN reasoning_tokens;",
+                )
+                .unwrap();
+            }
+
+            // Reopening migrates in place rather than discarding.
+            let recorder = SqliteRecorder::open(&db).expect("must migrate, not fail");
+            recorder.record(rec_from("lmstudio", "new-model", Outcome::NativeValid));
+            drop(recorder);
+
+            let stats = Stats::read(&db).unwrap();
+            let models: Vec<&str> =
+                stats.per_model.iter().map(|m| m.model.as_str()).collect();
+            assert!(
+                models.contains(&"old-model"),
+                "the pre-upgrade row must survive: {models:?}"
+            );
+            assert!(models.contains(&"new-model"));
 
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2305,13 +2432,13 @@ mod sqlite {
             recorder.record(rec_with_usage(
                 "m",
                 Outcome::NativeValid,
-                Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 60, attempts: 1 },
+                Usage { prompt_tokens: 100, completion_tokens: 10, cached_tokens: 60, reasoning_tokens: 0, attempts: 1 },
             ));
             // A retried request: two backend calls folded into one row.
             recorder.record(rec_with_usage(
                 "m",
                 Outcome::RecoveredAfterRetry,
-                Usage { prompt_tokens: 300, completion_tokens: 30, cached_tokens: 140, attempts: 2 },
+                Usage { prompt_tokens: 300, completion_tokens: 30, cached_tokens: 140, reasoning_tokens: 0, attempts: 2 },
             ));
             drop(recorder);
 
@@ -2348,7 +2475,7 @@ mod sqlite {
         }
 
         fn usage_of(prompt: i64, completion: i64) -> Usage {
-            Usage { prompt_tokens: prompt, completion_tokens: completion, cached_tokens: 0, attempts: 1 }
+            Usage { prompt_tokens: prompt, completion_tokens: completion, cached_tokens: 0, reasoning_tokens: 0, attempts: 1 }
         }
 
         #[test]
@@ -2492,6 +2619,7 @@ mod sqlite {
                 prompt_tokens: prompt,
                 completion_tokens: 0,
                 cached_tokens: cached,
+                reasoning_tokens: 0,
                 attempts: 1,
             };
 
@@ -2711,7 +2839,7 @@ mod sqlite {
             recorder.record(rec_with_usage(
                 "m",
                 Outcome::NativeValid,
-                Usage { prompt_tokens: 50, completion_tokens: 5, cached_tokens: 0, attempts: 1 },
+                Usage { prompt_tokens: 50, completion_tokens: 5, cached_tokens: 0, reasoning_tokens: 0, attempts: 1 },
             ));
             recorder.record(rec("m", Outcome::NativeValid)); // no usage at all
             // An all-zero report is indistinguishable from no report and is
@@ -2804,7 +2932,7 @@ mod sqlite {
             recorder.record(rec_with_usage(
                 "gpt-4o",
                 Outcome::NativeValid,
-                Usage { prompt_tokens: 9, completion_tokens: 1, cached_tokens: 0, attempts: 1 },
+                Usage { prompt_tokens: 9, completion_tokens: 1, cached_tokens: 0, reasoning_tokens: 0, attempts: 1 },
             ));
             drop(recorder);
 

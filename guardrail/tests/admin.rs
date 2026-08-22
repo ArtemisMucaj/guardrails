@@ -150,6 +150,7 @@ fn rec_usage(model: &str, prompt: i64, completion: i64) -> OutcomeRecord {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_tokens: 0,
+            reasoning_tokens: 0,
             attempts: 1,
         }),
         ..rec(model, Outcome::NativeValid)

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.3](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.2...v0.12.3) (2026-08-22)
+
+
+### Bug Fixes
+
+* stream truncation, transport retry, disconnect, and reasoning-token accounting ([#63](https://github.com/ArtemisMucaj/guardrails/issues/63)) ([2e5fe4e](https://github.com/ArtemisMucaj/guardrails/commit/2e5fe4e13590fcaab6300b22567ea66229b6f9da))
+* three silent faults in the proxy transport, rescue, and admin surface ([#54](https://github.com/ArtemisMucaj/guardrails/issues/54)) ([78adb6d](https://github.com/ArtemisMucaj/guardrails/commit/78adb6d870c791205e61dc60fe52fe1938aa191f))
+
 ## [0.12.2](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.1...v0.12.2) (2026-08-22)
 
 

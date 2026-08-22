@@ -94,14 +94,28 @@ async fn call_tool(proxy: &str) {
 /// Read stats once the recorder has flushed. Dropping the proxy's `Arc` is not
 /// enough on its own, so the read is retried briefly.
 fn stats_for(db: &std::path::Path) -> Stats {
-    for _ in 0..50 {
+    stats_for_n(db, 1)
+}
+
+/// Read stats once `expected` measured requests have been written.
+///
+/// Dropping the test's `Arc<SqliteRecorder>` does not join the writer thread —
+/// the proxy task holds a clone — so the rows arrive asynchronously. Waiting
+/// for "any usage row" is therefore only correct for a single request: with
+/// several in flight the read can land after the first has been written and the
+/// rest have not, which reads as a smaller total rather than as a failure to
+/// wait. Waiting for the expected count makes the race a timeout instead of a
+/// wrong number.
+fn stats_for_n(db: &std::path::Path, expected: i64) -> Stats {
+    for _ in 0..100 {
         let stats = Stats::read(db).unwrap();
-        if stats.per_model.iter().any(|m| m.usage_requests > 0) {
+        let measured: i64 = stats.per_model.iter().map(|m| m.usage_requests).sum();
+        if measured >= expected {
             return stats;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Stats::read(db).unwrap()
+    panic!("timed out waiting for {expected} measured request(s) to be written");
 }
 
 #[tokio::test]
@@ -492,7 +506,7 @@ async fn a_chat_conversation_is_reconstructed_from_its_resent_transcript() {
     send_turn(&proxy, &t3).await;
     drop(recorder);
 
-    let stats = stats_for(&db);
+    let stats = stats_for_n(&db, 3);
     let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
 
     // Billed is unchanged — it is still what the provider charged.
@@ -572,7 +586,7 @@ async fn unrelated_chat_requests_are_not_merged_into_one_conversation() {
     send_turn(&proxy, &serde_json::json!([{"role": "user", "content": "about dogs"}])).await;
     drop(recorder);
 
-    let stats = stats_for(&db);
+    let stats = stats_for_n(&db, 2);
     let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
     assert_eq!(m.usage.prompt_tokens, 200);
     assert_eq!(m.conversations, Some(2), "two unrelated requests");
@@ -612,7 +626,7 @@ async fn matching_is_off_unless_asked_for() {
     send_turn(&proxy, &t2).await;
     drop(recorder);
 
-    let stats = stats_for(&db);
+    let stats = stats_for_n(&db, 2);
     let m = stats.per_model.iter().find(|m| m.model == "m").expect("model row");
     assert_eq!(m.distinct_prompt_tokens, None, "no grouping without the flag");
     assert_eq!(m.conversations, None);

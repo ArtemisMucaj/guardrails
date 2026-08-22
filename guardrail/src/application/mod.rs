@@ -363,6 +363,13 @@ async fn run_responses_guardrail(
             match port.stream_post(&provider, &target, &headers, body_bytes).await {
                 Ok((_status, _resp_headers, rx, native)) => (rx, native),
                 Err(passthrough_resp) => {
+                    // See the chat loop: a streaming client already holds a
+                    // `200`, so a backend failure is reported in-band.
+                    let status = passthrough_resp.status();
+                    if !status.is_success() {
+                        emit_metric(billed, response_id.clone(), Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                        send_stream_error(&body_tx, status).await;
+                    }
                     let _ = passthrough_tx.send(passthrough_resp);
                     return;
                 }
@@ -800,9 +807,7 @@ async fn run_guardrail(
     // client sent, not what the guardrails asked in between, and would fail to
     // match. Captured only when matching is enabled -- this is the one place
     // the metrics path reads message content, so it does not happen by default.
-    let prefix_chain = g
-        .match_conversations
-        .then(|| PrefixChain::of(&request.messages));
+    let prefix_chain = Some(PrefixChain::of(&request.messages));
 
     let emit_metric = |billed: Usage,
                        conversation: Option<Conversation>,
@@ -834,7 +839,17 @@ async fn run_guardrail(
         let (mut sse_rx, is_native_sse) = match port.stream_post(&provider, &target, &headers, body_bytes).await {
             Ok((_status, _resp_headers, rx, native)) => (rx, native),
             Err(passthrough_resp) => {
-                // Non-JSON/non-SSE backend response — forward verbatim.
+                // A backend error or a non-JSON/non-SSE body — forward verbatim.
+                // A non-streaming client receives this response as-is. A
+                // streaming one has already been handed a `200` with SSE
+                // headers, so the status can no longer be changed; the failure
+                // is relayed in-band instead, which is what an OpenAI-compatible
+                // client reads on a stream that fails after it has begun.
+                let status = passthrough_resp.status();
+                if !status.is_success() {
+                    emit_metric(billed, None, Outcome::InternalError, None, None, None, tracker.attempts(), Some(format!("backend returned {status}")));
+                    send_stream_error(&body_tx, status).await;
+                }
                 let _ = passthrough_tx.send(passthrough_resp);
                 return;
             }
@@ -966,6 +981,24 @@ async fn run_guardrail(
             }
         }
     }
+}
+
+/// Relay a backend failure to a client that is already receiving a stream.
+///
+/// Once the SSE headers are out the status line is fixed, so a failure can only
+/// be reported inside the body. This is the shape OpenAI-compatible clients
+/// expect from a stream that fails mid-flight: a `data:` frame carrying an
+/// `error` object rather than a chunk.
+async fn send_stream_error(tx: &mpsc::Sender<String>, status: StatusCode) {
+    let event = serde_json::json!({
+        "error": {
+            "message": format!("The upstream provider returned {status}."),
+            "type": "upstream_error",
+            "code": status.as_u16(),
+        }
+    });
+    let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+    let _ = tx.send(format!("data: {line}\n\n")).await;
 }
 
 /// Send a chat-completion value as an SSE chunk into the body channel.

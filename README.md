@@ -295,6 +295,10 @@ lmstudio / qwen2.5-7b
     retries_exhausted         5
     respond_intercept       14
     passthrough_no_calls    12
+  tokens billed: 1284300  |  prompt: 1201400 (388200 new, 813200 cached)  |  completion: 82900
+  cache hit rate: 67.7%  |  backend calls per request: 1.09  |  measured over 168 of 168 requests
+  prompt per request:     min 412 | p50 3180 | p90 24100 | p99 96400 | max 131000
+  completion per request: min 3 | p50 240 | p90 1420 | p99 3100 | max 4096
 
 Errors (triage list)
 ====================
@@ -313,6 +317,42 @@ from the success rate.
 The sink is abstracted behind a `Recorder` trait, so an OpenTelemetry / OTLP
 exporter can be added later as a second implementation without changing the
 guardrail loop.
+
+#### Token figures
+
+Tokens are recorded per request, summed over **every** backend attempt it made —
+a corrective retry is a second billed call, and `backend calls per request` is
+the multiplier the guardrails add to the bill. Requests whose backend reported
+no usage are left out of the totals rather than averaged in as zeroes, which is
+what `measured over N of M requests` reports.
+
+Prompt tokens **do not add up across a conversation**. Every chat turn resends
+the whole transcript, so turn 5's prompt contains turns 1–4, and summing them
+counts shared prefixes once per later turn — growth quadratic in turn count, not
+a count of distinct tokens. The sum is therefore labelled *billed*: it is a
+faithful answer to "what did the provider charge" and a wrong answer to "how
+many tokens did this traffic contain". Only completion tokens are generated once
+and so sum cleanly.
+
+Two figures address that, and they answer different questions:
+
+- **`distinct tokens: N over K conversation(s)`** counts a resent prefix once, by
+  taking the largest prompt per conversation rather than the sum. It needs a
+  conversation key, which only the stateful Responses API supplies (via
+  `previous_response_id`). On Chat Completions the line is **absent** rather than
+  repeating the inflated sum under a better name — see [#46].
+- **`prompt/completion per request`** is the spread across single requests, so it
+  needs no conversation key and is reported for all traffic. It is what
+  distinguishes a workload where every request is 3k tokens from one where most
+  are 500 and a handful are 130k; the average alone describes neither. The
+  percentiles are nearest-rank, so every figure is a token count some request
+  actually reported rather than an interpolated point between two of them.
+
+For any grouping the report does not do — by hour, by outcome, or by a session
+key only the client knows — `GET /requests` serves the underlying per-request
+rows.
+
+[#46]: https://github.com/ArtemisMucaj/guardrails/issues/46
 
 ### Admin HTTP server
 
@@ -340,6 +380,7 @@ authenticated.
 | `GET /healthz` | `{"status":"ok"}` — a liveness probe. The server only runs while the proxy is up, so a reachable `/healthz` is the connected signal. |
 | `GET /info` | The running proxy's `version`, `providers` (each as `name=scheme://host[:port]`, in routing order — never credentials or query), `proxy_listen`, `admin_listen`, `max_retries`, and `database` path. |
 | `GET /stats` | The full metrics rollup as JSON (see below). |
+| `GET /requests` | The individual recorded requests, newest first, so a consumer can group them itself. `?limit=` (default 1000), clamped to `[1, 10000]`. |
 | `GET /providers` | Providers, their discovered models, and exposure. |
 | `POST /providers` | Add a provider. |
 | `PATCH /providers/{name}` | Change exposure for one provider. |
@@ -367,7 +408,35 @@ database runs in WAL mode, these reads never block the proxy's writes.
       "by_outcome": [
         { "outcome": "native_valid", "count": 110 },
         { "outcome": "rescued", "count": 18 }
-      ]
+      ],
+      // null when no request reported usage, so a consumer shows "not
+      // measured" rather than a confident zero.
+      "usage": {
+        "prompt_tokens": 1201400,   // billed: NOT additive across a conversation
+        "completion_tokens": 82900, // generated once, so this sums cleanly
+        "billed_tokens": 1284300,
+        "cached_tokens": 813200,
+        "uncached_prompt_tokens": 388200,
+        "cache_hit_rate": 0.677,
+        "billed_calls": 183,        // backend calls, retries included
+        "requests": 168,
+        "calls_per_request": 1.089,
+        // Resent prefixes counted once. null on Chat Completions, which
+        // carries no conversation key — never the inflated sum renamed.
+        "distinct_prompt_tokens": null,
+        "distinct_tokens": null,
+        "conversations": null,
+        // Spread across single requests: needs no conversation key, so it is
+        // populated for all traffic. Percentiles are nearest-rank.
+        "prompt_distribution": {
+          "count": 168, "min": 412, "p50": 3180,
+          "p90": 24100, "p99": 96400, "max": 131000
+        },
+        "completion_distribution": {
+          "count": 168, "min": 3, "p50": 240,
+          "p90": 1420, "p99": 3100, "max": 4096
+        }
+      }
     }
   ],
   "errors": [
@@ -386,6 +455,39 @@ database runs in WAL mode, these reads never block the proxy's writes.
 The `detail` snippet is redacted the same way as in the CLI report: argument
 values are reduced to type/size tags, never stored or served verbatim, so the
 endpoint is safe to surface in a UI.
+
+`GET /requests` serves the rows behind that rollup, newest first, for the
+groupings it does not do — a histogram with its own buckets, a breakdown by
+hour, or a per-conversation total keyed on a session id only the client knows.
+Only requests that reported usage appear, matching the population every token
+figure in `/stats` is computed over. No message content is stored or served;
+these are counts.
+
+```jsonc
+{
+  "count": 2,      // rows returned; equals `limit` when more were available
+  "limit": 1000,   // the limit actually applied, after clamping
+  "requests": [
+    {
+      "ts": "2026-08-22T14:03:11Z",
+      "provider": "lmstudio",
+      "model": "qwen2.5-7b",
+      "outcome": "native_valid",
+      "prompt_tokens": 3180,
+      "completion_tokens": 240,
+      "cached_tokens": 2100,
+      "billed_calls": 1,        // backend calls this request made, retries included
+      "response_id": null,      // null on Chat Completions: no conversation key
+      "parent_id": null         // the turn this one continues, when known
+    }
+  ]
+}
+```
+
+On Responses traffic `response_id` and `parent_id` are populated, so the rows
+can be walked into chains — which is exactly what `distinct_prompt_tokens` does
+server-side. On Chat Completions they are `null`, and grouping is the consumer's
+to do with whatever key it has.
 
 ## Logging
 

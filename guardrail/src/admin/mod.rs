@@ -19,17 +19,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
 
-use crate::domain::metrics::{ErrorGroup, ModelStats, Stats};
+use crate::domain::metrics::{
+    Distribution, ErrorGroup, ModelStats, RequestRow, Stats, MAX_ROWS,
+};
 
 /// Static description of the running proxy, surfaced at `/info` so an embedding
 /// UI can show what it is connected to without parsing logs. Holds nothing
@@ -122,6 +124,7 @@ pub fn build_admin_app(state: AdminState) -> Router {
         .route("/healthz", get(healthz))
         .route("/info", get(info))
         .route("/stats", get(stats))
+        .route("/requests", get(requests))
         .route("/copilot/login", get(copilot_login_status).post(copilot_login_start))
         .route(
             "/providers",
@@ -167,7 +170,7 @@ fn copilot_disabled() -> Response {
 /// Discoverability root: list the available endpoints so the port is
 /// self-describing when opened in a browser or by a new integration.
 async fn index(State(state): State<AdminState>) -> Json<serde_json::Value> {
-    let mut endpoints = vec!["/healthz", "/info", "/stats"];
+    let mut endpoints = vec!["/healthz", "/info", "/stats", "/requests"];
     if state.management.is_some() {
         endpoints.push("/providers");
     }
@@ -200,6 +203,49 @@ async fn info(State(state): State<AdminState>) -> Json<AdminInfo> {
 async fn stats(State(state): State<AdminState>) -> Response {
     match Stats::read(&state.db_path) {
         Ok(stats) => Json(StatsResponse::from(stats)).into_response(),
+        Err(e) => {
+            error!(error = %e, "admin: failed to read guardrails database");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to read guardrails database" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Default number of request rows `GET /requests` returns.
+const DEFAULT_ROW_LIMIT: i64 = 1000;
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    limit: Option<i64>,
+}
+
+/// `GET /requests` — the individual recorded requests, newest first.
+///
+/// The rollup at `/stats` answers the questions the report asks. This serves
+/// the rows behind it so a consumer can ask its own: a histogram with its own
+/// buckets, a grouping by hour, or — on Chat Completions, where the proxy has
+/// no conversation key of its own — a grouping by whatever session key that
+/// consumer does have.
+async fn requests(
+    State(state): State<AdminState>,
+    Query(query): Query<RequestsQuery>,
+) -> Response {
+    // A nonsensical limit is clamped rather than rejected: this is a read-only
+    // diagnostic endpoint, and answering with the sane neighbouring value is
+    // more useful than a 400 for a hand-typed URL. `read_rows` clamps to the
+    // same bound itself — this is here so the applied value can be echoed back
+    // in the response, not because the read depends on it.
+    let limit = query.limit.unwrap_or(DEFAULT_ROW_LIMIT).clamp(1, MAX_ROWS);
+    match Stats::read_rows(&state.db_path, limit) {
+        Ok(rows) => Json(RequestsResponse {
+            count: rows.len(),
+            limit,
+            requests: rows.into_iter().map(RequestRowDto::from).collect(),
+        })
+        .into_response(),
         Err(e) => {
             error!(error = %e, "admin: failed to read guardrails database");
             (
@@ -274,6 +320,80 @@ struct UsageDto {
     distinct_tokens: Option<i64>,
     /// Conversations the measured requests span; `null` when unknown.
     conversations: Option<i64>,
+    /// Spread of prompt tokens across single requests. Unlike the three fields
+    /// above this needs no conversation key, so it is populated for Chat
+    /// Completions traffic too — a sum says what the traffic cost, this says
+    /// what it looked like.
+    prompt_distribution: Option<DistributionDto>,
+    /// Spread of completion tokens across single requests.
+    completion_distribution: Option<DistributionDto>,
+}
+
+/// Spread of a per-request figure across the measured requests.
+///
+/// Percentiles are nearest-rank, so every value here is one some request
+/// actually reported rather than an interpolated point between two of them.
+#[derive(Serialize)]
+struct DistributionDto {
+    /// Requests the percentiles are over.
+    count: i64,
+    min: i64,
+    p50: i64,
+    p90: i64,
+    p99: i64,
+    max: i64,
+}
+
+impl From<Distribution> for DistributionDto {
+    fn from(d: Distribution) -> Self {
+        Self { count: d.count, min: d.min, p50: d.p50, p90: d.p90, p99: d.p99, max: d.max }
+    }
+}
+
+#[derive(Serialize)]
+struct RequestsResponse {
+    /// Rows returned, which is `limit` when more were available.
+    count: usize,
+    /// The limit actually applied, after clamping.
+    limit: i64,
+    requests: Vec<RequestRowDto>,
+}
+
+/// One recorded request. Only requests that reported usage appear, matching the
+/// population the `/stats` token figures are computed over.
+#[derive(Serialize)]
+struct RequestRowDto {
+    ts: String,
+    provider: String,
+    model: String,
+    outcome: String,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    /// Backend calls this request made, retries included.
+    billed_calls: i64,
+    /// This turn's conversation id; `null` on Chat Completions, which carries
+    /// no such key — a consumer grouping these rows supplies its own there.
+    response_id: Option<String>,
+    /// The turn this one continues; `null` on a first turn or without a key.
+    parent_id: Option<String>,
+}
+
+impl From<RequestRow> for RequestRowDto {
+    fn from(r: RequestRow) -> Self {
+        Self {
+            ts: r.ts,
+            provider: r.provider,
+            model: r.model,
+            outcome: r.outcome,
+            prompt_tokens: r.prompt_tokens,
+            completion_tokens: r.completion_tokens,
+            cached_tokens: r.cached_tokens,
+            billed_calls: r.billed_calls,
+            response_id: r.response_id,
+            parent_id: r.parent_id,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -319,6 +439,8 @@ impl From<ModelStats> for ModelStatsDto {
             distinct_prompt_tokens: m.distinct_prompt_tokens,
             distinct_tokens: m.distinct_tokens(),
             conversations: m.conversations,
+            prompt_distribution: m.prompt_distribution.map(DistributionDto::from),
+            completion_distribution: m.completion_distribution.map(DistributionDto::from),
         });
         Self {
             provider: m.provider,

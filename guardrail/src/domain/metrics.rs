@@ -1454,13 +1454,19 @@ mod sqlite {
         }
     }
 
-    /// How many recent rows a match considers.
+    /// How many rows sharing one head hash a match considers.
     ///
-    /// Matching scans back over recent turns of the same provider and model. A
-    /// conversation's previous turn is by definition one of the most recent
-    /// rows, so a modest window finds it; a larger one only adds rows that the
-    /// gap check would reject anyway.
-    const MATCH_WINDOW: i64 = 256;
+    /// The parent lookup is a point query on the predecessor's head hash, not a
+    /// scan over recent history, so this bounds only the *duplicates* of a
+    /// single transcript — a client retrying the same request. Beyond a handful
+    /// the most recent is what wins anyway, so a small cap costs nothing and
+    /// bounds a pathological resend loop.
+    ///
+    /// It deliberately does not bound how far back a conversation may be found:
+    /// a row cap did exactly that, and with enough conversations in flight a
+    /// turn stopped matching its own predecessor and counted its resent prefix
+    /// again — the double counting this feature exists to remove.
+    const MATCH_WINDOW: i64 = 64;
 
     /// Fill in `record.conversation` by matching its message prefix against
     /// recent turns.
@@ -1470,11 +1476,9 @@ mod sqlite {
     /// Responses API supplies real edges, which are never overridden by an
     /// inferred one.
     ///
-    /// The synthetic id combines the chain's head hash with the row's own
-    /// sequence number, making it unique per *row* rather than per transcript.
-    /// A later turn does not derive it — it matches on prefix chains and reads
-    /// the id it finds — so there is nothing to gain from a shared value and a
-    /// great deal to lose (see the note at the assignment).
+    /// Only the *parent* is resolved here. This turn's own id cannot be known
+    /// until the row exists, because it is derived from the row's `rowid` —
+    /// see [`insert`], which assigns it after the write.
     fn infer_conversation(conn: &Connection, record: &mut OutcomeRecord) -> rusqlite::Result<()> {
         let Some(chain) = record.prefix_chain.as_ref() else {
             return Ok(());
@@ -1483,42 +1487,60 @@ mod sqlite {
             return Ok(());
         }
 
-        let mut stmt = conn.prepare(
+        // The parent is looked up *directly*, not scanned for. A predecessor's
+        // whole transcript is a prefix of this one, so its head hash is one of
+        // this chain's own hashes — which makes the lookup a point query on an
+        // indexed column rather than a walk over recent rows.
+        //
+        // The earlier shape scanned the last N rows and filtered in Rust. That
+        // silently broke whenever conversations interleaved: with enough
+        // exchanges in flight, a turn's own predecessor fell outside any modest
+        // N and it stopped matching, counting its resent prefix again. A point
+        // query has no such horizon — the predecessor is found however much
+        // unrelated traffic sits between the two turns.
+        //
+        // Candidates are still gap-checked in `match_parent`; the SQL bound
+        // below is the same limit, applied early so the database does the work.
+        let floor = conversation::gap_floor(&record.ts);
+        let mut stmt = conn.prepare_cached(
             "SELECT response_id, ts, prefix_chain, \
                 COALESCE(prompt_tokens, 0), COALESCE(cached_tokens, 0) \
              FROM outcomes \
-             WHERE prefix_chain IS NOT NULL AND response_id IS NOT NULL \
-               AND provider = ?1 AND model = ?2 \
-             ORDER BY id DESC LIMIT ?3",
+             WHERE head_hash = ?1 AND response_id IS NOT NULL \
+               AND provider = ?2 AND model = ?3 AND ts >= ?4 \
+             ORDER BY id DESC LIMIT ?5",
         )?;
-        let candidates: Vec<Candidate> = stmt
-            .query_map(
-                rusqlite::params![record.provider, record.model, MATCH_WINDOW],
-                |r| {
-                    Ok(Candidate {
-                        id: r.get(0)?,
-                        ts: r.get(1)?,
-                        chain: PrefixChain::decode(&r.get::<_, String>(2)?),
-                        prompt_tokens: r.get(3)?,
-                        cached_tokens: r.get(4)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<_>>()?;
 
-        let parent = conversation::match_parent(chain, &record.ts, &candidates);
+        // Every proper prefix of this chain is a possible predecessor, newest
+        // (longest) first: the immediate predecessor is the longest one present.
+        let mut parent: Option<String> = None;
+        for length in (1..chain.len()).rev() {
+            let head = chain.hashes()[length - 1] as i64;
+            let candidates: Vec<Candidate> = stmt
+                .query_map(
+                    rusqlite::params![head, record.provider, record.model, floor, MATCH_WINDOW],
+                    |r| {
+                        Ok(Candidate {
+                            id: r.get(0)?,
+                            ts: r.get(1)?,
+                            chain: PrefixChain::decode(&r.get::<_, String>(2)?),
+                            prompt_tokens: r.get(3)?,
+                            cached_tokens: r.get(4)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            if let Some(found) = conversation::match_parent(chain, &record.ts, &candidates) {
+                parent = Some(found.id.clone());
+                break;
+            }
+        }
         record.conversation = Some(super::Conversation {
-            // Unique per row, not merely per transcript. Two identical
-            // transcripts — a client retrying the same request — would
-            // otherwise share one id, and the recursive walk in
-            // `fold_distinct_prompts` multiplies paths at every depth when ids
-            // repeat: a 12-turn chain recorded twice explodes from 78 rows to
-            // over 16,000, three times to more than a million. Nothing needs
-            // to re-derive this id — a later turn finds its parent by matching
-            // prefix chains and reads whatever id it finds — so uniqueness is
-            // free.
-            id: synthetic_id(conn, chain),
-            parent: parent.map(|p| p.id.clone()),
+            // Placeholder: replaced in `insert` with one derived from the row's
+            // own rowid. Left empty rather than guessed, so a bug that skips
+            // the assignment is visible instead of silently colliding.
+            id: String::new(),
+            parent,
         });
         Ok(())
     }
@@ -1528,19 +1550,22 @@ mod sqlite {
     /// Prefixed so it is never mistaken for a backend-assigned response id in a
     /// database holding both dialects, and so `stats` can tell an inferred edge
     /// from a real one.
-    fn synthetic_id(conn: &Connection, chain: &PrefixChain) -> String {
-        let Some(head) = chain.head() else {
-            return String::new();
-        };
-        // `rowid` of the row about to be written: the table's own monotonic
-        // counter, so it is unique across restarts (unlike a process-local
-        // counter) and needs no extra query beyond this one.
-        let next: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM outcomes", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0);
-        format!("{INFERRED_PREFIX}{head:016x}-{next:x}")
+    /// Synthetic conversation id for an inferred turn, derived from the row
+    /// that now holds it.
+    ///
+    /// The `rowid` is assigned by SQLite inside the insert, so it is unique by
+    /// construction — across restarts, and across two proxies sharing the
+    /// database file. Predicting it instead with `SELECT MAX(id) + 1` was a
+    /// read in a different transaction from the insert that followed: two
+    /// writers interleaving read-read-insert-insert computed the same value,
+    /// and duplicate ids make the recursive walk in `fold_distinct_prompts`
+    /// combinatorial (a 12-turn chain recorded twice goes from 78 intermediate
+    /// rows to 16,356; three times, to over a million).
+    fn synthetic_id(chain: &PrefixChain, rowid: i64) -> String {
+        match chain.head() {
+            Some(head) => format!("{INFERRED_PREFIX}{head:016x}-{rowid:x}"),
+            None => String::new(),
+        }
     }
 
     /// Marks a conversation id the proxy inferred rather than one a backend
@@ -1557,8 +1582,8 @@ mod sqlite {
             "INSERT INTO outcomes \
              (ts, provider, model, outcome, error_category, parser, tool_name, retries, fixed, detail, \
               prompt_tokens, completion_tokens, cached_tokens, billed_calls, response_id, parent_id, \
-              prefix_chain) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              prefix_chain, head_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 record.ts,
                 record.provider,
@@ -1577,8 +1602,32 @@ mod sqlite {
                 record.conversation.as_ref().map(|c| c.id.as_str()),
                 record.conversation.as_ref().and_then(|c| c.parent.as_deref()),
                 record.prefix_chain.as_ref().map(|c| c.encode()),
+                // Denormalised so the parent lookup is a point query: a
+                // successor's chain contains this value, so it can find this
+                // row by equality on an indexed column.
+                record
+                    .prefix_chain
+                    .as_ref()
+                    .and_then(|c| c.head())
+                    .map(|h| h as i64),
             ],
         )?;
+
+        // An inferred turn gets its id from the row that now holds it. Done
+        // after the insert because only then does the rowid exist; deriving it
+        // from the row is what makes it unique without a transaction, since
+        // SQLite allocates the rowid itself.
+        if let (Some(chain), Some(conversation)) =
+            (record.prefix_chain.as_ref(), record.conversation.as_ref())
+        {
+            if conversation.id.is_empty() && !chain.is_empty() {
+                let id = synthetic_id(chain, conn.last_insert_rowid());
+                conn.execute(
+                    "UPDATE outcomes SET response_id = ?1 WHERE id = ?2",
+                    rusqlite::params![id, conn.last_insert_rowid()],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1621,7 +1670,7 @@ mod sqlite {
         // a column the table lacks fails every time, silently disabling
         // metrics.
         let has_tokens = conn
-            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'prefix_chain'")?
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'head_hash'")?
             .exists([])?;
         if !has_tokens {
             warn!(
@@ -1656,7 +1705,8 @@ mod sqlite {
             billed_calls      INTEGER,\
             response_id       TEXT,\
             parent_id         TEXT,\
-            prefix_chain      TEXT\
+            prefix_chain      TEXT,\
+            head_hash         INTEGER\
         );\
         CREATE INDEX IF NOT EXISTS idx_outcomes_provider_model \
             ON outcomes(provider, model);\
@@ -1666,9 +1716,9 @@ mod sqlite {
             ON outcomes(response_id) WHERE response_id IS NOT NULL;\
         CREATE INDEX IF NOT EXISTS idx_outcomes_parent \
             ON outcomes(parent_id) WHERE parent_id IS NOT NULL;\
-        CREATE INDEX IF NOT EXISTS idx_outcomes_prefix_match \
-            ON outcomes(provider, model, id DESC) \
-            WHERE prefix_chain IS NOT NULL AND response_id IS NOT NULL;";
+        CREATE INDEX IF NOT EXISTS idx_outcomes_head_hash \
+            ON outcomes(head_hash, provider, model) \
+            WHERE head_hash IS NOT NULL AND response_id IS NOT NULL;";
 
     #[cfg(test)]
     mod tests {
@@ -2502,6 +2552,116 @@ mod sqlite {
 
             // The limit bounds the read.
             assert_eq!(Stats::read_rows(&db, 1).unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn interleaved_conversations_still_find_their_own_previous_turn() {
+            // A fixed row window is wrong the moment conversations overlap. With
+            // 300 exchanges in flight, a conversation's own previous turn sits
+            // ~300 rows back after a single round — past any modest row limit —
+            // and it would silently stop matching, counting its resent prefix
+            // again. That is the double counting the whole feature removes, so
+            // candidates are bounded by the gap the matcher enforces, not by a
+            // row count.
+            let dir = std::env::temp_dir().join(format!("guardrail-inter-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("interleaved.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            let opening = |conv: i64| vec![serde_json::json!({"role": "user", "content": conv})];
+
+            // Every conversation opens before any of them continues.
+            const CONVERSATIONS: i64 = 300;
+            for conv in 0..CONVERSATIONS {
+                recorder.record(OutcomeRecord {
+                    usage: Some(usage_of(100, 10)),
+                    prefix_chain: Some(PrefixChain::of(&opening(conv))),
+                    ..rec_from("default", "m", Outcome::NativeValid)
+                });
+            }
+            // Now the first one continues, ~300 rows after its opening turn.
+            let mut second = opening(0);
+            second.push(serde_json::json!({"role": "assistant", "content": "ok"}));
+            second.push(serde_json::json!({"role": "user", "content": "more"}));
+            recorder.record(OutcomeRecord {
+                usage: Some(usage_of(500, 10)),
+                prefix_chain: Some(PrefixChain::of(&second)),
+                ..rec_from("default", "m", Outcome::NativeValid)
+            });
+            drop(recorder);
+
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let parent: Option<String> = conn
+                .query_row(
+                    "SELECT parent_id FROM outcomes ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                parent.is_some(),
+                "the continuing turn must find its opening turn across the interleaving"
+            );
+
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(
+                m.conversations,
+                Some(CONVERSATIONS),
+                "the two turns of conversation 0 are one conversation, not two"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_synthetic_id_belongs_to_the_row_that_holds_it() {
+            // Ids come from the row's own rowid, assigned by SQLite inside the
+            // insert. Predicting one with `MAX(id) + 1` was a read in a separate
+            // transaction from the insert, so two writers sharing the database
+            // file could compute the same value — and duplicate ids make the
+            // chain walk combinatorial.
+            let dir = std::env::temp_dir().join(format!("guardrail-rowid-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("rowid.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            for turn in 0..20 {
+                let messages = vec![serde_json::json!({"role": "user", "content": turn})];
+                recorder.record(OutcomeRecord {
+                    usage: Some(usage_of(100, 10)),
+                    prefix_chain: Some(PrefixChain::of(&messages)),
+                    ..rec_from("default", "m", Outcome::NativeValid)
+                });
+            }
+            drop(recorder);
+
+            // Every id ends in its own row's id, so uniqueness is structural
+            // rather than a property of when the value happened to be read.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, response_id FROM outcomes ORDER BY id")
+                .unwrap();
+            let pairs: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(pairs.len(), 20);
+            for (rowid, id) in &pairs {
+                assert!(
+                    id.ends_with(&format!("-{rowid:x}")),
+                    "id {id} should carry its own rowid {rowid}"
+                );
+                assert!(id.starts_with(super::INFERRED_PREFIX));
+            }
+
+            let distinct: std::collections::HashSet<_> = pairs.iter().map(|(_, id)| id).collect();
+            assert_eq!(distinct.len(), 20, "ids must be unique");
 
             let _ = std::fs::remove_dir_all(&dir);
         }

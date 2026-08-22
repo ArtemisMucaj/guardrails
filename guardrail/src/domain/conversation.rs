@@ -217,6 +217,46 @@ pub fn match_parent<'a>(
         })
 }
 
+/// The earliest timestamp still eligible to be `ts`'s parent.
+///
+/// Lets the database apply the same bound the matcher does, so the candidate
+/// query is limited by *time* rather than by a row count. A fixed row window is
+/// wrong the moment conversations interleave: enough concurrent exchanges push
+/// a conversation's own previous turn out of any modest limit, and it silently
+/// stops matching. Returns an empty string when `ts` cannot be parsed, which
+/// compares less than every real timestamp and so bounds nothing — the same
+/// "a bad timestamp must not discard a containment match" posture as
+/// [`within_gap`].
+pub fn gap_floor(ts: &str) -> String {
+    let Some(now) = epoch_seconds(ts) else {
+        return String::new();
+    };
+    let floor = now - MAX_GAP_SECONDS;
+    let (days, rem) = (floor.div_euclid(86_400), floor.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Millisecond field included so the string orders correctly against the
+    // `.mmmZ` timestamps `now_rfc3339` writes; `.000` is the floor of a second.
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.000Z")
+}
+
+/// Howard Hinnant's days-to-civil-date algorithm (days since 1970-01-01).
+///
+/// The inverse of [`days_from_civil`]; duplicated from `metrics` rather than
+/// shared, to keep this module free of a dependency on it.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Whether `later` is within [`MAX_GAP_SECONDS`] of `earlier`.
 ///
 /// Timestamps are RFC3339 UTC as written by `now_rfc3339`, which is

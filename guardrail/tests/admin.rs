@@ -43,6 +43,7 @@ fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
         detail: None,
         usage: None,
         conversation: None,
+        prefix_chain: None,
     }
 }
 

@@ -1279,10 +1279,11 @@ mod sqlite {
                 return Ok(Vec::new());
             }
 
-            // Ordered by `id` rather than `ts`: the timestamp has one-second
-            // resolution, so a burst shares one value and would order
-            // arbitrarily. The primary key is monotonic in insertion order,
-            // which is the order the rows actually happened in.
+            // Ordered by `id` rather than `ts`: the timestamp is millisecond
+            // resolution but comes from the wall clock, so it can still tie
+            // within a burst and can move backwards across an adjustment. The
+            // primary key is monotonic in insertion order, which is the order
+            // the rows actually happened in.
             let mut stmt = conn.prepare(
                 "SELECT ts, COALESCE(provider, 'unknown'), model, outcome, \
                     prompt_tokens, completion_tokens, cached_tokens, billed_calls, \
@@ -1468,9 +1469,11 @@ mod sqlite {
     /// Responses API supplies real edges, which are never overridden by an
     /// inferred one.
     ///
-    /// The synthetic id is the chain's own head hash, so it is stable and
-    /// derivable: the *next* turn computes the same value for this turn's
-    /// prefix and links to it without needing to have seen the id.
+    /// The synthetic id combines the chain's head hash with the row's own
+    /// sequence number, making it unique per *row* rather than per transcript.
+    /// A later turn does not derive it — it matches on prefix chains and reads
+    /// the id it finds — so there is nothing to gain from a shared value and a
+    /// great deal to lose (see the note at the assignment).
     fn infer_conversation(conn: &Connection, record: &mut OutcomeRecord) -> rusqlite::Result<()> {
         let Some(chain) = record.prefix_chain.as_ref() else {
             return Ok(());
@@ -1504,9 +1507,16 @@ mod sqlite {
 
         let parent = conversation::match_parent(chain, &record.ts, &candidates);
         record.conversation = Some(super::Conversation {
-            // The head hash identifies this exact transcript, so the next turn
-            // arrives at the same id independently.
-            id: synthetic_id(chain),
+            // Unique per row, not merely per transcript. Two identical
+            // transcripts — a client retrying the same request — would
+            // otherwise share one id, and the recursive walk in
+            // `fold_distinct_prompts` multiplies paths at every depth when ids
+            // repeat: a 12-turn chain recorded twice explodes from 78 rows to
+            // over 16,000, three times to more than a million. Nothing needs
+            // to re-derive this id — a later turn finds its parent by matching
+            // prefix chains and reads whatever id it finds — so uniqueness is
+            // free.
+            id: synthetic_id(conn, chain),
             parent: parent.map(|p| p.id.clone()),
         });
         Ok(())
@@ -1517,11 +1527,19 @@ mod sqlite {
     /// Prefixed so it is never mistaken for a backend-assigned response id in a
     /// database holding both dialects, and so `stats` can tell an inferred edge
     /// from a real one.
-    fn synthetic_id(chain: &PrefixChain) -> String {
-        match chain.head() {
-            Some(head) => format!("{INFERRED_PREFIX}{head:016x}"),
-            None => String::new(),
-        }
+    fn synthetic_id(conn: &Connection, chain: &PrefixChain) -> String {
+        let Some(head) = chain.head() else {
+            return String::new();
+        };
+        // `rowid` of the row about to be written: the table's own monotonic
+        // counter, so it is unique across restarts (unlike a process-local
+        // counter) and needs no extra query beyond this one.
+        let next: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM outcomes", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        format!("{INFERRED_PREFIX}{head:016x}-{next:x}")
     }
 
     /// Marks a conversation id the proxy inferred rather than one a backend
@@ -1646,12 +1664,15 @@ mod sqlite {
         CREATE INDEX IF NOT EXISTS idx_outcomes_response \
             ON outcomes(response_id) WHERE response_id IS NOT NULL;\
         CREATE INDEX IF NOT EXISTS idx_outcomes_parent \
-            ON outcomes(parent_id) WHERE parent_id IS NOT NULL;";
+            ON outcomes(parent_id) WHERE parent_id IS NOT NULL;\
+        CREATE INDEX IF NOT EXISTS idx_outcomes_prefix_match \
+            ON outcomes(provider, model, id DESC) \
+            WHERE prefix_chain IS NOT NULL AND response_id IS NOT NULL;";
 
     #[cfg(test)]
     mod tests {
         use super::super::{now_rfc3339, Outcome, OutcomeRecord, Recorder, Usage};
-        use super::{Distribution, SqliteRecorder, Stats, MAX_ROWS};
+        use super::{Distribution, PrefixChain, SqliteRecorder, Stats, MAX_ROWS};
         use crate::domain::validate::ErrorCategory;
 
         fn rec(model: &str, outcome: Outcome) -> OutcomeRecord {
@@ -2480,6 +2501,74 @@ mod sqlite {
 
             // The limit bounds the read.
             assert_eq!(Stats::read_rows(&db, 1).unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn repeated_identical_transcripts_do_not_explode_the_chain_walk() {
+            // A client that retries the same request sends a byte-identical
+            // transcript, which hashes to the same head. If the synthetic id
+            // were the head alone, those rows would share one `response_id`,
+            // and the recursive walk in `fold_distinct_prompts` multiplies
+            // paths at every depth when ids repeat: a 12-turn chain recorded
+            // twice goes from 78 intermediate rows to over 16,000, three times
+            // to more than a million. `stats` would hang rather than answer.
+            //
+            // Ids are therefore unique per row, and this asserts both halves:
+            // the walk stays cheap, and the duplicates still group correctly
+            // rather than being scattered into separate conversations.
+            let dir = std::env::temp_dir().join(format!("guardrail-dupes-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("dupes.sqlite");
+            let _ = std::fs::remove_file(&db);
+
+            let recorder = SqliteRecorder::open(&db).unwrap();
+            // A ten-turn conversation, every turn recorded three times.
+            let mut messages = vec![serde_json::json!({"role": "system", "content": "go"})];
+            for turn in 0..10 {
+                messages.push(serde_json::json!({"role": "user", "content": turn}));
+                for _ in 0..3 {
+                    recorder.record(OutcomeRecord {
+                        usage: Some(usage_of(100 * (turn + 1), 10)),
+                        prefix_chain: Some(PrefixChain::of(&messages)),
+                        ..rec_from("default", "m", Outcome::NativeValid)
+                    });
+                }
+                messages.push(serde_json::json!({"role": "assistant", "content": "ok"}));
+            }
+            drop(recorder);
+
+            // Every synthetic id is distinct, which is what keeps the walk linear.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let (rows, ids): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(response_id), COUNT(DISTINCT response_id) FROM outcomes",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(rows, 30);
+            assert_eq!(ids, 30, "each row needs its own id, or the walk explodes");
+
+            // And the read completes rather than hanging. Three retries of the
+            // opening turn are three roots, because `extends` is strict: an
+            // identical transcript does not continue itself, so a resend starts
+            // its own chain rather than being chained to the request it
+            // repeats. Each later turn then attaches to one of them.
+            //
+            // That is the honest reading — a retry is a distinct billed
+            // request, not a later turn — and it stays bounded: three roots,
+            // not the thirty an ungrouped report would show, and nowhere near
+            // the combinatorial blowup a shared id would cause.
+            let stats = Stats::read(&db).unwrap();
+            let m = &stats.per_model[0];
+            assert_eq!(m.conversations, Some(3), "one root per resend of turn 1");
+            assert!(
+                m.distinct_prompt_tokens.unwrap() < m.usage.prompt_tokens,
+                "grouping still removes the resent prefixes"
+            );
+            assert!(m.inferred_conversations);
 
             let _ = std::fs::remove_dir_all(&dir);
         }

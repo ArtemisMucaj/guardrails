@@ -195,7 +195,7 @@ pub fn repair_argument_names(calls: &mut [ToolCall], tools: &[Tool]) -> bool {
 /// Normalize an argument key for style-insensitive comparison: lowercased with
 /// `_`, `-`, and spaces removed, so `file_path`, `File-Path`, and `filePath`
 /// all collapse to `filepath`.
-fn normalize_key(key: &str) -> String {
+pub(crate) fn normalize_key(key: &str) -> String {
     key.chars()
         .filter(|c| !matches!(c, '_' | '-' | ' '))
         .flat_map(char::to_lowercase)

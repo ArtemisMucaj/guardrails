@@ -35,8 +35,10 @@ pub enum Outcome {
     /// Retries exhausted and the call was still invalid — the guardrails could
     /// not fix it. This is the population worth triaging.
     RetriesExhausted,
-    /// A write-only tool was called on a file that already exists. The model
-    /// was instructed to read the file first and use the edit tool instead.
+    /// A mutating tool call was refused by a semantic precondition: a
+    /// write-only tool aimed at a path that already exists, or an edit aimed at
+    /// a file the conversation never shows being read. Either way the model was
+    /// told to read the file first, and the call never reached the client.
     WriteRefused,
     /// The model returned plain text with no tool call to validate.
     PassthroughNoCalls,

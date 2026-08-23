@@ -70,7 +70,12 @@ intercepting write-only tools when the target file already exists).
 
 ---
 
-## Write-only tools (precondition-checked)
+## Precondition-checked tools
+
+Two rules run before the repair/validate loop. A call that fails either is
+returned to the model as plain assistant text, never forwarded to the harness.
+
+### Write-only tools — must not target an existing path
 
 The proxy intercepts any call to the following tools when the target file
 already exists, and instructs the model to read the file first and then use
@@ -82,3 +87,81 @@ the corresponding edit tool:
 | `write` | OpenCode, Pi |
 | `write_file` | Zed AI |
 | `create` | GitHub Copilot CLI |
+
+### Edit tools — must follow a read of the same path
+
+An in-place edit is only as good as the model's knowledge of the file: the old
+string it matches on, or the hunk it patches against, has to describe what is
+actually on disk. The proxy scans the transcript the client sent and refuses an
+edit whose target never appears in a read:
+
+| Tool name | Harness |
+|-----------|---------|
+| `Edit` | Claude Code |
+| `MultiEdit` | Claude Code |
+| `NotebookEdit` | Claude Code (targets `notebook_path`) |
+| `edit` | OpenCode, Pi, GitHub Copilot CLI |
+| `edit_file` | Zed AI |
+
+Only whole-file readers count as a read — `Read`, `read`, `read_file`. A `Grep`
+returns matching lines and a `Glob` returns names, so neither tells the model
+what an edit's context looks like, and `WebFetch` / `TodoRead` read something
+that is not a project file.
+
+Tool names and path arguments are both matched after normalising casing and
+separators, so one entry covers every spelling a harness might use: `read_file`
+also admits `readFile`, `ReadFile`, and `read-file`, and the target path is found
+under `file_path`, `filePath`, or `path` alike. That generosity is deliberate on
+the read side — a read name the list misses produces a *false refusal*, telling a
+model to re-read a file it already read, whereas an over-broad match merely
+declines to guard an edit.
+
+Paths are compared after canonicalisation, so a read of `/private/etc/hosts`
+licenses an edit to `/etc/hosts` rather than reading as a different file.
+
+The read set is rebuilt from each request's own `messages[]` (or Responses
+`input[]`), so it is scoped to the conversation that sent it: a read in one chat
+cannot license an edit in another. On the Responses API only items typed
+`function_call` are scanned — an `mcp_call` carries the same name/arguments pair,
+and a third-party server exposing a tool called `read` must not license an edit
+to a file nothing on this machine opened.
+
+### Not covered
+
+`apply_patch` (OpenCode) names its target inside the patch body
+(`*** Update File: …`) rather than in a path argument, so it is deliberately
+absent: listing it would guard nothing while this page claimed otherwise.
+Covering it means parsing the patch formats.
+
+The delete and move family — Zed's `delete_path`, `move_path`, `copy_path`, and
+OpenCode's `delete` — is also out of scope here. These destroy or relocate
+contents rather than editing them, and "read it first" is not the right
+correction for them.
+
+### Failing open
+
+The edit rule refuses only on positive evidence: a mutating call whose path is
+absent from a transcript in which **at least one read has already been seen and
+understood**.
+
+That bar is deliberately higher than "some tool call was recognised". A
+transcript whose only surviving tool traffic is the model's own failed edit
+proves the scan can read *calls*, not that it can see *reads* — and that is
+exactly the shape trimmed history takes, since a compaction drops the read first
+and keeps the failed edit last. Treating any recognised call as sufficient would
+refuse precisely the conversation that already did the read.
+
+So the rule stands down when the transcript is missing, contains no read it
+could parse, or names its tools in an unknown vocabulary.
+
+On the Responses API it also stands down for any turn carrying
+`previous_response_id`. A chained turn keeps its history on the backend, and
+whatever input it resends is a fragment: clients commonly replay the previous
+call and its output, which parses as a read and is therefore legible — legible
+about the fragment, while the read that matters sits upstream out of reach.
+Keying on the chaining signal rather than on the resent input being empty is what
+keeps that from refusing an edit whose read did happen. The cost is that the first
+edit of a conversation is unguarded, nothing having been read yet. That is the
+right side to err on: the rule exists to catch a model editing from memory
+across a long session, and one unguarded opening edit is cheaper than telling a
+model to re-read a file it just read.

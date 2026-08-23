@@ -33,6 +33,16 @@ and repaired before the response reaches the client.
 - Repairs argument keys that name a declared property in a different casing or
   separator style (for example `file_path` for a schema's `filePath`), but only
   to fill a missing required field and only when the match is unambiguous.
+- Refuses a write-only tool (`Write`, `write`, `write_file`, `create`) aimed at a
+  path that already exists, so a whole-file rewrite cannot silently replace it.
+- Refuses an in-place edit (`Edit`, `MultiEdit`, `NotebookEdit`, `edit`,
+  `edit_file`) whose target the conversation never shows being read — an edit
+  matched against a file the model never looked at is matched against a guess.
+  The check reads the transcript the client sent, so it is scoped to that
+  conversation, and it only applies once it has seen a read it understood, which
+  keeps trimmed history and unfamiliar tool vocabularies from producing a
+  refusal the model cannot act on. See
+  [docs/harness-tools.md](docs/harness-tools.md).
 - Retries invalid tool calls with a corrective nudge, then falls back safely
   instead of forwarding invalid tool calls to the client.
 - Optionally injects a synthetic `respond` tool so models can return a final text
@@ -274,7 +284,7 @@ Outcomes:
 | `recovered_after_retry` | Invalid, then valid after corrective retries. | 1 |
 | `respond_intercept` | Synthetic `respond` tool carried the final text. | 1 |
 | `retries_exhausted` | Retries exhausted, still invalid — the errors to triage. | 0 |
-| `write_refused` | Write-only tool called on an existing file — model told to read first. | 0 |
+| `write_refused` | Precondition refused the call: a write onto an existing file, or an edit to a file never read. | 0 |
 | `passthrough_no_calls` | Model returned plain text, no tool call to check. | 1 |
 | `streamed_passthrough` | Streaming request with no tools, forwarded live (nothing to guard). | 1 |
 | `non_tool_passthrough` | Non-streaming request with no tools, forwarded unguarded. | 1 |

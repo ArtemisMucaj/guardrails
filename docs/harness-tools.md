@@ -70,7 +70,12 @@ intercepting write-only tools when the target file already exists).
 
 ---
 
-## Write-only tools (precondition-checked)
+## Precondition-checked tools
+
+Two rules run before the repair/validate loop. A call that fails either is
+returned to the model as plain assistant text, never forwarded to the harness.
+
+### Write-only tools — must not target an existing path
 
 The proxy intercepts any call to the following tools when the target file
 already exists, and instructs the model to read the file first and then use
@@ -82,3 +87,39 @@ the corresponding edit tool:
 | `write` | OpenCode, Pi |
 | `write_file` | Zed AI |
 | `create` | GitHub Copilot CLI |
+
+### Edit tools — must follow a read of the same path
+
+An in-place edit is only as good as the model's knowledge of the file: the old
+string it matches on, or the hunk it patches against, has to describe what is
+actually on disk. The proxy scans the transcript the client sent and refuses an
+edit whose target never appears in a read:
+
+| Tool name | Harness |
+|-----------|---------|
+| `Edit` | Claude Code |
+| `MultiEdit` | Claude Code |
+| `edit` | OpenCode, Pi, GitHub Copilot CLI |
+| `apply_patch` | OpenCode |
+| `edit_file` | Zed AI |
+
+Only whole-file readers count as a read — `Read`, `read`, `read_file`. A `Grep`
+returns matching lines and a `Glob` returns names, so neither tells the model
+what an edit's context looks like.
+
+The read set is rebuilt from each request's own `messages[]` (or Responses
+`input[]`), so it is scoped to the conversation that sent it: a read in one chat
+cannot license an edit in another.
+
+### Failing open
+
+The edit rule refuses only on positive evidence — a mutating call whose path is
+absent from a transcript that is present and does contain recognisable tool
+traffic. It stands down when the transcript is missing, carries no tool calls,
+names its tools in an unknown vocabulary, or (on the Responses API) is a chained
+turn whose history lives on the backend.
+
+That is deliberate. A client may trim or summarise history, and the read may
+well have happened where the scan cannot see it. A missed refusal costs one bad
+edit the model can still be corrected on; a false refusal tells the model to
+read a file it already read, and burns the turn.

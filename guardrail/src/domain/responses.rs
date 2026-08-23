@@ -98,6 +98,21 @@ impl ResponsesRequest {
         self.tools.get_or_insert_with(Vec::new).push(Value::Object(flat));
     }
 
+    /// The `input` items as an array, when the client sent them that way.
+    ///
+    /// Empty for the bare-string form and for a chained turn, which names its
+    /// predecessor with `previous_response_id` instead of resending anything.
+    /// A caller that reads this to *look for* something must treat empty as
+    /// "nothing to see here" rather than as "it did not happen" — a chained
+    /// turn's history lives on the backend, out of the proxy's reach.
+    pub fn input_items(&self) -> &[Value] {
+        self.rest
+            .get("input")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     /// Append turns to `input`, so a corrective retry can carry the nudge.
     ///
     /// `input` may legally be a bare string; it is promoted to the turn form

@@ -194,6 +194,17 @@ pub struct ExposureUpdate {
     /// Per-model exposure to set. Models not named are left as they are.
     #[serde(default)]
     models: std::collections::BTreeMap<String, bool>,
+    /// Drop every stored per-model decision before applying `models`, so the
+    /// provider falls back to `expose_by_default` for anything not named.
+    ///
+    /// Decisions are stored per model and outlive the model — deliberately, so
+    /// one that disappears and returns keeps its setting. That also means a
+    /// caller working from a list of *currently offered* models cannot undo a
+    /// decision for a model the provider has since stopped offering: setting
+    /// what it can see leaves the rest stranded. Clearing first is the only way
+    /// to express "whatever is remembered, forget it".
+    #[serde(default)]
+    clear_models: bool,
     /// Whether the provider is routed to at all.
     #[serde(default)]
     enabled: Option<bool>,
@@ -236,6 +247,9 @@ pub(super) async fn update_provider(
         let Some(provider) = config.provider_mut(&name) else {
             return not_found(&name);
         };
+        if update.clear_models {
+            provider.models.clear();
+        }
         for (model, exposed) in &update.models {
             provider.set_exposed(model.clone(), *exposed);
         }

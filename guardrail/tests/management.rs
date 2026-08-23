@@ -398,3 +398,68 @@ async fn an_unknown_provider_is_a_404() {
         .unwrap();
     assert_eq!(response.status(), 404);
 }
+
+#[tokio::test]
+async fn clearing_decisions_releases_models_a_caller_can_no_longer_name() {
+    // Exposure decisions outlive the model they were made for -- deliberately,
+    // so a model that disappears and returns keeps its setting. The cost is
+    // that a caller working from the *currently offered* list cannot undo a
+    // decision for a model that has since gone: it sets what it can see and
+    // leaves the rest stranded hidden. That is what stranded 13 of Copilot's
+    // models after a "None" taken when the catalogue was larger.
+    let alpha = backend_with("alpha", &["a", "b", "c"]).await;
+    let h = harness("clear", &[("alpha", &alpha, &["a", "b", "c"])]).await;
+    let client = reqwest::Client::new();
+
+    // Hide all three, as a "None" button does.
+    client
+        .patch(format!("{}/providers/alpha", h.admin))
+        .json(&serde_json::json!({"models": {"a": false, "b": false, "c": false}}))
+        .send()
+        .await
+        .unwrap();
+
+    // Now only `a` and `b` can be named -- `c` is no longer offered. Setting
+    // those two leaves `c` stored false: invisible, and unreachable.
+    client
+        .patch(format!("{}/providers/alpha", h.admin))
+        .json(&serde_json::json!({"models": {"a": true, "b": true}}))
+        .send()
+        .await
+        .unwrap();
+    let saved = Config::load(&h.config_path).unwrap().unwrap();
+    assert_eq!(
+        saved.provider("alpha").unwrap().models.get("c"),
+        Some(&false),
+        "c is stranded: the caller could not name it"
+    );
+
+    // Clearing drops every stored decision, so anything not named falls back to
+    // `expose_by_default` -- which is how "expose everything" is expressed when
+    // the caller cannot enumerate what it is undoing.
+    client
+        .patch(format!("{}/providers/alpha", h.admin))
+        .json(&serde_json::json!({"clear_models": true}))
+        .send()
+        .await
+        .unwrap();
+    let saved = Config::load(&h.config_path).unwrap().unwrap();
+    assert!(
+        saved.provider("alpha").unwrap().models.is_empty(),
+        "no stored decision should remain"
+    );
+    assert!(
+        saved.provider("alpha").unwrap().exposes("c"),
+        "c inherits expose_by_default again"
+    );
+
+    // And the live listing agrees: all three are served.
+    let body = get_json(format!("{}/providers", h.admin)).await;
+    let exposed = body["providers"][0]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["exposed"] == true)
+        .count();
+    assert_eq!(exposed, 3);
+}

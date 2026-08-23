@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.13.0...v0.14.0) (2026-08-23)
+
+
+### Features
+
+* refuse an edit to a file the conversation never read ([#66](https://github.com/ArtemisMucaj/guardrails/issues/66)) ([493d08c](https://github.com/ArtemisMucaj/guardrails/commit/493d08cf4177dec273f7e0ca9c789181cb535228))
+
 ## [0.13.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.3...v0.13.0) (2026-08-23)
 
 

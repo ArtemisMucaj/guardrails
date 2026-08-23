@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.3...v0.13.0) (2026-08-23)
+
+
+### Features
+
+* let a caller clear stored per-model decisions ([#64](https://github.com/ArtemisMucaj/guardrails/issues/64)) ([16fc7bb](https://github.com/ArtemisMucaj/guardrails/commit/16fc7bbc37fd37314d01d978b0b833aef5653223))
+
 ## [0.12.3](https://github.com/ArtemisMucaj/guardrails/compare/v0.12.2...v0.12.3) (2026-08-22)
 
 

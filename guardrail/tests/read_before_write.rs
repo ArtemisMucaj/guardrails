@@ -193,8 +193,12 @@ async fn post_chat(proxy: &str, messages: Value) -> Value {
         .unwrap()
 }
 
-/// A transcript in which the model looked at something other than the file it
-/// is about to edit — legible, so the rule applies, and missing the read.
+/// A transcript in which the model read *another* file and then grepped, but
+/// never read the file it is about to edit.
+///
+/// The read of the other file is what makes the transcript legible: the rule
+/// only refuses once it has seen reads flowing through, so a transcript with no
+/// read at all would stand it down instead of exercising it.
 fn transcript_without_the_read() -> Value {
     json!([
         {"role": "user", "content": "fix the typo"},
@@ -204,10 +208,23 @@ fn transcript_without_the_read() -> Value {
             "tool_calls": [{
                 "id": "call_0",
                 "type": "function",
+                "function": {
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"/etc/passwd\"}"
+                }
+            }]
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "root:*:0:0:"},
+        {
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
                 "function": {"name": "Grep", "arguments": "{\"pattern\":\"typo\"}"}
             }]
         },
-        {"role": "tool", "tool_call_id": "call_0", "content": "3 matches"}
+        {"role": "tool", "tool_call_id": "call_1", "content": "3 matches"}
     ])
 }
 
@@ -389,9 +406,15 @@ async fn responses_input_items_are_scanned_for_the_read() {
             .is_some_and(|items| items.iter().any(|i| i["type"] == "function_call"))
     };
 
-    // Grepped, never read → refused.
+    // Read another file, grepped this one, never read it → refused. The read of
+    // the other file is what makes the transcript legible.
     let refused = ask(json!([
-        {"type": "function_call", "call_id": "c0", "name": "Grep", "arguments": "{\"pattern\":\"x\"}"}
+        {
+            "type": "function_call", "call_id": "c0", "name": "Read",
+            "arguments": "{\"file_path\":\"/etc/passwd\"}"
+        },
+        {"type": "function_call_output", "call_id": "c0", "output": "root:*:0:0:"},
+        {"type": "function_call", "call_id": "c1", "name": "Grep", "arguments": "{\"pattern\":\"x\"}"}
     ]))
     .await;
     assert!(!is_call(&refused), "expected a refusal, got: {refused}");
@@ -408,6 +431,48 @@ async fn responses_input_items_are_scanned_for_the_read() {
     assert!(
         is_call(&allowed),
         "expected the edit through, got: {allowed}"
+    );
+}
+
+/// Trimmed history: a compaction drops the read and keeps the model's own
+/// failed edit plus its error. The surviving traffic is recognisable, but it is
+/// not evidence that reads are visible — so the rule must stand down rather than
+/// tell the model to re-read a file it already read.
+#[tokio::test]
+async fn a_trimmed_history_keeping_only_a_failed_edit_does_not_refuse() {
+    let file = Fixture::new("trimmed");
+    let backend = backend_editing(&file.path()).await;
+    let proxy = spawn(&backend.uri()).await;
+
+    let got = post_chat(
+        &proxy,
+        json!([
+            {"role": "user", "content": "fix the typo"},
+            {
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "Edit",
+                        "arguments": json!({
+                            "file_path": file.path(),
+                            "old_string": "stale",
+                            "new_string": "fixed"
+                        }).to_string()
+                    }
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "Error: string not found"}
+        ]),
+    )
+    .await;
+
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(
+        call["function"]["name"], "Edit",
+        "a trimmed history was refused: {got}"
     );
 }
 

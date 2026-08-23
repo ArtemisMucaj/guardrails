@@ -35,12 +35,14 @@ and repaired before the response reaches the client.
   to fill a missing required field and only when the match is unambiguous.
 - Refuses a write-only tool (`Write`, `write`, `write_file`, `create`) aimed at a
   path that already exists, so a whole-file rewrite cannot silently replace it.
-- Refuses an in-place edit (`Edit`, `MultiEdit`, `edit`, `apply_patch`,
+- Refuses an in-place edit (`Edit`, `MultiEdit`, `NotebookEdit`, `edit`,
   `edit_file`) whose target the conversation never shows being read — an edit
   matched against a file the model never looked at is matched against a guess.
   The check reads the transcript the client sent, so it is scoped to that
-  conversation, and it stands down whenever the history is trimmed or its tool
-  vocabulary is unfamiliar. See [docs/harness-tools.md](docs/harness-tools.md).
+  conversation, and it only applies once it has seen a read it understood, which
+  keeps trimmed history and unfamiliar tool vocabularies from producing a
+  refusal the model cannot act on. See
+  [docs/harness-tools.md](docs/harness-tools.md).
 - Retries invalid tool calls with a corrective nudge, then falls back safely
   instead of forwarding invalid tool calls to the client.
 - Optionally injects a synthetic `respond` tool so models can return a final text

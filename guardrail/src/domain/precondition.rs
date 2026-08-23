@@ -69,14 +69,20 @@ const WRITE_TOOLS: &[(&str, &str)] = &[
 /// Sources:
 /// - `Edit`, `MultiEdit` — Claude Code
 /// - `edit`              — OpenCode, Pi, GitHub Copilot CLI
-/// - `apply_patch`       — OpenCode
 /// - `edit_file`         — Zed AI
+/// - `NotebookEdit`      — Claude Code (targets `notebook_path`)
+///
+/// `apply_patch` is deliberately absent. It names its target inside the patch
+/// body (`*** Update File: …`) rather than in a path argument, so listing it
+/// here would guard nothing while the docs claimed otherwise — and a guard
+/// believed to be on is worse than one known to be off. Covering it means
+/// parsing the patch formats, which is its own change.
 const EDIT_TOOLS: &[(&str, &str)] = &[
     ("Edit", "Claude Code"),
     ("MultiEdit", "Claude Code"),
     ("edit", "OpenCode, Pi, GitHub Copilot CLI"),
-    ("apply_patch", "OpenCode"),
     ("edit_file", "Zed AI"),
+    ("NotebookEdit", "Claude Code"),
 ];
 
 /// Tools whose call means the model has seen a file's contents.
@@ -105,8 +111,9 @@ pub enum Precondition {
 ///
 /// Built once per guardrail loop from the request's message array, then
 /// consulted per tool call. An empty set is ambiguous — it means either "no
-/// read happened" or "this scan understood nothing here" — so it is paired with
-/// [`Transcript::legible`] to tell those apart.
+/// read happened" or "this scan cannot see the reads here" — so it is paired
+/// with [`Transcript::legible`], which is true only once a read has been seen
+/// and understood, to tell those apart.
 #[derive(Debug, Default, Clone)]
 pub struct Transcript {
     read_paths: HashSet<String>,
@@ -131,12 +138,17 @@ impl Transcript {
         let mut legible = false;
         for message in messages {
             for (name, arguments) in tool_invocations(message) {
-                legible = true;
                 if !READ_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(name)) {
                     continue;
                 }
+                // Only a read the scan fully understood is evidence that reads
+                // are visible here. A `Read` whose path will not parse — the
+                // arguments came through as an object rather than the wire's
+                // JSON string, say — is a read this scan just missed, and
+                // counting it as legible would assert the opposite.
                 if let Some(path) = file_path_arg(arguments) {
-                    read_paths.insert(path);
+                    read_paths.insert(canonical(&path));
+                    legible = true;
                 }
             }
         }
@@ -146,17 +158,28 @@ impl Transcript {
         }
     }
 
-    /// Whether the scan recognised any tool traffic at all.
+    /// Whether this scan is in a position to say a read did *not* happen.
     ///
-    /// False for a transcript that is absent, is pure chat, or names its tools
-    /// in a vocabulary this file does not know. In each case the absence of a
-    /// read is not evidence that none happened, so the rule stands down.
+    /// True only when at least one read was seen and understood. That is a
+    /// deliberately strong bar, and it is not the same as "some tool call was
+    /// recognised": a transcript whose only surviving tool traffic is the
+    /// model's own failed edit proves the scan can read *calls*, not that it
+    /// can see *reads*. Trimmed history is exactly that shape — the read is the
+    /// first thing a compaction drops and the failed edit is the last — so
+    /// treating any recognised call as legibility refuses precisely the
+    /// conversation that already did the read.
+    ///
+    /// The cost is that the very first edit of a conversation is unguarded,
+    /// since nothing has been read yet. That is the right side to err on: the
+    /// rule exists to catch a model editing from memory across a long session,
+    /// and one unguarded opening edit is cheaper than telling a model to
+    /// re-read a file it just read.
     pub fn legible(&self) -> bool {
         self.legible
     }
 
     fn has_read(&self, path: &str) -> bool {
-        self.read_paths.contains(path)
+        self.read_paths.contains(&canonical(path))
     }
 }
 
@@ -232,12 +255,18 @@ fn tool_invocations(message: &Value) -> Vec<(&str, &str)> {
         return found;
     };
 
-    // Responses: a flat `function_call` item.
-    if let (Some(name), Some(arguments)) = (
-        obj.get("name").and_then(Value::as_str),
-        obj.get("arguments").and_then(Value::as_str),
-    ) {
-        found.push((name, arguments));
+    // Responses: a flat `function_call` item. The type is checked rather than
+    // inferred from the name/arguments pair, because other item types carry the
+    // same pair — an `mcp_call` names a tool on some third-party server, and a
+    // server exposing one called `read` would otherwise license an edit to a
+    // file nothing on this machine ever opened.
+    if obj.get("type").and_then(Value::as_str) == Some(super::responses::FUNCTION_CALL) {
+        if let (Some(name), Some(arguments)) = (
+            obj.get("name").and_then(Value::as_str),
+            obj.get("arguments").and_then(Value::as_str),
+        ) {
+            found.push((name, arguments));
+        }
     }
 
     // Chat Completions: an assistant message with `tool_calls[]`.
@@ -258,14 +287,34 @@ fn tool_invocations(message: &Value) -> Vec<(&str, &str)> {
     found
 }
 
-/// Extract the `file_path` or `path` string argument from a raw JSON arguments
-/// string. Returns `None` if the arguments are not a valid object or neither
-/// key is present.
+/// Resolve a path to the identity the read set is keyed on.
+///
+/// Two spellings of one file must compare equal, or the rule refuses an edit
+/// whose read it is holding under another name — `/etc/hosts` against a read of
+/// `/private/etc/hosts` on macOS, or an absolute edit against a relative read.
+/// `canonicalize` collapses symlinks, `.`/`..`, and trailing slashes, and on a
+/// case-insensitive filesystem it also settles case.
+///
+/// It touches the disk and fails on a path that is not there. That is fine for
+/// both callers: a read of a since-deleted file cannot license an edit to a
+/// file that must exist, and an unresolvable path falls back to its literal
+/// form, which is the exact-match behaviour this replaced.
+fn canonical(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Extract the target path from a raw JSON arguments string, under any of the
+/// keys the supported harnesses use. Returns `None` if the arguments are not a
+/// valid object or no such key holds a string — which is why a caller must not
+/// read `None` as "this call has no target".
 fn file_path_arg(arguments: &str) -> Option<String> {
     let obj: Value = serde_json::from_str(arguments).ok()?;
     let map = obj.as_object()?;
     map.get("file_path")
         .or_else(|| map.get("path"))
+        .or_else(|| map.get("notebook_path"))
         .and_then(Value::as_str)
         .map(str::to_string)
 }
@@ -399,7 +448,9 @@ mod tests {
 
     #[test]
     fn edit_without_a_prior_read_fails() {
-        let messages = vec![assistant_call("Grep", json!({"pattern": "fn main"}))];
+        // A read of *another* file: enough to know reads are visible here, and
+        // it is not a read of the file being edited.
+        let messages = vec![assistant_call("Read", json!({"file_path": "/etc/passwd"}))];
         let calls = vec![call(
             "Edit",
             r#"{"file_path":"/etc/hosts","old_string":"a","new_string":"b"}"#,
@@ -444,10 +495,10 @@ mod tests {
     /// the model what an edit's context looks like.
     #[test]
     fn grep_does_not_count_as_a_read() {
-        let messages = vec![assistant_call(
-            "Grep",
-            json!({"path": EXISTING, "pattern": "x"}),
-        )];
+        let messages = vec![
+            assistant_call("Read", json!({"file_path": "/etc/passwd"})),
+            assistant_call("Grep", json!({"path": EXISTING, "pattern": "x"})),
+        ];
         let calls = vec![call(
             "Edit",
             r#"{"file_path":"/etc/hosts","old_string":"a","new_string":"b"}"#,
@@ -472,16 +523,41 @@ mod tests {
     }
 
     #[test]
-    fn every_edit_family_tool_is_guarded() {
-        let messages = vec![assistant_call("Grep", json!({"pattern": "x"}))];
+    fn every_edit_family_tool_is_guarded_in_its_own_argument_shape() {
+        let messages = vec![assistant_call("Read", json!({"file_path": "/etc/passwd"}))];
         let transcript = Transcript::of(&messages);
         for (tool, _) in EDIT_TOOLS {
-            let calls = vec![call(tool, r#"{"file_path":"/etc/hosts","old_string":"a"}"#)];
+            let key = if *tool == "NotebookEdit" {
+                "notebook_path"
+            } else {
+                "file_path"
+            };
+            let arguments = json!({key: EXISTING, "old_string": "a"}).to_string();
             assert!(
-                matches!(check(&calls, &transcript), Precondition::Failed { .. }),
+                matches!(
+                    check(&[call(tool, &arguments)], &transcript),
+                    Precondition::Failed { .. }
+                ),
                 "{tool} was not guarded"
             );
         }
+    }
+
+    /// `apply_patch` names its target inside the patch body, so it is not in
+    /// `EDIT_TOOLS`. This pins that it stays out until the body is parsed —
+    /// listing it would guard nothing while the docs claimed otherwise.
+    #[test]
+    fn apply_patch_is_not_claimed_as_guarded() {
+        assert!(!EDIT_TOOLS.iter().any(|(t, _)| *t == "apply_patch"));
+        let messages = vec![assistant_call("Read", json!({"file_path": "/etc/passwd"}))];
+        let calls = vec![call(
+            "apply_patch",
+            r#"{"patchText":"*** Update File: /etc/hosts"}"#,
+        )];
+        assert!(matches!(
+            check(&calls, &Transcript::of(&messages)),
+            Precondition::Ok
+        ));
     }
 
     // ── Failing open ─────────────────────────────────────────────────────────
@@ -496,8 +572,8 @@ mod tests {
         assert!(matches!(check(&calls, &none()), Precondition::Ok));
     }
 
-    /// A transcript with no recognisable tool traffic is illegible, not empty.
-    /// The reads may be there under names this scan does not know.
+    /// A transcript with no understood read is illegible, not empty. The reads
+    /// may be there under names or shapes this scan does not know.
     #[test]
     fn edit_passes_when_the_transcript_shows_no_tool_traffic() {
         let messages = vec![
@@ -513,12 +589,75 @@ mod tests {
         assert!(matches!(check(&calls, &transcript), Precondition::Ok));
     }
 
-    /// One recognised call is enough to trust the vocabulary, even when that
-    /// call is not itself a read.
+    /// A recognised call that is not a read proves the scan can read *calls*,
+    /// not that it can see *reads*. It must not make the transcript legible.
     #[test]
-    fn any_recognised_tool_call_makes_the_transcript_legible() {
+    fn a_non_read_call_alone_does_not_make_the_transcript_legible() {
         let messages = vec![assistant_call("Bash", json!({"command": "ls"}))];
+        assert!(!Transcript::of(&messages).legible());
+    }
+
+    /// One understood read is the bar, and it licenses the rule for *other*
+    /// paths — that is what makes a refusal possible at all.
+    #[test]
+    fn an_understood_read_makes_the_transcript_legible() {
+        let messages = vec![assistant_call("Read", json!({"file_path": "/etc/passwd"}))];
         assert!(Transcript::of(&messages).legible());
+    }
+
+    /// A `Read` whose path will not parse is a read this scan *missed*. Calling
+    /// that legible would assert the opposite and refuse the next edit.
+    #[test]
+    fn a_read_with_unparseable_arguments_does_not_make_the_transcript_legible() {
+        // `arguments` as a decoded object rather than the wire's JSON string:
+        // a real shape for a client that round-trips its own history.
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "Read", "arguments": {"file_path": EXISTING}},
+            }],
+        })];
+        let transcript = Transcript::of(&messages);
+        assert!(!transcript.legible());
+        let calls = vec![call(
+            "Edit",
+            r#"{"file_path":"/etc/hosts","old_string":"a"}"#,
+        )];
+        assert!(matches!(check(&calls, &transcript), Precondition::Ok));
+    }
+
+    /// The trimmed-history shape: a compaction drops the read and keeps the
+    /// failed edit. Refusing here tells the model to re-read a file it read.
+    #[test]
+    fn a_surviving_failed_edit_does_not_license_a_refusal() {
+        let messages = vec![
+            assistant_call("Edit", json!({"file_path": EXISTING, "old_string": "a"})),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "string not found"}),
+        ];
+        let transcript = Transcript::of(&messages);
+        assert!(!transcript.legible());
+        let calls = vec![call(
+            "Edit",
+            r#"{"file_path":"/etc/hosts","old_string":"a"}"#,
+        )];
+        assert!(matches!(check(&calls, &transcript), Precondition::Ok));
+    }
+
+    /// An `mcp_call` carries the same name/arguments pair as a `function_call`.
+    /// A third-party server exposing `read` must not license a real edit.
+    #[test]
+    fn an_mcp_call_named_read_does_not_count_as_a_read() {
+        let messages = vec![json!({
+            "type": "mcp_call",
+            "server_label": "docs",
+            "name": "read",
+            "arguments": json!({"path": EXISTING}).to_string(),
+        })];
+        let transcript = Transcript::of(&messages);
+        assert!(!transcript.legible());
+        assert!(!transcript.has_read(EXISTING));
     }
 
     /// An edit to a path that is not on disk fails on its own terms, with a
@@ -529,6 +668,23 @@ mod tests {
         let calls = vec![call(
             "Edit",
             &format!(r#"{{"file_path":"{MISSING}","old_string":"a"}}"#),
+        )];
+        assert!(matches!(
+            check(&calls, &Transcript::of(&messages)),
+            Precondition::Ok
+        ));
+    }
+
+    /// `/etc/hosts` is a symlink to `/private/etc/hosts` on macOS. Two spellings
+    /// of one file must not read as two files.
+    #[test]
+    fn two_spellings_of_one_path_compare_equal() {
+        let canonical_form = std::fs::canonicalize(EXISTING).unwrap();
+        let other_spelling = canonical_form.to_string_lossy().into_owned();
+        let messages = vec![assistant_call("Read", json!({"file_path": other_spelling}))];
+        let calls = vec![call(
+            "Edit",
+            r#"{"file_path":"/etc/hosts","old_string":"a"}"#,
         )];
         assert!(matches!(
             check(&calls, &Transcript::of(&messages)),

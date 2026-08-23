@@ -38,6 +38,7 @@
 use std::collections::HashSet;
 
 use super::decode::ToolCall;
+use super::validate::normalize_key;
 use serde_json::Value;
 
 /// Write-only tools that must not target an already-existing file.
@@ -85,18 +86,30 @@ const EDIT_TOOLS: &[(&str, &str)] = &[
     ("NotebookEdit", "Claude Code"),
 ];
 
-/// Tools whose call means the model has seen a file's contents.
+/// Tools whose call means the model has seen a file's contents, normalized.
+///
+/// Matched with [`normalize_key`], so one entry covers every casing and
+/// separator style a harness might use: `readfile` also admits `read_file`,
+/// `readFile`, `ReadFile`, and `read-file`.
+///
+/// Being generous here is the safe direction, and deliberately so. The two
+/// failure modes are not symmetric: a read name this list misses produces a
+/// *false refusal*, telling a model to read a file it already read, while an
+/// over-broad match merely declines to guard an edit. The first breaks a
+/// conversation; the second returns the guard to where it stood before this
+/// rule existed.
 ///
 /// Only whole-file readers count. A `Grep` returns matching lines and a `Glob`
 /// returns names, so neither tells the model what an `Edit`'s context looks
 /// like — treating them as reads would license exactly the blind edit this rule
-/// exists to stop.
+/// exists to stop. `WebFetch` and `TodoRead` are reads of something that is not
+/// a project file, and are likewise out.
 ///
 /// Sources:
 /// - `Read`      — Claude Code
 /// - `read`      — OpenCode, Pi, GitHub Copilot CLI
 /// - `read_file` — Zed AI
-const READ_TOOLS: &[&str] = &["Read", "read", "read_file"];
+const READ_TOOLS: &[&str] = &["read", "readfile"];
 
 /// Outcome of a precondition check.
 pub enum Precondition {
@@ -138,7 +151,7 @@ impl Transcript {
         let mut legible = false;
         for message in messages {
             for (name, arguments) in tool_invocations(message) {
-                if !READ_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(name)) {
+                if !READ_TOOLS.contains(&normalize_key(name).as_str()) {
                     continue;
                 }
                 // Only a read the scan fully understood is evidence that reads
@@ -305,18 +318,31 @@ fn canonical(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Extract the target path from a raw JSON arguments string, under any of the
-/// keys the supported harnesses use. Returns `None` if the arguments are not a
+/// The argument keys that name a tool's target file, normalized.
+///
+/// Ordered: a call carrying both `notebook_path` and `file_path` means the
+/// notebook, which is the more specific target.
+const PATH_KEYS: &[&str] = &["notebookpath", "filepath", "path"];
+
+/// Extract the target path from a raw JSON arguments string, under any spelling
+/// of the keys the supported harnesses use. Returns `None` if the arguments are not a
 /// valid object or no such key holds a string — which is why a caller must not
 /// read `None` as "this call has no target".
 fn file_path_arg(arguments: &str) -> Option<String> {
     let obj: Value = serde_json::from_str(arguments).ok()?;
     let map = obj.as_object()?;
-    map.get("file_path")
-        .or_else(|| map.get("path"))
-        .or_else(|| map.get("notebook_path"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    // Matched on the normalized key rather than a literal list, because the
+    // same argument is spelled differently by every harness — `file_path`
+    // (Claude Code), `filePath` (OpenCode), `path` (Pi, Zed, Copilot CLI) — and
+    // a literal list silently lets the spellings it forgot walk past the guard.
+    // `normalize_key` is the repo's existing answer to that, already used to
+    // repair argument names against a schema.
+    PATH_KEYS.iter().find_map(|wanted| {
+        map.iter()
+            .find(|(key, _)| normalize_key(key) == *wanted)
+            .and_then(|(_, value)| value.as_str())
+            .map(str::to_string)
+    })
 }
 
 #[cfg(test)]
@@ -690,6 +716,56 @@ mod tests {
             check(&calls, &Transcript::of(&messages)),
             Precondition::Ok
         ));
+    }
+
+    /// Every harness spells the path argument differently. A literal key list
+    /// silently let the spellings it forgot walk past both rules — including
+    /// the write rule, which predates this one.
+    #[test]
+    fn every_spelling_of_the_path_argument_is_found() {
+        for key in ["file_path", "filePath", "path", "File_Path", "file-path"] {
+            let arguments = json!({key: EXISTING, "content": "x"}).to_string();
+            assert!(
+                matches!(
+                    check(&[call("Write", &arguments)], &none()),
+                    Precondition::Failed { .. }
+                ),
+                "write guard missed the key {key}"
+            );
+        }
+    }
+
+    /// A read named in a different separator style is the same read. Missing it
+    /// costs a false refusal, so matching is normalized rather than literal.
+    #[test]
+    fn read_tools_are_matched_across_casing_and_separators() {
+        for name in [
+            "Read",
+            "read",
+            "READ",
+            "read_file",
+            "readFile",
+            "ReadFile",
+            "read-file",
+        ] {
+            let messages = vec![assistant_call(name, json!({"file_path": EXISTING}))];
+            let transcript = Transcript::of(&messages);
+            assert!(transcript.legible(), "{name} was not recognised as a read");
+            assert!(transcript.has_read(EXISTING), "{name} recorded no path");
+        }
+    }
+
+    /// A reader of something that is not a project file must not license an
+    /// edit to one.
+    #[test]
+    fn non_file_readers_do_not_count_as_reads() {
+        for name in ["WebFetch", "web_fetch", "TodoRead", "Grep", "Glob"] {
+            let messages = vec![assistant_call(name, json!({"file_path": EXISTING}))];
+            assert!(
+                !Transcript::of(&messages).legible(),
+                "{name} was treated as a file read"
+            );
+        }
     }
 
     #[test]

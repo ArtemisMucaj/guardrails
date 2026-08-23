@@ -332,11 +332,21 @@ async fn run_responses_guardrail(
 
     // Which files this conversation shows being read, for the read-before-edit
     // precondition. Read from the client's original input, before the loop
-    // appends any corrective nudge. A chained turn (`previous_response_id`)
-    // sends no input at all, and the scan is illegible there rather than empty
-    // — which is what makes the rule stand down instead of refusing an edit
-    // whose read is sitting on the backend where the proxy cannot see it.
-    let transcript = crate::domain::precondition::Transcript::of(request.input_items());
+    // appends any corrective nudge.
+    //
+    // A chained turn keeps its history on the backend, so whatever it resends
+    // is a fragment of the conversation rather than the whole of it. Clients
+    // commonly replay the last `function_call` and its output, which is a
+    // parsed read and therefore legible — legible about a fragment, while the
+    // read that matters sits upstream where the proxy cannot see it. Scanning
+    // that would refuse an edit for a read that did happen, so the rule stands
+    // down on the `previous_response_id` signal rather than on the hope that
+    // the resent input is empty.
+    let transcript = if parent_id.is_some() {
+        crate::domain::precondition::Transcript::unavailable()
+    } else {
+        crate::domain::precondition::Transcript::of(request.input_items())
+    };
 
     let emit_metric = |billed: Usage,
                        response_id: Option<String>,

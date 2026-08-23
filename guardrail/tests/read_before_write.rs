@@ -476,6 +476,79 @@ async fn a_trimmed_history_keeping_only_a_failed_edit_does_not_refuse() {
     );
 }
 
+/// A chained Responses turn keeps its history on the backend. Clients commonly
+/// replay the previous call and its output, which parses as a read and so is
+/// legible — legible about a fragment, while the read that matters is upstream.
+/// The rule must stand down on `previous_response_id`, not on the resent input
+/// happening to be empty.
+#[tokio::test]
+async fn a_chained_responses_turn_does_not_refuse() {
+    let file = Fixture::new("chained");
+    let path = file.path();
+    let sse = format!(
+        concat!(
+            r#"data: {{"type":"response.output_item.added","output_index":0,"item":{{"type":"function_call","call_id":"call_1","name":"Edit"}}}}"#,
+            "\n\n",
+            r#"data: {{"type":"response.function_call_arguments.delta","output_index":0,"delta":{delta}}}"#,
+            "\n\n",
+            r#"data: {{"type":"response.completed","response":{{"id":"resp_2","model":"test-model","output":[]}}}}"#,
+            "\n\n",
+        ),
+        delta = Value::String(
+            json!({"file_path": path, "old_string": "original contents", "new_string": "x"})
+                .to_string()
+        )
+    );
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wm_path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .mount(&backend)
+        .await;
+    let proxy = spawn(&backend.uri()).await;
+
+    // Chained, and replaying a read of some *other* file — legible, but a
+    // fragment. The read of the edited file happened in an earlier turn the
+    // backend holds.
+    let got: Value = reqwest::Client::new()
+        .post(format!("{proxy}/v1/responses"))
+        .json(&json!({
+            "model": "test-model",
+            "previous_response_id": "resp_1",
+            "input": [
+                {
+                    "type": "function_call", "call_id": "c9", "name": "Read",
+                    "arguments": "{\"file_path\":\"/etc/passwd\"}"
+                },
+                {"type": "function_call_output", "call_id": "c9", "output": "root:*:0:0:"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"}
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let has_call = got["output"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|i| i["type"] == "function_call"));
+    assert!(has_call, "a chained turn was refused: {got}");
+}
+
 // ── Whole-file writes over an existing file ─────────────────────────────────
 
 /// The rule issue #2 produced, now covered end to end: a whole-file `Write`

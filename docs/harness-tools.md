@@ -105,7 +105,16 @@ edit whose target never appears in a read:
 
 Only whole-file readers count as a read — `Read`, `read`, `read_file`. A `Grep`
 returns matching lines and a `Glob` returns names, so neither tells the model
-what an edit's context looks like.
+what an edit's context looks like, and `WebFetch` / `TodoRead` read something
+that is not a project file.
+
+Tool names and path arguments are both matched after normalising casing and
+separators, so one entry covers every spelling a harness might use: `read_file`
+also admits `readFile`, `ReadFile`, and `read-file`, and the target path is found
+under `file_path`, `filePath`, or `path` alike. That generosity is deliberate on
+the read side — a read name the list misses produces a *false refusal*, telling a
+model to re-read a file it already read, whereas an over-broad match merely
+declines to guard an edit.
 
 Paths are compared after canonicalisation, so a read of `/private/etc/hosts`
 licenses an edit to `/etc/hosts` rather than reading as a different file.
@@ -143,8 +152,15 @@ and keeps the failed edit last. Treating any recognised call as sufficient would
 refuse precisely the conversation that already did the read.
 
 So the rule stands down when the transcript is missing, contains no read it
-could parse, names its tools in an unknown vocabulary, or (on the Responses API)
-is a chained turn whose history lives on the backend. The cost is that the first
+could parse, or names its tools in an unknown vocabulary.
+
+On the Responses API it also stands down for any turn carrying
+`previous_response_id`. A chained turn keeps its history on the backend, and
+whatever input it resends is a fragment: clients commonly replay the previous
+call and its output, which parses as a read and is therefore legible — legible
+about the fragment, while the read that matters sits upstream out of reach.
+Keying on the chaining signal rather than on the resent input being empty is what
+keeps that from refusing an edit whose read did happen. The cost is that the first
 edit of a conversation is unguarded, nothing having been read yet. That is the
 right side to err on: the rule exists to catch a model editing from memory
 across a long session, and one unguarded opening edit is cheaper than telling a

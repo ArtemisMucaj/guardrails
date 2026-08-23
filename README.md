@@ -140,7 +140,7 @@ restart:
 | --- | --- |
 | `GET /providers` | Every provider, its discovered models, and which are exposed. |
 | `POST /providers` | Add a provider (`name`, `base_url`, optional `unversioned`). |
-| `PATCH /providers/{name}` | Set per-model exposure, `enabled`, or `expose_by_default`. |
+| `PATCH /providers/{name}` | Set per-model exposure, `enabled`, or `expose_by_default`. `clear_models: true` drops every stored per-model decision first. |
 | `DELETE /providers/{name}` | Remove a provider. |
 
 ```bash
@@ -151,6 +151,19 @@ curl -X PATCH http://127.0.0.1:8081/providers/remote-a \
 # Or expose nothing except what you pick, for a server with a large catalogue.
 curl -X PATCH http://127.0.0.1:8081/providers/remote-b \
   -d '{"expose_by_default": false, "models": {"qwen3-72b": true}}'
+```
+
+`clear_models` exists because decisions outlive the model they were made for.
+That is deliberate — a model that disappears from a backend and comes back keeps
+whatever you chose for it — but it means a caller working from the *currently
+offered* list cannot undo a decision for a model that has since gone: naming
+what it can see leaves the rest stored and hidden. Clearing is how "forget
+everything I chose" is expressed.
+
+```bash
+# Expose everything again, including models the provider is not offering today.
+curl -X PATCH http://127.0.0.1:8081/providers/copilot \
+  -d '{"clear_models": true}'
 ```
 
 A hidden model is **not served**, not merely unlisted: it disappears from

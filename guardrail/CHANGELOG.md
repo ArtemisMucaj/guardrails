@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/ArtemisMucaj/guardrails/compare/v0.14.0...v0.14.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **routing:** route every request that names a model, and hide per provider ([#69](https://github.com/ArtemisMucaj/guardrails/issues/69)) ([bcb4a17](https://github.com/ArtemisMucaj/guardrails/commit/bcb4a179ae73b0ec2ef8e4f37f9314a9331e5ae4))
+
 ## [0.14.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.13.0...v0.14.0) (2026-08-23)
 
 

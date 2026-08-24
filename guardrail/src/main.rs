@@ -55,7 +55,7 @@ async fn discover_models(
                         .map(|p| p.exposes(id))
                         .unwrap_or(true)
                     {
-                        registry.hide(id.clone());
+                        registry.hide(id.clone(), &name);
                         hidden += 1;
                         continue;
                     }

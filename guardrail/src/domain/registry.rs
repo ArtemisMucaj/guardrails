@@ -19,10 +19,17 @@ pub struct Registry {
     providers: Vec<Arc<Provider>>,
     /// Model id → index into `providers`.
     routes: BTreeMap<String, usize>,
-    /// Model ids discovered but deliberately not exposed. Kept apart from
-    /// `routes` so a hidden model is distinguishable from one that was never
-    /// discovered: the first is refused, the second falls back.
-    hidden: BTreeSet<String>,
+    /// Model id → the providers that discovered it and deliberately do not
+    /// expose it. Kept apart from `routes` so a hidden model is
+    /// distinguishable from one that was never discovered: the first is
+    /// refused, the second falls back.
+    ///
+    /// Per provider, because that is how the configuration models exposure:
+    /// `ProviderConfig::exposes` is answered by one provider about one id.
+    /// Flattening those decisions into a single set meant hiding `gpt-4o` on a
+    /// local server also hid the Copilot one — and worse, left the id routed to
+    /// Copilot while every request for it was refused.
+    hidden: BTreeMap<String, BTreeSet<usize>>,
     /// Index of the provider serving unknown and absent models.
     default: usize,
 }
@@ -34,7 +41,7 @@ impl Registry {
         Self {
             providers: vec![Arc::new(provider)],
             routes: BTreeMap::new(),
-            hidden: BTreeSet::new(),
+            hidden: BTreeMap::new(),
             default: 0,
         }
     }
@@ -65,7 +72,7 @@ impl Registry {
         Some(Self {
             providers: providers.into_iter().map(Arc::new).collect(),
             routes: BTreeMap::new(),
-            hidden: BTreeSet::new(),
+            hidden: BTreeMap::new(),
             default: 0,
         })
     }
@@ -78,7 +85,7 @@ impl Registry {
     /// means another provider already serves this id, which the caller may want
     /// to log.
     pub fn route(&mut self, model: impl Into<String>, provider: &str) -> bool {
-        let Some(index) = self.providers.iter().position(|p| p.name() == provider) else {
+        let Some(index) = self.index_of(provider) else {
             return false;
         };
         let model = model.into();
@@ -89,22 +96,73 @@ impl Registry {
         true
     }
 
-    /// Record `model` as discovered but not exposed.
-    pub fn hide(&mut self, model: impl Into<String>) {
+    /// Record that `provider` discovered `model` and does not expose it.
+    pub fn hide(&mut self, model: impl Into<String>, provider: &str) {
+        let Some(index) = self.index_of(provider) else {
+            return;
+        };
         let model = model.into();
-        self.routes.remove(&model);
-        self.hidden.insert(model);
+        // Only this provider's claim is withdrawn. Another provider may serve
+        // the same id and expose it, and hiding it here must not take that
+        // away — that is the whole point of tracking hiding per provider.
+        if self.routes.get(&model) == Some(&index) {
+            self.routes.remove(&model);
+        }
+        self.hidden.entry(model).or_default().insert(index);
     }
 
-    /// Whether `model` was discovered and deliberately hidden.
+    /// Whether `provider` discovered `model` and chose not to expose it.
     ///
-    /// A provider-qualified id is hidden when the id it names is: otherwise
-    /// `copilot/gpt-4o` would serve a `gpt-4o` the user chose to hide.
+    /// This is the per-entry question `/v1/models` asks while merging
+    /// catalogues: an id hidden on one provider must vanish from that
+    /// provider's listing without touching another's.
+    pub fn hides(&self, provider: &str, model: &str) -> bool {
+        self.index_of(provider)
+            .is_some_and(|index| self.hidden_from(index, model))
+    }
+
+    /// Whether a request naming `model` must be refused rather than forwarded.
+    ///
+    /// Hiding is a per-provider decision, so the question is not "is this id
+    /// hidden anywhere" but "would this request reach a provider that hid it".
+    /// Two ways that happens:
+    ///
+    /// 1. It resolves to a provider that hid the id — including through a
+    ///    qualifier, so `mlx/gpt-4o` is refused while `copilot/gpt-4o` is
+    ///    served if only mlx hid it.
+    /// 2. Nothing routes the id at all and someone hid it, which means every
+    ///    provider holding it hid it. Falling back would either serve what the
+    ///    user hid or reach a provider that never had the model, so refusing is
+    ///    both safer and the more truthful answer.
     pub fn is_hidden(&self, model: &str) -> bool {
-        self.hidden.contains(model)
-            || self
-                .qualified(model)
-                .is_some_and(|(_, bare)| self.hidden.contains(bare))
+        let (index, upstream) = self.target(model);
+        let id = upstream.unwrap_or(model);
+        if !self.hidden.contains_key(id) {
+            return false;
+        }
+        self.hidden_from(index, id) || !self.routes.contains_key(id)
+    }
+
+    fn hidden_from(&self, provider: usize, model: &str) -> bool {
+        self.hidden
+            .get(model)
+            .is_some_and(|hiders| hiders.contains(&provider))
+    }
+
+    fn index_of(&self, provider: &str) -> Option<usize> {
+        self.providers.iter().position(|p| p.name() == provider)
+    }
+
+    /// The provider a request naming `model` resolves to, and the id to send
+    /// upstream when a qualifier was stripped.
+    fn target<'a>(&self, model: &'a str) -> (usize, Option<&'a str>) {
+        if let Some(&index) = self.routes.get(model) {
+            return (index, None);
+        }
+        match self.qualified(model) {
+            Some((index, bare)) => (index, Some(bare)),
+            None => (self.default, None),
+        }
     }
 
     /// Split a provider-qualified id — `copilot/gpt-4o` — into the provider it
@@ -123,16 +181,15 @@ impl Registry {
     /// an instruction about where to send the request, and honouring it for a
     /// model discovery missed is the same leniency [`Self::resolve`] already
     /// extends to unknown ids — with a better destination than the default.
-    pub fn qualified<'a>(&self, model: &'a str) -> Option<(&Arc<Provider>, &'a str)> {
-        if self.routes.contains_key(model) || self.hidden.contains(model) {
+    fn qualified<'a>(&self, model: &'a str) -> Option<(usize, &'a str)> {
+        if self.routes.contains_key(model) || self.hidden.contains_key(model) {
             return None;
         }
         let (name, bare) = model.split_once('/')?;
         if bare.is_empty() {
             return None;
         }
-        let provider = self.providers.iter().find(|p| p.name() == name)?;
-        Some((provider, bare))
+        Some((self.index_of(name)?, bare))
     }
 
     /// The provider serving `model`, or the default when the id is unknown.
@@ -161,17 +218,8 @@ impl Registry {
         let Some(model) = model else {
             return (self.default_provider(), None);
         };
-        if let Some(provider) = self
-            .routes
-            .get(model)
-            .and_then(|&index| self.providers.get(index))
-        {
-            return (provider, None);
-        }
-        match self.qualified(model) {
-            Some((provider, bare)) => (provider, Some(bare)),
-            None => (self.default_provider(), None),
-        }
+        let (index, upstream) = self.target(model);
+        (&self.providers[index], upstream)
     }
 
     /// The provider handling unrouted traffic.
@@ -299,7 +347,7 @@ mod tests {
         // it, hiding a model would route it to the default instead.
         let mut registry = registry();
         registry.route("gpt-4o", "copilot");
-        registry.hide("gpt-4o");
+        registry.hide("gpt-4o", "copilot");
 
         assert!(registry.is_hidden("gpt-4o"));
         assert!(!registry.has_route("gpt-4o"));
@@ -311,10 +359,68 @@ mod tests {
         let mut registry = registry();
         registry.route("gpt-4o", "copilot");
         registry.route("qwen2.5-7b", "lmstudio");
-        registry.hide("gpt-4o");
+        registry.hide("gpt-4o", "copilot");
 
         let routes: Vec<(&str, &str)> = registry.routes().collect();
         assert_eq!(routes, vec![("qwen2.5-7b", "lmstudio")]);
+    }
+
+    #[test]
+    fn hiding_on_one_provider_leaves_another_serving_the_same_id() {
+        // Exposure is a per-provider decision in the configuration, so it has
+        // to be one here too. Flattened into a single set, hiding the local
+        // gpt-4o also hid Copilot's — and left the id routed to Copilot while
+        // every request for it was refused, which is the worst of both.
+        let mut registry = registry();
+        registry.hide("gpt-4o", "lmstudio");
+        assert!(
+            registry.route("gpt-4o", "copilot"),
+            "the id lmstudio withdrew is free for copilot to claim"
+        );
+
+        assert!(!registry.is_hidden("gpt-4o"), "copilot still exposes it");
+        assert_eq!(registry.resolve(Some("gpt-4o")).name(), "copilot");
+        assert!(registry.hides("lmstudio", "gpt-4o"), "hidden in the listing");
+        assert!(!registry.hides("copilot", "gpt-4o"));
+    }
+
+    #[test]
+    fn hiding_survives_the_other_provider_claiming_first() {
+        // Discovery order must not decide the outcome: copilot may be asked
+        // before lmstudio, so hiding has to withdraw only the hider's own
+        // claim rather than whatever route happens to exist.
+        let mut registry = registry();
+        registry.route("gpt-4o", "copilot");
+        registry.hide("gpt-4o", "lmstudio");
+
+        assert!(registry.has_route("gpt-4o"), "copilot's claim is untouched");
+        assert_eq!(registry.resolve(Some("gpt-4o")).name(), "copilot");
+        assert!(!registry.is_hidden("gpt-4o"));
+    }
+
+    #[test]
+    fn an_id_hidden_everywhere_is_refused_rather_than_falling_back() {
+        // Nothing routes it, so the fallback would reach the default provider
+        // — either serving what the user hid, or a provider that never had the
+        // model at all. Refusing is the truthful answer.
+        let mut registry = registry();
+        registry.hide("gpt-4o", "lmstudio");
+        registry.hide("gpt-4o", "copilot");
+
+        assert!(!registry.has_route("gpt-4o"));
+        assert!(registry.is_hidden("gpt-4o"));
+    }
+
+    #[test]
+    fn hiding_the_only_copy_is_refused_even_from_a_non_hiding_default() {
+        // beta alone serves the model and hides it. lmstudio is the default and
+        // never had it, so "did the resolved provider hide it" is not enough on
+        // its own — an unrouted id nobody exposes must still be refused.
+        let mut registry = registry();
+        registry.hide("text-embedding-3-small", "copilot");
+
+        assert_eq!(registry.default_provider().name(), "lmstudio");
+        assert!(registry.is_hidden("text-embedding-3-small"));
     }
 
     #[test]
@@ -379,10 +485,26 @@ mod tests {
         // user's decision not to expose gpt-4o.
         let mut registry = registry();
         registry.route("gpt-4o", "copilot");
-        registry.hide("gpt-4o");
+        registry.hide("gpt-4o", "copilot");
 
         assert!(registry.is_hidden("copilot/gpt-4o"));
         assert!(!registry.is_hidden("copilot/qwen2.5-7b"));
+    }
+
+    #[test]
+    fn a_qualifier_is_refused_only_on_the_provider_that_hid_it() {
+        // The pair that shows hiding is now addressed, not global: the same id,
+        // refused on the provider that hid it and served on the one that
+        // did not.
+        let mut registry = registry();
+        registry.hide("gpt-4o", "lmstudio");
+        registry.route("gpt-4o", "copilot");
+
+        assert!(registry.is_hidden("lmstudio/gpt-4o"));
+        assert!(!registry.is_hidden("copilot/gpt-4o"));
+        let (provider, upstream) = registry.resolve_upstream(Some("copilot/gpt-4o"));
+        assert_eq!(provider.name(), "copilot");
+        assert_eq!(upstream, Some("gpt-4o"));
     }
 
     #[test]

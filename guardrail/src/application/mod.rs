@@ -615,8 +615,10 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
                     // client (or a UI) can tell two same-named models apart.
                     let id = model.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                     // Hidden models are not advertised, so the listing and what
-                    // the proxy will actually serve agree.
-                    if registry.is_hidden(&id) {
+                    // the proxy will actually serve agree. Asked per provider:
+                    // an id hidden on this one must vanish from its catalogue
+                    // without touching another provider's copy.
+                    if registry.hides(provider.name(), &id) {
                         continue;
                     }
                     // An id an earlier provider already claimed routes there, so

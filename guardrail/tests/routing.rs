@@ -215,7 +215,7 @@ async fn a_hidden_model_is_refused_on_the_embeddings_path_too() {
     ])
     .unwrap();
     registry.route("text-embedding-3-small", "beta");
-    registry.hide("text-embedding-3-small");
+    registry.hide("text-embedding-3-small", "beta");
 
     let proxy = spawn_proxy(AppState::with_registry(
         Backend::new(reqwest::Client::new()),
@@ -232,6 +232,56 @@ async fn a_hidden_model_is_refused_on_the_embeddings_path_too() {
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], "model_not_found");
+}
+
+#[tokio::test]
+async fn hiding_a_model_on_one_provider_leaves_another_serving_it() {
+    // The case an operator actually hits: the same id on a local server and on
+    // Copilot, hidden on the local one. It used to 404 everywhere, because
+    // hiding was a single global set — and the listing dropped both copies.
+    let alpha = backend_with_models("alpha", &["gpt-4o"]).await;
+    let beta = backend_with_models("beta", &["gpt-4o"]).await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    // What discovery records when alpha's config hides the id and beta's
+    // exposes it.
+    registry.hide("gpt-4o", "alpha");
+    registry.route("gpt-4o", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    // Served, by the provider that still exposes it.
+    let reply = chat(&proxy, "gpt-4o").await;
+    assert_eq!(reply["id"], "beta");
+    assert_eq!(reply["model"], "gpt-4o");
+
+    // Listed once, bare, under that provider: alpha's copy is gone, beta's is
+    // not pushed to a qualified id by a rival that no longer claims the name.
+    assert_eq!(
+        ids_with_providers(&list_models(&proxy).await),
+        vec![("gpt-4o".to_string(), "beta".to_string())]
+    );
+
+    // And naming alpha explicitly is still refused — hiding is addressed now,
+    // not global, so it holds exactly where it was set.
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "alpha/gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]

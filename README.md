@@ -150,9 +150,10 @@ curl http://127.0.0.1:8080/v1/embeddings \
 ```
 
 The qualifier is the proxy's own addressing and is stripped before the hop, so
-the backend receives the bare `text-embedding-3-small` it published. It is the
+the backend receives the bare `text-embedding-3-small` it published — the
+upstream never sees the `other/` part, and would reject it if it did. It is the
 only way to reach a model id two backends both serve, and it does not override
-exposure: a hidden `gpt-4o` stays hidden as `copilot/gpt-4o`.
+exposure: if `mlx` hides `gpt-4o`, then `mlx/gpt-4o` is refused too.
 
 An id the proxy already knows is never re-read as a qualifier, so a real id
 containing a slash — `lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF` —
@@ -203,6 +204,11 @@ A hidden model is **not served**, not merely unlisted: it disappears from
 advertises and what it will do agree. Exposure decisions are stored per model,
 so a model that vanishes when a backend restarts keeps whatever you chose for
 it.
+
+Exposure is also **per backend**, which is how you pick a vendor for a shared id.
+Hiding `gpt-4o` on `mlx` leaves Copilot's `gpt-4o` listed and served — it simply
+inherits the bare name, since `mlx` has withdrawn its claim on it. Only an id
+that every backend holding it has hidden is refused outright.
 
 ### GitHub Copilot
 

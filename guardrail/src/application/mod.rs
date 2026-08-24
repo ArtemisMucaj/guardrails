@@ -204,6 +204,10 @@ async fn proxy_responses(State(state): State<AppState>, req: Request) -> Respons
             if registry.is_hidden(model) {
                 return not_exposed(model);
             }
+            // Refused here for the same reason as the chat path.
+            if registry.refuses(model) {
+                return not_found(model);
+            }
         }
 
         let (provider, upstream) = registry.resolve_upstream(requested.as_deref());
@@ -727,6 +731,30 @@ fn with_model(body: &[u8], model: &str) -> Option<bytes::Bytes> {
 }
 
 /// The refusal for a model the user chose not to expose.
+/// The proxy's `404` for a model nothing here serves.
+///
+/// Requests naming a model no provider advertised used to be forwarded to the
+/// default provider on the chance discovery had missed it. That guess made the
+/// failure unreadable: the reply carried the *default* provider's catalogue, so
+/// an operator read a model list from a server that was never meant to serve
+/// the request and went off to fix the wrong one. The proxy publishes what it
+/// serves at `/v1/models`; anything else is a `404` it can answer itself,
+/// without a hop and without repeating a list the client can already fetch.
+fn not_found(model: &str) -> Response {
+    warn!(model = %model, "refused: no provider serves this model");
+    json_response(
+        StatusCode::NOT_FOUND,
+        HeaderMap::new(),
+        &serde_json::json!({
+            "error": {
+                "message": format!("The model `{model}` does not exist."),
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        }),
+    )
+}
+
 fn not_exposed(model: &str) -> Response {
     warn!(model = %model, "refused: model is not exposed");
     json_response(
@@ -786,6 +814,12 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         if let Some(model) = requested.as_deref() {
             if registry.is_hidden(model) {
                 return not_exposed(model);
+            }
+            // Nothing advertises it and no qualifier names a provider, so there
+            // is no provider to ask. Answer now rather than forwarding a guess
+            // whose rejection would describe the wrong server.
+            if registry.refuses(model) {
+                return not_found(model);
             }
         }
 

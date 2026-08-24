@@ -346,10 +346,13 @@ async fn hiding_a_model_on_one_provider_leaves_another_serving_it() {
 }
 
 #[tokio::test]
-async fn an_unrouted_model_falls_back_to_the_first_provider() {
-    // Discovery can miss a model a backend loaded after startup. Falling back
-    // keeps those working instead of failing a request the single-backend
-    // proxy would have served.
+async fn a_model_no_provider_serves_is_refused_without_a_hop() {
+    // This used to fall back to the first provider on the chance discovery had
+    // missed a model loaded after startup. The guess cost more than it bought:
+    // its rejection named the default provider's catalogue, so the error
+    // described a server that was never asked to serve the request. The proxy
+    // publishes what it serves at /v1/models, so an id that is not there is a
+    // 404 it can answer itself.
     let alpha = backend_named("alpha").await;
     let beta = backend_named("beta").await;
 
@@ -366,7 +369,15 @@ async fn an_unrouted_model_falls_back_to_the_first_provider() {
     ))
     .await;
 
-    assert_eq!(ask(&proxy, "never-discovered").await, "alpha");
+    let body = chat(&proxy, "never-discovered").await;
+    assert_eq!(body["error"]["code"], "model_not_found");
+    // Bare: no provider names, no catalogue. /v1/models is the list.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert_eq!(message, "The model `never-discovered` does not exist.");
+
+    // And no provider was asked. A hop would have been the whole problem.
+    assert!(alpha.received_requests().await.unwrap().is_empty());
+    assert!(beta.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -689,4 +700,108 @@ async fn every_provider_failing_is_an_error_not_an_empty_list() {
 
     let response = reqwest::get(format!("{proxy}/v1/models")).await.unwrap();
     assert_eq!(response.status(), 502);
+}
+
+#[tokio::test]
+async fn an_unserved_embedding_model_is_refused_without_a_hop() {
+    // The report this came from: a client asked for an embedding model no
+    // provider had. The request was forwarded to the default provider, whose
+    // 404 listed *its* models -- a local server that was never meant to answer
+    // -- so the error pointed at the wrong machine and hid the real cause.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("text-embedding-3-small", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let body = embed(&proxy, "text-embedding-nomic-embed-text-v1.5").await;
+    assert_eq!(body["error"]["code"], "model_not_found");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "The model `text-embedding-nomic-embed-text-v1.5` does not exist."
+    );
+    assert!(alpha.received_requests().await.unwrap().is_empty());
+    assert!(beta.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_qualifier_still_reaches_a_provider_that_never_advertised_the_id() {
+    // Refusing unserved ids must not narrow the qualifier, which is an
+    // instruction about *where* to send a request rather than a claim that the
+    // id was discovered. A provider that loaded a model after startup is still
+    // reachable this way -- the escape hatch that makes refusing the
+    // unqualified case affordable.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    // Nothing routed at all: beta advertised no models.
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let reply = chat(&proxy, "beta/loaded-after-startup").await;
+    assert_eq!(reply["id"], "beta", "the qualifier decides the provider");
+    assert_eq!(
+        reply["model"], "loaded-after-startup",
+        "stripped before the hop"
+    );
+}
+
+#[tokio::test]
+async fn a_lone_provider_still_answers_for_its_own_unknown_models() {
+    // Refusing is for a routing decision that could go wrong. With one provider
+    // there isn't one: its 404 names its own catalogue, which is the truthful
+    // answer, and forwarding preserves the passthrough single-backend users
+    // have. A model it loaded after discovery ran also keeps working.
+    let only = backend_named("only").await;
+
+    let registry = Registry::new(vec![Provider::new("only", only.uri())]).unwrap();
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    assert_eq!(ask(&proxy, "never-discovered").await, "only");
+}
+
+#[tokio::test]
+async fn an_empty_catalogue_refuses_nothing() {
+    // Discovery is best-effort: a provider that was down at startup claims no
+    // models. That is an absent catalogue, not an authoritative empty one, so
+    // refusing against it would take the proxy down until a restart instead of
+    // degrading to how it behaved before discovery ran.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    // Two providers, neither of which reported anything.
+    let registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    assert_eq!(ask(&proxy, "loaded-after-startup").await, "alpha");
 }

@@ -97,8 +97,42 @@ impl Registry {
     }
 
     /// Whether `model` was discovered and deliberately hidden.
+    ///
+    /// A provider-qualified id is hidden when the id it names is: otherwise
+    /// `copilot/gpt-4o` would serve a `gpt-4o` the user chose to hide.
     pub fn is_hidden(&self, model: &str) -> bool {
         self.hidden.contains(model)
+            || self
+                .qualified(model)
+                .is_some_and(|(_, bare)| self.hidden.contains(bare))
+    }
+
+    /// Split a provider-qualified id — `copilot/gpt-4o` — into the provider it
+    /// names and the id to send upstream.
+    ///
+    /// This is the proxy's own addressing scheme, and the only way to reach a
+    /// model id that two providers both serve: `routes` holds one provider per
+    /// id, so the second claimant is otherwise unreachable.
+    ///
+    /// An id the registry already knows is never reinterpreted, because real
+    /// model ids contain slashes — `lmstudio-community/Qwen2.5-Coder-7B-GGUF`
+    /// is one id, not a qualifier, and stays one even if a provider is named
+    /// `lmstudio-community`.
+    ///
+    /// The provider is not asked whether it serves the bare id. A qualifier is
+    /// an instruction about where to send the request, and honouring it for a
+    /// model discovery missed is the same leniency [`Self::resolve`] already
+    /// extends to unknown ids — with a better destination than the default.
+    pub fn qualified<'a>(&self, model: &'a str) -> Option<(&Arc<Provider>, &'a str)> {
+        if self.routes.contains_key(model) || self.hidden.contains(model) {
+            return None;
+        }
+        let (name, bare) = model.split_once('/')?;
+        if bare.is_empty() {
+            return None;
+        }
+        let provider = self.providers.iter().find(|p| p.name() == name)?;
+        Some((provider, bare))
     }
 
     /// The provider serving `model`, or the default when the id is unknown.
@@ -111,10 +145,33 @@ impl Registry {
     /// should check [`Self::is_hidden`] first and refuse rather than falling
     /// back, or hiding a model would silently route it somewhere else.
     pub fn resolve(&self, model: Option<&str>) -> &Arc<Provider> {
-        model
-            .and_then(|model| self.routes.get(model))
+        self.resolve_upstream(model).0
+    }
+
+    /// The provider serving `model`, and the id to send it.
+    ///
+    /// The second element is `Some` only when the client qualified the id with
+    /// a provider name and that qualifier was stripped. The upstream published
+    /// the bare id and would not recognise the qualified one, so a caller that
+    /// forwards a body must rewrite `model` with this before the hop.
+    pub fn resolve_upstream<'a>(
+        &self,
+        model: Option<&'a str>,
+    ) -> (&Arc<Provider>, Option<&'a str>) {
+        let Some(model) = model else {
+            return (self.default_provider(), None);
+        };
+        if let Some(provider) = self
+            .routes
+            .get(model)
             .and_then(|&index| self.providers.get(index))
-            .unwrap_or_else(|| self.default_provider())
+        {
+            return (provider, None);
+        }
+        match self.qualified(model) {
+            Some((provider, bare)) => (provider, Some(bare)),
+            None => (self.default_provider(), None),
+        }
     }
 
     /// The provider handling unrouted traffic.
@@ -258,6 +315,74 @@ mod tests {
 
         let routes: Vec<(&str, &str)> = registry.routes().collect();
         assert_eq!(routes, vec![("qwen2.5-7b", "lmstudio")]);
+    }
+
+    #[test]
+    fn a_provider_qualified_id_reaches_that_provider() {
+        // The only way to reach the loser of a duplicate id: `routes` holds one
+        // provider per id, so without a qualifier copilot's gpt-4o is
+        // unreachable once lmstudio has claimed the name.
+        let mut registry = registry();
+        registry.route("gpt-4o", "lmstudio");
+
+        let (provider, upstream) = registry.resolve_upstream(Some("copilot/gpt-4o"));
+        assert_eq!(provider.name(), "copilot");
+        assert_eq!(
+            upstream,
+            Some("gpt-4o"),
+            "the qualifier is the proxy's, not the upstream's"
+        );
+    }
+
+    #[test]
+    fn an_unqualified_id_is_sent_on_unchanged() {
+        let mut registry = registry();
+        registry.route("gpt-4o", "copilot");
+        assert_eq!(registry.resolve_upstream(Some("gpt-4o")).1, None);
+        assert_eq!(registry.resolve_upstream(None).1, None);
+    }
+
+    #[test]
+    fn a_model_id_containing_a_slash_is_not_a_qualifier() {
+        // Real ids are full of slashes, and one of them may well match a
+        // provider name. An id the registry knows is never re-read as an
+        // address.
+        let mut registry = Registry::new(vec![
+            Provider::new("lmstudio", "http://127.0.0.1:1234"),
+            Provider::new("lmstudio-community", "http://127.0.0.1:9999"),
+        ])
+        .unwrap();
+        let id = "lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF";
+        registry.route(id, "lmstudio");
+
+        let (provider, upstream) = registry.resolve_upstream(Some(id));
+        assert_eq!(provider.name(), "lmstudio", "the exact route wins");
+        assert_eq!(upstream, None, "the id goes upstream whole");
+    }
+
+    #[test]
+    fn an_unknown_prefix_is_not_treated_as_a_provider() {
+        // Only a known provider name qualifies. Anything else is just an
+        // unknown id, which falls back as it always did.
+        let registry = registry();
+        let (provider, upstream) = registry.resolve_upstream(Some("someorg/some-model"));
+        assert_eq!(provider.name(), "lmstudio");
+        assert_eq!(
+            upstream, None,
+            "an unrouted id must reach the default provider unchanged"
+        );
+    }
+
+    #[test]
+    fn a_qualifier_does_not_unhide_a_model() {
+        // Otherwise `copilot/gpt-4o` would be a one-character bypass of the
+        // user's decision not to expose gpt-4o.
+        let mut registry = registry();
+        registry.route("gpt-4o", "copilot");
+        registry.hide("gpt-4o");
+
+        assert!(registry.is_hidden("copilot/gpt-4o"));
+        assert!(!registry.is_hidden("copilot/qwen2.5-7b"));
     }
 
     #[test]

@@ -209,13 +209,19 @@ async fn a_qualified_model_reaches_that_provider_and_arrives_bare() {
 async fn a_hidden_model_is_refused_on_the_embeddings_path_too() {
     // Hiding has to mean the same thing on every path, or it is a suggestion.
     let alpha = backend_named("alpha").await;
+    // Both servers stay bound for the whole test. Letting beta drop here would
+    // leave a dead port behind it, and the 404 below would no longer prove the
+    // proxy refused the request — a regression that forwarded it instead would
+    // fail on a connection error rather than on the behaviour under test.
+    let beta = backend_named("beta").await;
     let mut registry = Registry::new(vec![
         Provider::new("alpha", alpha.uri()),
-        Provider::new("beta", backend_named("beta").await.uri()),
+        Provider::new("beta", beta.uri()),
     ])
     .unwrap();
     registry.route("text-embedding-3-small", "beta");
     registry.hide("text-embedding-3-small", "beta");
+    registry.route("stays-exposed", "beta");
 
     let proxy = spawn_proxy(AppState::with_registry(
         Backend::new(reqwest::Client::new()),
@@ -232,6 +238,10 @@ async fn a_hidden_model_is_refused_on_the_embeddings_path_too() {
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], "model_not_found");
+
+    // beta is up and would have answered: the 404 is the proxy's refusal, not
+    // an unreachable backend.
+    assert_eq!(embed(&proxy, "stays-exposed").await["id"], "beta");
 }
 
 #[tokio::test]

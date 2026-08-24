@@ -739,7 +739,10 @@ async fn a_model_no_provider_advertises_is_answered_by_the_proxy() {
 
     // The proxy answers for itself: the model, the provider it guessed, and
     // where the real list lives.
-    assert!(message.contains("text-embedding-nomic-embed-text-v1.5"), "{message}");
+    assert!(
+        message.contains("text-embedding-nomic-embed-text-v1.5"),
+        "{message}"
+    );
     assert!(message.contains("alpha"), "{message}");
     assert!(message.contains("/v1/models"), "{message}");
     // And the upstream's own catalogue is not passed off as the answer.

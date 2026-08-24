@@ -727,6 +727,36 @@ fn with_model(body: &[u8], model: &str) -> Option<bytes::Bytes> {
 }
 
 /// The refusal for a model the user chose not to expose.
+/// The proxy's own `404` for a model no provider advertises.
+///
+/// An unrouted model is still forwarded to the default provider — discovery can
+/// miss one a backend loaded after startup, and refusing those outright would
+/// make this proxy less useful than the single-backend version it replaces. But
+/// when that guess comes back `404`, relaying the upstream's body is actively
+/// misleading: it names *that* provider's catalogue, so an operator reads a
+/// model list from a server that was never supposed to serve the request and
+/// concludes the routing is broken. Answer for the proxy instead, naming what
+/// was tried and where the real list lives.
+fn unrouted(model: &str, tried: &str, providers: &[String]) -> Response {
+    warn!(model = %model, provider = %tried, "no provider advertises this model");
+    json_response(
+        StatusCode::NOT_FOUND,
+        HeaderMap::new(),
+        &serde_json::json!({
+            "error": {
+                "message": format!(
+                    "No configured provider advertises the model `{model}`. \
+                     It was forwarded to `{tried}` (the default provider), which rejected it. \
+                     Configured providers: {}. See /v1/models for the ids this proxy serves.",
+                    providers.join(", "),
+                ),
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        }),
+    )
+}
+
 fn not_exposed(model: &str) -> Response {
     warn!(model = %model, "refused: model is not exposed");
     json_response(
@@ -793,6 +823,14 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         // OpenAI-compatible client gives us. Requests naming no model at all go
         // to the default provider.
         let (provider, upstream) = registry.resolve_upstream(requested.as_deref());
+        // A named model with no route is a guess, not a routing decision. Keep
+        // the guess — it rescues a model loaded after discovery ran — but
+        // remember it, so a `404` from that provider can be answered honestly
+        // rather than relayed as if the provider had been chosen deliberately.
+        let guessed = requested
+            .as_deref()
+            .filter(|model| !registry.has_route(model))
+            .map(|model| model.to_string());
         let provider = provider.clone();
         let mut body_bytes = body_bytes;
         if let Some(model) = upstream {
@@ -826,7 +864,18 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             });
         }
 
-        state.port.forward(&provider, parts.method, &target, &parts.headers, body_bytes).await
+        let response = state
+            .port
+            .forward(&provider, parts.method, &target, &parts.headers, body_bytes)
+            .await;
+        if let Some(model) = guessed {
+            if response.status() == StatusCode::NOT_FOUND {
+                let names: Vec<String> =
+                    registry.providers().map(|p| p.name().to_string()).collect();
+                return unrouted(&model, provider.name(), &names);
+            }
+        }
+        response
     }
     .instrument(span)
     .await

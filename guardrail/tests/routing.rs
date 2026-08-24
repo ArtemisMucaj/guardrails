@@ -690,3 +690,79 @@ async fn every_provider_failing_is_an_error_not_an_empty_list() {
     let response = reqwest::get(format!("{proxy}/v1/models")).await.unwrap();
     assert_eq!(response.status(), 502);
 }
+
+/// A backend that 404s every model, the way a server answers an id it has never
+/// loaded. The body names its own catalogue — which is exactly what makes the
+/// relayed error misleading when this provider was only a fallback guess.
+async fn backend_rejecting_everything(tag: &str) -> MockServer {
+    let server = MockServer::start().await;
+    let tag = tag.to_string();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!("Model not found. Available models: {tag}-local-model"),
+                    "type": "not_found_error",
+                }
+            }))
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn a_model_no_provider_advertises_is_answered_by_the_proxy() {
+    // The bug this guards: an unrouted model is forwarded to the default
+    // provider as a guess. When that guess 404s, relaying the upstream body
+    // reported the *default* provider's catalogue, so the error read as though
+    // that provider had been chosen on purpose and was missing the model —
+    // sending the reader off to fix the wrong server.
+    let alpha = backend_rejecting_everything("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("model-b", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let body = embed(&proxy, "text-embedding-nomic-embed-text-v1.5").await;
+    let message = body["error"]["message"].as_str().unwrap();
+
+    // The proxy answers for itself: the model, the provider it guessed, and
+    // where the real list lives.
+    assert!(message.contains("text-embedding-nomic-embed-text-v1.5"), "{message}");
+    assert!(message.contains("alpha"), "{message}");
+    assert!(message.contains("/v1/models"), "{message}");
+    // And the upstream's own catalogue is not passed off as the answer.
+    assert!(!message.contains("alpha-local-model"), "{message}");
+    assert_eq!(body["error"]["code"], "model_not_found");
+}
+
+#[tokio::test]
+async fn a_routed_model_still_relays_its_provider_404() {
+    // The substitution is only for a guess. When routing chose the provider
+    // deliberately, its 404 is the truthful answer and must survive untouched.
+    let alpha = backend_rejecting_everything("alpha").await;
+
+    let mut registry = Registry::new(vec![Provider::new("alpha", alpha.uri())]).unwrap();
+    registry.route("model-a", "alpha");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let body = embed(&proxy, "model-a").await;
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("alpha-local-model"), "{message}");
+}

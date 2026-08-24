@@ -217,13 +217,16 @@ impl Registry {
 
     /// The provider serving `model`, or the default when the id is unknown.
     ///
-    /// Unknown ids fall back rather than erroring: discovery can miss a model
-    /// that a backend loaded after startup, and refusing those would make the
-    /// proxy less useful than the single-backend version it replaces.
+    /// The fallback is for requests that name **no** model — every path that
+    /// is not a completion still has to reach some upstream. Callers holding a
+    /// model id should ask [`Self::serves`] first and refuse when it says no:
+    /// falling back there forwards a guess, and the guess's rejection describes
+    /// whichever provider happens to be default rather than the real problem,
+    /// which is that nothing here serves the id.
     ///
-    /// A *hidden* id is not unknown — the user decided against it — so callers
-    /// should check [`Self::is_hidden`] first and refuse rather than falling
-    /// back, or hiding a model would silently route it somewhere else.
+    /// A *hidden* id is likewise not unknown — the user decided against it —
+    /// so [`Self::is_hidden`] is checked first and refused separately, or
+    /// hiding a model would silently route it somewhere else.
     pub fn resolve(&self, model: Option<&str>) -> &Arc<Provider> {
         self.resolve_upstream(model).0
     }
@@ -266,6 +269,42 @@ impl Registry {
     /// Whether an explicit route exists for `model`.
     pub fn has_route(&self, model: &str) -> bool {
         self.routes.contains_key(model)
+    }
+
+    /// Whether the registry can place `model`: an id some provider advertised
+    /// at discovery, or one addressed with the proxy's own `provider/model`
+    /// qualifier.
+    ///
+    /// A model that is neither is one nothing here serves, and the proxy
+    /// refuses it rather than guessing a provider. Note this is deliberately
+    /// wider than [`Self::has_route`]: a qualifier is an instruction about
+    /// where to send a request, so it is honoured whether or not the named
+    /// provider advertised the bare id.
+    pub fn serves(&self, model: &str) -> bool {
+        self.routes.contains_key(model) || self.qualified(model).is_some()
+    }
+
+    /// Whether `model` should be refused outright rather than forwarded.
+    ///
+    /// Refusing needs more than "no route": it needs the registry to be in a
+    /// position to say so, which is why this is narrower than `!serves`.
+    ///
+    /// With a **single** provider there is no routing decision to get wrong.
+    /// That provider's own `404` names its own catalogue, which is the truthful
+    /// answer, and forwarding keeps the byte-for-byte passthrough single-
+    /// backend users have today — the same reason `/v1/models` does not tag a
+    /// lone provider's reply.
+    ///
+    /// With **no** discovered models the catalogue is not authoritative, it is
+    /// absent: discovery is best-effort and a provider that was down at startup
+    /// claims nothing. Refusing against an empty catalogue would take the whole
+    /// proxy down with it until a restart, rather than degrading to the
+    /// behaviour it had before discovery ran.
+    ///
+    /// Everything else — several providers, a real catalogue, an id in none of
+    /// it and no qualifier naming where to send it — has no provider to ask.
+    pub fn refuses(&self, model: &str) -> bool {
+        self.providers.len() > 1 && !self.routes.is_empty() && !self.serves(model)
     }
 
     /// Model ids with an explicit route, paired with their provider's name.

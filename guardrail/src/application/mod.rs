@@ -189,15 +189,24 @@ async fn proxy_responses(State(state): State<AppState>, req: Request) -> Respons
             None
         };
 
+        // Falls back to the raw body for the same reason the chat path does:
+        // `ResponsesRequest` types `tools`, so a request naming a perfectly good
+        // model alongside a malformed one fails to parse, and routing it to the
+        // default — with its qualifier still attached — is the wrong answer to a
+        // question the body does answer.
+        let requested = request
+            .as_ref()
+            .map(|r| r.model.clone())
+            .or_else(|| model_in_body(&parts.method, &body_bytes));
+
         let registry = state.registry.read().await.clone();
-        if let Some(request) = request.as_ref() {
-            if registry.is_hidden(&request.model) {
-                return not_exposed(&request.model);
+        if let Some(model) = requested.as_deref() {
+            if registry.is_hidden(model) {
+                return not_exposed(model);
             }
         }
 
-        let (provider, upstream) =
-            registry.resolve_upstream(request.as_ref().map(|r| r.model.as_str()));
+        let (provider, upstream) = registry.resolve_upstream(requested.as_deref());
         let provider = provider.clone();
         let upstream = upstream.map(str::to_string);
         let mut body_bytes = body_bytes;
@@ -631,7 +640,13 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
                         None
                     } else {
                         let qualified = format!("{}/{}", provider.name(), id);
-                        if !seen.insert(qualified.clone()) {
+                        // Only advertise an alias routing will honour. When
+                        // some provider really publishes this string as a model
+                        // id, resolving it finds that model rather than this
+                        // one, so listing it here would name the wrong thing.
+                        // The duplicate goes unlisted instead, as it did before
+                        // aliases existed.
+                        if registry.knows(&qualified) || !seen.insert(qualified.clone()) {
                             continue;
                         }
                         Some(qualified)

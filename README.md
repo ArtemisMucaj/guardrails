@@ -155,9 +155,16 @@ upstream never sees the `other/` part, and would reject it if it did. It is the
 only way to reach a model id two backends both serve, and it does not override
 exposure: if `mlx` hides `gpt-4o`, then `mlx/gpt-4o` is refused too.
 
-An id the proxy already knows is never re-read as a qualifier, so a real id
-containing a slash — `lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF` —
-routes as itself even if a backend happens to share the first segment's name.
+A real model id always wins over the alias that looks like it. An id the proxy
+knows is never re-read as a qualifier, so
+`lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF` routes as itself even if a
+backend shares the first segment's name — and when an alias would collide with
+such an id, the duplicate is left unlisted rather than advertised under a name
+that reaches something else.
+
+The qualifier is matched against the backend names that exist, not split at the
+first `/`, so a backend named `vendor/pool` is addressable as
+`vendor/pool/model`. If two names both prefix an id, the longer one wins.
 
 ### Choosing which models are exposed
 

@@ -177,19 +177,42 @@ impl Registry {
     /// is one id, not a qualifier, and stays one even if a provider is named
     /// `lmstudio-community`.
     ///
+    /// Matching is against the provider names that actually exist rather than
+    /// a split at the first `/`, because a provider name may itself contain one
+    /// — nothing rejects `--backend vendor/pool=URL`. Splitting blindly sent
+    /// `vendor/pool/model` looking for a provider called `vendor`, and it
+    /// landed on the default instead. The longest name wins, so the most
+    /// specific address is the one honoured.
+    ///
     /// The provider is not asked whether it serves the bare id. A qualifier is
     /// an instruction about where to send the request, and honouring it for a
     /// model discovery missed is the same leniency [`Self::resolve`] already
     /// extends to unknown ids — with a better destination than the default.
     fn qualified<'a>(&self, model: &'a str) -> Option<(usize, &'a str)> {
-        if self.routes.contains_key(model) || self.hidden.contains_key(model) {
+        if self.knows(model) {
             return None;
         }
-        let (name, bare) = model.split_once('/')?;
-        if bare.is_empty() {
-            return None;
-        }
-        Some((self.index_of(name)?, bare))
+        self.providers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, provider)| {
+                let bare = model
+                    .strip_prefix(provider.name())?
+                    .strip_prefix('/')
+                    .filter(|bare| !bare.is_empty())?;
+                Some((index, bare))
+            })
+            .max_by_key(|&(index, _)| self.providers[index].name().len())
+    }
+
+    /// Whether the registry knows `model` as a model id in its own right —
+    /// routed by some provider, or discovered and hidden.
+    ///
+    /// The question a provider-qualified alias has to survive: if some provider
+    /// really publishes `beta/shared`, then that string names a model and
+    /// cannot also address beta's `shared`.
+    pub fn knows(&self, model: &str) -> bool {
+        self.routes.contains_key(model) || self.hidden.contains_key(model)
     }
 
     /// The provider serving `model`, or the default when the id is unknown.
@@ -464,6 +487,68 @@ mod tests {
         let (provider, upstream) = registry.resolve_upstream(Some(id));
         assert_eq!(provider.name(), "lmstudio", "the exact route wins");
         assert_eq!(upstream, None, "the id goes upstream whole");
+    }
+
+    #[test]
+    fn a_provider_name_containing_a_slash_still_addresses_itself() {
+        // Nothing rejects `--backend vendor/pool=URL`, and splitting the id at
+        // the first `/` looked for a provider called `vendor`, found none, and
+        // fell back to the default — so `/v1/models` advertised an alias that
+        // routing sent somewhere else entirely.
+        let mut registry = Registry::new(vec![
+            Provider::new("mlx", "http://127.0.0.1:8000"),
+            Provider::new("vendor/pool", "http://127.0.0.1:9000"),
+        ])
+        .unwrap();
+        registry.route("shared", "mlx");
+
+        let (provider, upstream) = registry.resolve_upstream(Some("vendor/pool/shared"));
+        assert_eq!(provider.name(), "vendor/pool");
+        assert_eq!(upstream, Some("shared"));
+    }
+
+    #[test]
+    fn the_longest_matching_provider_name_wins() {
+        // `vendor` and `vendor/pool` both prefix `vendor/pool/shared`. The more
+        // specific address is the one the client can only have meant.
+        let mut registry = Registry::new(vec![
+            Provider::new("vendor", "http://127.0.0.1:8000"),
+            Provider::new("vendor/pool", "http://127.0.0.1:9000"),
+        ])
+        .unwrap();
+        registry.route("shared", "vendor");
+
+        let (provider, upstream) = registry.resolve_upstream(Some("vendor/pool/shared"));
+        assert_eq!(provider.name(), "vendor/pool");
+        assert_eq!(upstream, Some("shared"));
+
+        // The shorter name still addresses its own models.
+        let (provider, upstream) = registry.resolve_upstream(Some("vendor/other"));
+        assert_eq!(provider.name(), "vendor");
+        assert_eq!(upstream, Some("other"));
+    }
+
+    #[test]
+    fn a_real_model_id_wins_over_the_alias_that_looks_like_it() {
+        // A provider named `beta` and a real model literally called
+        // `beta/shared` collide in the alias namespace. The real id is a model
+        // a client can ask for; the alias is the proxy's invention, so the
+        // model wins and `knows` reports the clash for the listing to skip.
+        let mut registry = Registry::new(vec![
+            Provider::new("alpha", "http://127.0.0.1:1"),
+            Provider::new("beta", "http://127.0.0.1:2"),
+        ])
+        .unwrap();
+        registry.route("shared", "alpha");
+        registry.route("beta/shared", "beta");
+
+        assert!(registry.knows("beta/shared"));
+        let (provider, upstream) = registry.resolve_upstream(Some("beta/shared"));
+        assert_eq!(provider.name(), "beta");
+        assert_eq!(
+            upstream, None,
+            "the real model id goes upstream whole, not stripped to `shared`"
+        );
     }
 
     #[test]

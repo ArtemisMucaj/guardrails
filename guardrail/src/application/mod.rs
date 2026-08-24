@@ -94,6 +94,26 @@ pub trait BackendPort: Send + Sync {
     ) -> Response;
 }
 
+/// Port: asking a provider which models it serves.
+///
+/// Separate from [`BackendPort`] because it is not on the request path. This is
+/// what discovery calls — at startup and again whenever the catalogue is
+/// refreshed — to learn which ids route where.
+///
+/// It is a port rather than a free function for the same reason the rest of
+/// this layer is: the adapter owns the provider's HTTP client, so a provider
+/// that presents its own credential is asked with it rather than through a
+/// second, unauthenticated client that would be answered with a `401`.
+#[async_trait::async_trait]
+pub trait DiscoveryPort: Send + Sync {
+    /// The models `provider` reports, or the error that prevented asking.
+    ///
+    /// Errors are returned rather than swallowed: a caller has to be able to
+    /// tell "this provider serves nothing" from "this provider could not be
+    /// asked", because only the first is a reason to stop routing to it.
+    async fn list_models(&self, provider: &Provider) -> anyhow::Result<Vec<openai_rs::Model>>;
+}
+
 const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 /// The live registry, swappable at runtime by the management API.

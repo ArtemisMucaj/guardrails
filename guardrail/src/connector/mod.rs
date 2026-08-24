@@ -10,7 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::application::BackendPort;
+use openai_rs::ModelCatalog;
+
+use crate::application::{BackendPort, DiscoveryPort};
 use crate::domain::provider::Provider;
 use crate::domain::sse::StreamItem;
 
@@ -335,6 +337,38 @@ impl BackendPort for Backend {
             }
         };
         relay_response(resp)
+    }
+}
+
+#[async_trait::async_trait]
+impl DiscoveryPort for Backend {
+    /// List a provider's models.
+    ///
+    /// Delegates to `openai-rs`, which already normalises the several shapes an
+    /// OpenAI-compatible `/models` response comes in into one `Model` type. It
+    /// is built on the provider's own HTTP client — Copilot's carries the
+    /// credential its catalogue requires — via the transport escape hatch, so
+    /// this shares the connection pool and auth rather than constructing a
+    /// second client that would not be authenticated.
+    ///
+    /// The routes follow the provider too: one serving at the root is asked at
+    /// `/models` rather than a `/v1/models` it would answer with a `404`.
+    async fn list_models(&self, provider: &Provider) -> anyhow::Result<Vec<openai_rs::Model>> {
+        let routes = if provider.is_unversioned() {
+            openai_rs::ApiRoutes::unversioned()
+        } else {
+            openai_rs::ApiRoutes::default()
+        };
+        let transport = openai_rs::Transport::with_http_client(
+            self.client_for(provider).clone(),
+            provider.base_url(),
+            routes,
+        );
+        Ok(
+            openai_rs::OpenAiModelCatalog::with_transport(transport)
+                .list_models()
+                .await?,
+        )
     }
 }
 

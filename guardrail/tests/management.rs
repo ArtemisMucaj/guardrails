@@ -16,6 +16,16 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// A backend serving `models` and answering chat completions.
 async fn backend_with(tag: &str, models: &[&str]) -> MockServer {
     let server = MockServer::start().await;
+    serve_models(&server, tag, models).await;
+    server
+}
+
+/// Mount the catalogue and completion routes on `server`.
+///
+/// Separate from [`backend_with`] so a test can restate what a provider serves
+/// — after `MockServer::reset` — and model a backend that loaded a model after
+/// the proxy started.
+async fn serve_models(server: &MockServer, tag: &str, models: &[&str]) {
     let data: Vec<serde_json::Value> = models
         .iter()
         .map(|id| serde_json::json!({"id": id, "object": "model"}))
@@ -25,16 +35,15 @@ async fn backend_with(tag: &str, models: &[&str]) -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list", "data": data,
         })))
-        .mount(&server)
+        .mount(server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_string(format!(
             r#"{{"id":"{tag}","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}]}}"#
         )))
-        .mount(&server)
+        .mount(server)
         .await;
-    server
 }
 
 fn temp_config(label: &str) -> std::path::PathBuf {
@@ -76,7 +85,12 @@ async fn harness(label: &str, servers: &[(&str, &MockServer, &[&str])]) -> Harne
     }
 
     let shared: SharedRegistry = Arc::new(tokio::sync::RwLock::new(Arc::new(registry)));
-    let management = Management::new(shared.clone(), config, config_path.clone());
+    // Discovery goes through the same `Backend` the proxy forwards with, so a
+    // refresh asks the mock servers themselves.
+    let management = Arc::new(
+        Management::new(shared.clone(), config, config_path.clone())
+            .with_discovery(Arc::new(Backend::new(reqwest::Client::new()))),
+    );
     for (name, _, models) in servers {
         management
             .set_discovered(name, models.iter().map(|m| openai_rs::Model::new(*m)).collect())
@@ -122,6 +136,33 @@ async fn harness(label: &str, servers: &[(&str, &MockServer, &[&str])]) -> Harne
 
 async fn get_json(url: String) -> serde_json::Value {
     reqwest::get(url).await.unwrap().json().await.unwrap()
+}
+
+async fn post_json(url: String) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new().post(url).send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap())
+}
+
+/// The discovery entry for `provider`.
+fn discovered<'a>(body: &'a serde_json::Value, provider: &str) -> &'a serde_json::Value {
+    body["discovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == provider)
+        .unwrap_or_else(|| panic!("no discovery entry for {provider}"))
+}
+
+/// Whether the live registry routes `model`, as `GET /providers` reports it.
+fn routes(body: &serde_json::Value, provider: &str, model: &str) -> bool {
+    body["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"] == provider)
+        .flat_map(|p| p["models"].as_array().unwrap())
+        .any(|m| m["id"] == model && m["routed"] == true)
 }
 
 /// Ask for a completion; returns (status, responding backend tag).
@@ -509,4 +550,179 @@ async fn clearing_decisions_releases_models_a_caller_can_no_longer_name() {
         .filter(|m| m["exposed"] == true)
         .count();
     assert_eq!(exposed, 3);
+}
+
+#[tokio::test]
+async fn a_model_loaded_after_startup_becomes_routable_without_a_restart() {
+    // The whole point of the endpoint. Discovery is a startup snapshot, so an
+    // id a provider picks up later is advertised by the live `/v1/models` and
+    // refused by routing — until something re-asks.
+    let alpha = backend_with("alpha", &["a"]).await;
+    let beta = backend_with("beta", &["b"]).await;
+    let h = harness(
+        "refresh-late-model",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    let (status, body) = ask(&h.proxy, "c").await;
+    assert_eq!(status, 404, "nothing discovered it: {body}");
+
+    // beta loads it.
+    beta.reset().await;
+    serve_models(&beta, "beta", &["b", "c"]).await;
+
+    let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
+    assert_eq!(status, 200);
+    assert_eq!(discovered(&body, "beta")["refreshed"], true);
+    assert_eq!(discovered(&body, "beta")["models"], 2);
+    assert!(routes(&body, "beta", "c"), "the new id is routed: {body}");
+
+    let (status, tag) = ask(&h.proxy, "c").await;
+    assert_eq!(status, 200, "no restart needed");
+    assert_eq!(tag, "beta", "and it reaches the provider that loaded it");
+}
+
+#[tokio::test]
+async fn an_unreachable_provider_keeps_the_catalogue_it_had() {
+    // The failure mode a refresh must not have: emptying a good catalogue on a
+    // transient error turns every model that provider serves into a 404, which
+    // is worse than the staleness the refresh set out to fix.
+    let alpha = backend_with("alpha", &["a"]).await;
+    let beta = backend_with("beta", &["b"]).await;
+    let h = harness(
+        "refresh-unreachable",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    // beta's catalogue endpoint fails, while beta itself keeps answering
+    // completions — a restarting server, a rate limit, a blip.
+    beta.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&beta)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"id":"beta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        ))
+        .mount(&beta)
+        .await;
+
+    let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
+    assert_eq!(status, 200, "one provider failing is not a failed refresh");
+    assert_eq!(discovered(&body, "alpha")["refreshed"], true);
+    assert_eq!(discovered(&body, "beta")["refreshed"], false);
+    assert!(
+        discovered(&body, "beta")["error"].is_string(),
+        "the caller is told why: {body}"
+    );
+    assert_eq!(discovered(&body, "beta")["models"], 1, "kept, not emptied");
+    assert!(routes(&body, "beta", "b"), "still routed: {body}");
+    assert!(routes(&body, "alpha", "a"));
+    assert_eq!(
+        ask(&h.proxy, "b").await,
+        (200, "beta".to_string()),
+        "a live model stays served through its provider's blip"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_reporting_nothing_keeps_the_catalogue_it_had() {
+    // A local server answering `200 []` while it loads its index is the same
+    // transient as an unreachable one, so it is treated the same way — and
+    // reported distinctly, with no error, so a caller can tell them apart.
+    let alpha = backend_with("alpha", &["a"]).await;
+    let beta = backend_with("beta", &["b"]).await;
+    let h = harness(
+        "refresh-empty",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    beta.reset().await;
+    serve_models(&beta, "beta", &[]).await;
+
+    let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
+    assert_eq!(status, 200);
+    assert_eq!(discovered(&body, "beta")["refreshed"], false);
+    assert!(
+        discovered(&body, "beta")["error"].is_null(),
+        "answered, so not an error: {body}"
+    );
+    assert_eq!(discovered(&body, "beta")["models"], 1, "kept, not emptied");
+    assert_eq!(ask(&h.proxy, "b").await, (200, "beta".to_string()));
+}
+
+#[tokio::test]
+async fn a_refresh_picks_up_a_model_a_provider_stopped_hiding() {
+    // Exposure decisions outlive discovery, so a refresh has to apply them to
+    // whatever comes back rather than routing everything it is told about.
+    let alpha = backend_with("alpha", &["a", "secret"]).await;
+    let beta = backend_with("beta", &["b"]).await;
+    let h = harness(
+        "refresh-honours-exposure",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    let hidden = reqwest::Client::new()
+        .patch(format!("{}/providers/alpha", h.admin))
+        .json(&serde_json::json!({"models": {"secret": false}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), 200);
+
+    let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
+    assert_eq!(status, 200);
+    assert_eq!(discovered(&body, "alpha")["models"], 2, "both discovered");
+    assert!(
+        !routes(&body, "alpha", "secret"),
+        "the decision survives the refresh: {body}"
+    );
+    assert_eq!(ask(&h.proxy, "secret").await.0, 404);
+    assert!(routes(&body, "alpha", "a"));
+}
+
+#[tokio::test]
+async fn a_removed_provider_forgets_what_it_reported() {
+    // The catalogue is keyed by name and would otherwise outlive the entry, so
+    // re-adding a provider under the same name would resurrect models it may no
+    // longer serve — routed immediately, before it has been asked anything.
+    let alpha = backend_with("alpha", &["a"]).await;
+    let beta = backend_with("beta", &["b"]).await;
+    let h = harness(
+        "refresh-forgets",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    let removed = reqwest::Client::new()
+        .delete(format!("{}/providers/beta", h.admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+
+    let added = reqwest::Client::new()
+        .post(format!("{}/providers", h.admin))
+        .json(&serde_json::json!({"name": "beta", "base_url": beta.uri()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+    let body: serde_json::Value = added.json().await.unwrap();
+    assert!(
+        !routes(&body, "beta", "b"),
+        "nothing is claimed before it is asked: {body}"
+    );
+
+    // And a refresh is what puts it back.
+    let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
+    assert_eq!(status, 200);
+    assert!(routes(&body, "beta", "b"), "{body}");
 }

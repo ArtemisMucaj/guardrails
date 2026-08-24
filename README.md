@@ -121,7 +121,11 @@ cargo run -p guardrail -- \
 At startup the proxy asks each backend which models it serves and builds the
 routing table from the answers, so the model list is never hand-maintained. A
 backend that is unreachable at startup keeps its place — a local server is often
-started after the proxy — it simply claims no models until the next restart.
+started after the proxy — it simply claims no models until it is asked again.
+
+Asking again is `POST /discovery` on the admin port, which is how a model
+loaded after startup becomes routable without a restart; see
+[Picking up a model loaded after startup](#picking-up-a-model-loaded-after-startup).
 
 Four rules make routing predictable:
 
@@ -181,7 +185,8 @@ restart:
 | `GET /providers` | Every provider, its discovered models, and which are exposed. |
 | `POST /providers` | Add a provider (`name`, `base_url`, optional `unversioned`). |
 | `PATCH /providers/{name}` | Set per-model exposure, `enabled`, or `expose_by_default`. `clear_models: true` drops every stored per-model decision first. |
-| `DELETE /providers/{name}` | Remove a provider. |
+| `DELETE /providers/{name}` | Remove a provider, and forget what it reported. |
+| `POST /discovery` | Re-ask every enabled provider what it serves, and route on the answer. |
 
 ```bash
 # Hide one model.
@@ -216,6 +221,43 @@ Exposure is also **per backend**, which is how you pick a vendor for a shared id
 Hiding `gpt-4o` on `mlx` leaves Copilot's `gpt-4o` listed and served — it simply
 inherits the bare name, since `mlx` has withdrawn its claim on it. Only an id
 that every backend holding it has hidden is refused outright.
+
+### Picking up a model loaded after startup
+
+Discovery runs at startup: each provider is asked what it serves, and the answer
+is what routing is decided from. `GET /v1/models` is answered live, by contrast,
+so the two drift apart the moment a provider loads a model — the id shows up in
+the listing while a request naming it is refused as unserved, until the proxy
+restarts. Local servers that load on demand are the obvious way to hit this.
+
+`POST /discovery` re-asks every enabled provider and rebuilds routing on the
+answer. Startup is the same call, so there is one place routes come from.
+
+```bash
+curl -X POST http://127.0.0.1:8081/discovery
+```
+
+```json
+{
+  "discovery": [
+    { "name": "lmstudio", "models": 12, "refreshed": true },
+    { "name": "remote-a", "models": 4, "refreshed": false, "error": "..." }
+  ],
+  "providers": [ "... the same shape GET /providers returns ..." ]
+}
+```
+
+It is best-effort per provider, and the response says which. A provider that
+cannot be reached **keeps the catalogue it had** rather than losing it — a blip
+must not start refusing models that are still live, which would make refreshing
+riskier than staying stale. An empty reply is treated the same way and reported
+with no `error`, because a local server answering `200 []` while it loads its
+index is the same transient in different clothes. The cost: a provider that
+genuinely stops serving everything keeps its ids until it is removed, where a
+stale route forwards and gets that provider's own `404`.
+
+Your exposure decisions are applied to whatever comes back, so a refresh never
+un-hides a model you hid.
 
 ### GitHub Copilot
 
@@ -511,7 +553,8 @@ authenticated.
 | `GET /providers` | Providers, their discovered models, and exposure. |
 | `POST /providers` | Add a provider. |
 | `PATCH /providers/{name}` | Change exposure for one provider. |
-| `DELETE /providers/{name}` | Remove a provider. |
+| `DELETE /providers/{name}` | Remove a provider, and forget what it reported. |
+| `POST /discovery` | Re-run model discovery against every enabled provider. |
 | `GET /copilot/login` | Current device-flow status. Only present with `--copilot`. |
 | `POST /copilot/login` | Start (or restart) the device flow; returns the `user_code` and `verification_uri`. Only present with `--copilot`. |
 | `GET /` | Lists the available endpoints. |

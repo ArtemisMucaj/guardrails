@@ -243,6 +243,53 @@ async fn a_hidden_model_is_refused_rather_than_falling_back() {
 }
 
 #[tokio::test]
+async fn hiding_a_shared_id_on_one_provider_leaves_the_other_serving_it() {
+    // Exposure is stored per provider, so it has to behave per provider. It
+    // used to collapse into one global set: hiding the local `gpt-4o` also
+    // refused Copilot's, and the listing lost both copies — the operator's only
+    // way to prefer one vendor's build of a model silently disabled it
+    // everywhere.
+    let alpha = backend_with("alpha", &["gpt-4o"]).await;
+    let beta = backend_with("beta", &["gpt-4o", "only-beta"]).await;
+    let h = harness(
+        "shared-hide",
+        &[
+            ("alpha", &alpha, &["gpt-4o"]),
+            ("beta", &beta, &["gpt-4o", "only-beta"]),
+        ],
+    )
+    .await;
+
+    // alpha listed it first, so it holds the bare name and beta's copy is
+    // qualified.
+    assert_eq!(ask(&h.proxy, "gpt-4o").await, (200, "alpha".to_string()));
+    assert_eq!(
+        listed_ids(&get_json(format!("{}/v1/models", h.proxy)).await),
+        vec!["beta/gpt-4o", "gpt-4o", "only-beta"]
+    );
+
+    let response = reqwest::Client::new()
+        .patch(format!("{}/providers/alpha", h.admin))
+        .json(&serde_json::json!({"models": {"gpt-4o": false}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // beta inherits the bare name, and serving it is the point: the request
+    // must succeed, not 404.
+    assert_eq!(ask(&h.proxy, "gpt-4o").await, (200, "beta".to_string()));
+    assert_eq!(
+        listed_ids(&get_json(format!("{}/v1/models", h.proxy)).await),
+        vec!["gpt-4o", "only-beta"],
+        "alpha's copy is gone and beta's is no longer crowded onto a qualifier"
+    );
+
+    // The hide still holds exactly where it was set.
+    assert_eq!(ask(&h.proxy, "alpha/gpt-4o").await.0, 404);
+}
+
+#[tokio::test]
 async fn a_change_is_persisted_so_it_survives_a_restart() {
     let alpha = backend_with("alpha", &["a", "b"]).await;
     let h = harness("persist", &[("alpha", &alpha, &["a", "b"])]).await;

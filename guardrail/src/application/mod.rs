@@ -183,36 +183,42 @@ async fn proxy_responses(State(state): State<AppState>, req: Request) -> Respons
             }
         };
 
-        let request = if parts.method == axum::http::Method::POST {
+        let mut request = if parts.method == axum::http::Method::POST {
             serde_json::from_slice::<ResponsesRequest>(&body_bytes).ok()
         } else {
             None
         };
 
+        // Falls back to the raw body for the same reason the chat path does:
+        // `ResponsesRequest` types `tools`, so a request naming a perfectly good
+        // model alongside a malformed one fails to parse, and routing it to the
+        // default — with its qualifier still attached — is the wrong answer to a
+        // question the body does answer.
+        let requested = request
+            .as_ref()
+            .map(|r| r.model.clone())
+            .or_else(|| model_in_body(&parts.method, &body_bytes));
+
         let registry = state.registry.read().await.clone();
-        if let Some(request) = request.as_ref() {
-            if registry.is_hidden(&request.model) {
-                warn!(model = %request.model, "refused: model is not exposed");
-                return json_response(
-                    StatusCode::NOT_FOUND,
-                    HeaderMap::new(),
-                    &serde_json::json!({
-                        "error": {
-                            "message": format!(
-                                "The model `{}` is not exposed by this proxy.",
-                                request.model
-                            ),
-                            "type": "invalid_request_error",
-                            "code": "model_not_found",
-                        }
-                    }),
-                );
+        if let Some(model) = requested.as_deref() {
+            if registry.is_hidden(model) {
+                return not_exposed(model);
             }
         }
 
-        let provider = registry
-            .resolve(request.as_ref().map(|r| r.model.as_str()))
-            .clone();
+        let (provider, upstream) = registry.resolve_upstream(requested.as_deref());
+        let provider = provider.clone();
+        let upstream = upstream.map(str::to_string);
+        let mut body_bytes = body_bytes;
+        if let Some(model) = upstream {
+            // Stripped before the hop — see the chat path.
+            if let Some(request) = request.as_mut() {
+                request.model = model.clone();
+            }
+            if let Some(rewritten) = with_model(&body_bytes, &model) {
+                body_bytes = rewritten;
+            }
+        }
         let target = provider.target(&path_and_query);
         debug!(provider = %provider.name(), target = %target, "forwarding to provider");
 
@@ -618,17 +624,38 @@ async fn models(State(state): State<AppState>, req: Request) -> Response {
                     // client (or a UI) can tell two same-named models apart.
                     let id = model.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                     // Hidden models are not advertised, so the listing and what
-                    // the proxy will actually serve agree.
-                    if registry.is_hidden(&id) {
+                    // the proxy will actually serve agree. Asked per provider:
+                    // an id hidden on this one must vanish from its catalogue
+                    // without touching another provider's copy.
+                    if registry.hides(provider.name(), &id) {
                         continue;
                     }
-                    if !id.is_empty() && !seen.insert(id) {
-                        // An id already claimed by an earlier provider routes
-                        // there, so listing it twice would misdescribe routing.
-                        continue;
-                    }
+                    // An id an earlier provider already claimed routes there, so
+                    // listing it bare a second time would misdescribe routing.
+                    // Dropping it instead left this provider's model with no
+                    // name a client could ask for, so it is offered qualified —
+                    // the form routing accepts to reach this provider
+                    // specifically.
+                    let qualified = if id.is_empty() || seen.insert(id.clone()) {
+                        None
+                    } else {
+                        let qualified = format!("{}/{}", provider.name(), id);
+                        // Only advertise an alias routing will honour. When
+                        // some provider really publishes this string as a model
+                        // id, resolving it finds that model rather than this
+                        // one, so listing it here would name the wrong thing.
+                        // The duplicate goes unlisted instead, as it did before
+                        // aliases existed.
+                        if registry.knows(&qualified) || !seen.insert(qualified.clone()) {
+                            continue;
+                        }
+                        Some(qualified)
+                    };
                     let mut model = model;
                     if let Some(obj) = model.as_object_mut() {
+                        if let Some(qualified) = qualified {
+                            obj.insert("id".to_string(), Value::String(qualified));
+                        }
                         obj.insert("provider".to_string(), Value::String(provider.name().to_string()));
                     }
                     merged.push(model);
@@ -672,6 +699,49 @@ async fn read_models(response: Response) -> Option<Vec<Value>> {
     Some(body.get("data")?.as_array()?.clone())
 }
 
+/// The model a request body names, for routing.
+///
+/// Every OpenAI-compatible endpoint that names a model puts it in a top-level
+/// `model` string — chat completions, embeddings, completions, reranks — so one
+/// reader serves them all, including paths this proxy has no typed request for.
+/// Bodies that are not JSON objects (a multipart upload, a GET) name nothing.
+fn model_in_body(method: &axum::http::Method, body: &[u8]) -> Option<String> {
+    if method != axum::http::Method::POST {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(body).ok()?;
+    Some(body.get("model")?.as_str()?.to_string())
+}
+
+/// Re-encode `body` with its top-level `model` replaced.
+///
+/// Returns `None` when the body is not a JSON object, leaving the caller to
+/// forward the original bytes. Only called when a provider qualifier was
+/// actually stripped, so an ordinary request still reaches its upstream as the
+/// exact bytes the client sent.
+fn with_model(body: &[u8], model: &str) -> Option<bytes::Bytes> {
+    let mut body: Value = serde_json::from_slice(body).ok()?;
+    body.as_object_mut()?
+        .insert("model".to_string(), Value::String(model.to_string()));
+    Some(bytes::Bytes::from(serde_json::to_vec(&body).ok()?))
+}
+
+/// The refusal for a model the user chose not to expose.
+fn not_exposed(model: &str) -> Response {
+    warn!(model = %model, "refused: model is not exposed");
+    json_response(
+        StatusCode::NOT_FOUND,
+        HeaderMap::new(),
+        &serde_json::json!({
+            "error": {
+                "message": format!("The model `{model}` is not exposed by this proxy."),
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        }),
+    )
+}
+
 async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     let path_and_query = req
@@ -692,7 +762,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             }
         };
 
-        let chat_request = if parts.method == axum::http::Method::POST
+        let mut chat_request = if parts.method == axum::http::Method::POST
             && parts.uri.path() == "/v1/chat/completions"
         {
             serde_json::from_slice::<ChatRequest>(&body_bytes).ok()
@@ -700,36 +770,42 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             None
         };
 
+        // Every OpenAI-compatible endpoint that names a model carries it the
+        // same way, so routing reads it whatever the path. Reading it only on
+        // the chat path was why an embeddings request went to the default
+        // provider instead of the one whose catalogue holds its model.
+        let requested = chat_request
+            .as_ref()
+            .map(|r| r.model.clone())
+            .or_else(|| model_in_body(&parts.method, &body_bytes));
+
         // A model the user hid is refused rather than routed. Falling back to
         // the default provider would quietly serve something the user chose not
         // to expose, and would disagree with what /v1/models advertises.
         let registry = state.registry.read().await.clone();
-        if let Some(request) = chat_request.as_ref() {
-            if registry.is_hidden(&request.model) {
-                warn!(model = %request.model, "refused: model is not exposed");
-                return json_response(
-                    StatusCode::NOT_FOUND,
-                    HeaderMap::new(),
-                    &serde_json::json!({
-                        "error": {
-                            "message": format!(
-                                "The model `{}` is not exposed by this proxy.",
-                                request.model
-                            ),
-                            "type": "invalid_request_error",
-                            "code": "model_not_found",
-                        }
-                    }),
-                );
+        if let Some(model) = requested.as_deref() {
+            if registry.is_hidden(model) {
+                return not_exposed(model);
             }
         }
 
         // Route on the model, which is the only routing hint an
-        // OpenAI-compatible client gives us. Requests with no parseable model
-        // — every non-chat path — go to the default provider.
-        let provider = registry
-            .resolve(chat_request.as_ref().map(|r| r.model.as_str()))
-            .clone();
+        // OpenAI-compatible client gives us. Requests naming no model at all go
+        // to the default provider.
+        let (provider, upstream) = registry.resolve_upstream(requested.as_deref());
+        let provider = provider.clone();
+        let mut body_bytes = body_bytes;
+        if let Some(model) = upstream {
+            // The qualifier is the proxy's own addressing, so it is stripped
+            // before the hop: the upstream published the bare id and would
+            // reject the qualified one.
+            if let Some(request) = chat_request.as_mut() {
+                request.model = model.to_string();
+            }
+            if let Some(rewritten) = with_model(&body_bytes, model) {
+                body_bytes = rewritten;
+            }
+        }
         let target = provider.target(&path_and_query);
         debug!(provider = %provider.name(), target = %target, "forwarding to provider");
 

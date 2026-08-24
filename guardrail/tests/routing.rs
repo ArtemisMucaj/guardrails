@@ -11,18 +11,66 @@ use guardrail::domain::registry::Registry;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// A backend answering chat completions with plain text, tagged so the test can
+/// A backend answering chat completions and embeddings, tagged so the test can
 /// tell which one replied.
+///
+/// Both replies echo the `model` the backend was actually asked for, which is
+/// how a test sees that a provider qualifier was stripped before the hop.
 async fn backend_named(tag: &str) -> MockServer {
     let server = MockServer::start().await;
+    let chat_tag = tag.to_string();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            r#"{{"id":"{tag}","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":"from {tag}"}},"finish_reason":"stop"}}]}}"#
-        )))
+        .respond_with(move |req: &wiremock::Request| {
+            let tag = chat_tag.clone();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": tag,
+                "object": "chat.completion",
+                "model": received_model(req),
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": format!("from {tag}")},
+                    "finish_reason": "stop",
+                }],
+            }))
+        })
+        .mount(&server)
+        .await;
+    let responses_tag = tag.to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |req: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": responses_tag.clone(),
+                "object": "response",
+                "model": received_model(req),
+                "output": [],
+            }))
+        })
+        .mount(&server)
+        .await;
+    let embedding_tag = tag.to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(move |req: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": embedding_tag.clone(),
+                "object": "list",
+                "model": received_model(req),
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.0]}],
+            }))
+        })
         .mount(&server)
         .await;
     server
+}
+
+/// The `model` field of a request the backend received.
+fn received_model(req: &wiremock::Request) -> String {
+    serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok()
+        .and_then(|b| b["model"].as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 async fn spawn_proxy(state: AppState) -> String {
@@ -43,19 +91,45 @@ fn temp_db(label: &str) -> std::path::PathBuf {
 
 /// Ask the proxy to complete `model` and return the responding backend's tag.
 async fn ask(proxy: &str, model: &str) -> String {
-    let body: serde_json::Value = reqwest::Client::new()
-        .post(format!("{proxy}/v1/chat/completions"))
-        .json(&serde_json::json!({
+    chat(proxy, model).await["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Ask the proxy to complete `model` and return the backend's whole reply.
+async fn chat(proxy: &str, model: &str) -> serde_json::Value {
+    post(
+        proxy,
+        "/v1/chat/completions",
+        serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],
-        }))
+        }),
+    )
+    .await
+}
+
+/// Ask the proxy to embed with `model` and return the backend's whole reply.
+async fn embed(proxy: &str, model: &str) -> serde_json::Value {
+    post(
+        proxy,
+        "/v1/embeddings",
+        serde_json::json!({"model": model, "input": "hi"}),
+    )
+    .await
+}
+
+async fn post(proxy: &str, path: &str, body: serde_json::Value) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(format!("{proxy}{path}"))
+        .json(&body)
         .send()
         .await
         .unwrap()
         .json()
         .await
-        .unwrap();
-    body["id"].as_str().unwrap_or_default().to_string()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -79,6 +153,196 @@ async fn each_model_reaches_the_provider_that_serves_it() {
 
     assert_eq!(ask(&proxy, "model-a").await, "alpha");
     assert_eq!(ask(&proxy, "model-b").await, "beta");
+}
+
+#[tokio::test]
+async fn an_embeddings_request_reaches_the_provider_that_serves_its_model() {
+    // The bug this guards: routing read the model only on the chat path, so an
+    // embeddings request went to the default provider — a different upstream,
+    // which either 404s the model or, worse, answers with vectors from some
+    // other model that silently do not match the stored ones.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("text-embedding-3-small", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    assert_eq!(embed(&proxy, "text-embedding-3-small").await["id"], "beta");
+}
+
+#[tokio::test]
+async fn a_qualified_model_reaches_that_provider_and_arrives_bare() {
+    // `provider/model` is the proxy's own addressing, and the only way to name
+    // the loser of a duplicate id. The upstream published the bare id, so the
+    // qualifier must not survive the hop.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    // alpha claimed the bare id, so beta's copy is reachable only qualified.
+    registry.route("shared", "alpha");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let reply = chat(&proxy, "beta/shared").await;
+    assert_eq!(reply["id"], "beta", "the qualifier decides the provider");
+    assert_eq!(reply["model"], "shared", "the qualifier is stripped");
+
+    // The same on the embeddings path, which reads the model from the body the
+    // proxy rewrites rather than from a typed request.
+    let reply = embed(&proxy, "beta/shared").await;
+    assert_eq!(reply["id"], "beta");
+    assert_eq!(reply["model"], "shared");
+
+    // Unqualified still goes where routing says, unchanged.
+    let reply = chat(&proxy, "shared").await;
+    assert_eq!(reply["id"], "alpha");
+    assert_eq!(reply["model"], "shared");
+}
+
+#[tokio::test]
+async fn the_responses_path_routes_by_model_when_the_typed_parse_fails() {
+    // `ResponsesRequest` types `tools`, so a request carrying a good model and
+    // a malformed `tools` did not parse — and the handler then routed on
+    // nothing, sending it to the default provider with its qualifier still
+    // attached, which the upstream would reject. The body answers the routing
+    // question even when the rest of it is invalid.
+    let alpha = backend_named("alpha").await;
+    let beta = backend_named("beta").await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("shared", "alpha");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let reply = post(
+        &proxy,
+        "/v1/responses",
+        serde_json::json!({
+            "model": "beta/shared",
+            "input": "hi",
+            "tools": "not-an-array",
+        }),
+    )
+    .await;
+
+    assert_eq!(reply["id"], "beta", "routed on the model the body names");
+    assert_eq!(reply["model"], "shared", "the qualifier is stripped");
+}
+
+#[tokio::test]
+async fn a_hidden_model_is_refused_on_the_embeddings_path_too() {
+    // Hiding has to mean the same thing on every path, or it is a suggestion.
+    let alpha = backend_named("alpha").await;
+    // Both servers stay bound for the whole test. Letting beta drop here would
+    // leave a dead port behind it, and the 404 below would no longer prove the
+    // proxy refused the request — a regression that forwarded it instead would
+    // fail on a connection error rather than on the behaviour under test.
+    let beta = backend_named("beta").await;
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("text-embedding-3-small", "beta");
+    registry.hide("text-embedding-3-small", "beta");
+    registry.route("stays-exposed", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/embeddings"))
+        .json(&serde_json::json!({"model": "text-embedding-3-small", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
+
+    // beta is up and would have answered: the 404 is the proxy's refusal, not
+    // an unreachable backend.
+    assert_eq!(embed(&proxy, "stays-exposed").await["id"], "beta");
+}
+
+#[tokio::test]
+async fn hiding_a_model_on_one_provider_leaves_another_serving_it() {
+    // The case an operator actually hits: the same id on a local server and on
+    // Copilot, hidden on the local one. It used to 404 everywhere, because
+    // hiding was a single global set — and the listing dropped both copies.
+    let alpha = backend_with_models("alpha", &["gpt-4o"]).await;
+    let beta = backend_with_models("beta", &["gpt-4o"]).await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    // What discovery records when alpha's config hides the id and beta's
+    // exposes it.
+    registry.hide("gpt-4o", "alpha");
+    registry.route("gpt-4o", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    // Served, by the provider that still exposes it.
+    let reply = chat(&proxy, "gpt-4o").await;
+    assert_eq!(reply["id"], "beta");
+    assert_eq!(reply["model"], "gpt-4o");
+
+    // Listed once, bare, under that provider: alpha's copy is gone, beta's is
+    // not pushed to a qualified id by a rival that no longer claims the name.
+    assert_eq!(
+        ids_with_providers(&list_models(&proxy).await),
+        vec![("gpt-4o".to_string(), "beta".to_string())]
+    );
+
+    // And naming alpha explicitly is still refused — hiding is addressed now,
+    // not global, so it holds exactly where it was set.
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "alpha/gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]
@@ -240,17 +504,24 @@ async fn models_lists_the_union_across_providers() {
 }
 
 #[tokio::test]
-async fn a_duplicate_id_is_listed_once_under_the_provider_that_serves_it() {
-    // Routing gives a contested id to the first provider listed; listing it
-    // twice would tell the client something routing will not honour.
+async fn a_duplicate_id_is_listed_qualified_so_it_stays_reachable() {
+    // Routing gives a contested bare id to the first provider listed, so
+    // listing it bare twice would tell the client something routing will not
+    // honour. Listing it once dropped beta's model from the catalogue and left
+    // it with no name a client could ask for, so it appears qualified — the
+    // form routing accepts to reach beta specifically.
     let alpha = backend_with_models("alpha", &["shared"]).await;
     let beta = backend_with_models("beta", &["shared", "only-beta"]).await;
 
-    let registry = Registry::new(vec![
+    let mut registry = Registry::new(vec![
         Provider::new("alpha", alpha.uri()),
         Provider::new("beta", beta.uri()),
     ])
     .unwrap();
+    // The routes discovery would have recorded: alpha listed `shared` first, so
+    // beta's claim on it loses.
+    registry.route("shared", "alpha");
+    registry.route("only-beta", "beta");
 
     let proxy = spawn_proxy(AppState::with_registry(
         Backend::new(reqwest::Client::new()),
@@ -261,10 +532,92 @@ async fn a_duplicate_id_is_listed_once_under_the_provider_that_serves_it() {
     assert_eq!(
         ids_with_providers(&list_models(&proxy).await),
         vec![
+            ("beta/shared".to_string(), "beta".to_string()),
             ("only-beta".to_string(), "beta".to_string()),
             ("shared".to_string(), "alpha".to_string()),
         ]
     );
+
+    // And every listed id resolves to the provider it is listed under.
+    assert_eq!(ask(&proxy, "shared").await, "alpha");
+    assert_eq!(ask(&proxy, "beta/shared").await, "beta");
+    assert_eq!(ask(&proxy, "only-beta").await, "beta");
+}
+
+#[tokio::test]
+async fn an_alias_that_collides_with_a_real_model_id_is_not_advertised() {
+    // beta publishes both `shared` and, for real, a model called
+    // `beta/shared`. The alias the listing would invent for its duplicate
+    // `shared` is exactly that id, and routing resolves the real model first —
+    // so advertising the alias would hand the client a name that reaches
+    // something else. It goes unlisted instead, as duplicates did before
+    // aliases existed.
+    let alpha = backend_with_models("alpha", &["shared"]).await;
+    let beta = backend_with_models("beta", &["shared", "beta/shared"]).await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("alpha", alpha.uri()),
+        Provider::new("beta", beta.uri()),
+    ])
+    .unwrap();
+    registry.route("shared", "alpha");
+    registry.route("beta/shared", "beta");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    assert_eq!(
+        ids_with_providers(&list_models(&proxy).await),
+        vec![
+            ("beta/shared".to_string(), "beta".to_string()),
+            ("shared".to_string(), "alpha".to_string()),
+        ],
+        "the real model keeps the name; no second entry claims it"
+    );
+
+    // And that name reaches the real model, sent upstream whole.
+    let reply = chat(&proxy, "beta/shared").await;
+    assert_eq!(reply["id"], "beta");
+    assert_eq!(reply["model"], "beta/shared");
+}
+
+#[tokio::test]
+async fn a_provider_named_with_a_slash_is_addressable() {
+    // Provider names are not required to be `/`-free, so the alias for a
+    // duplicate has two slashes. Routing has to find the provider by its real
+    // name rather than splitting at the first one.
+    let mlx = backend_with_models("mlx", &["shared"]).await;
+    let pool = backend_with_models("vendor/pool", &["shared"]).await;
+
+    let mut registry = Registry::new(vec![
+        Provider::new("mlx", mlx.uri()),
+        Provider::new("vendor/pool", pool.uri()),
+    ])
+    .unwrap();
+    registry.route("shared", "mlx");
+
+    let proxy = spawn_proxy(AppState::with_registry(
+        Backend::new(reqwest::Client::new()),
+        registry,
+    ))
+    .await;
+
+    assert_eq!(
+        ids_with_providers(&list_models(&proxy).await),
+        vec![
+            ("shared".to_string(), "mlx".to_string()),
+            ("vendor/pool/shared".to_string(), "vendor/pool".to_string()),
+        ]
+    );
+
+    // Every advertised id must reach what it is listed under.
+    let reply = chat(&proxy, "vendor/pool/shared").await;
+    assert_eq!(reply["id"], "vendor/pool");
+    assert_eq!(reply["model"], "shared", "the qualifier is stripped");
+    assert_eq!(ask(&proxy, "shared").await, "mlx");
 }
 
 #[tokio::test]

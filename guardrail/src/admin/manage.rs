@@ -141,7 +141,7 @@ impl Management {
                 if provider.exposes(&model.id) {
                     registry.route(model.id.clone(), &provider.name);
                 } else {
-                    registry.hide(model.id.clone());
+                    registry.hide(model.id.clone(), &provider.name);
                 }
             }
         }

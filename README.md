@@ -123,18 +123,48 @@ routing table from the answers, so the model list is never hand-maintained. A
 backend that is unreachable at startup keeps its place — a local server is often
 started after the proxy — it simply claims no models until the next restart.
 
-Three rules make routing predictable:
+Four rules make routing predictable:
 
+- **Every request that names a model routes on it**, not just chat completions.
+  `/v1/embeddings`, `/v1/completions` and anything else carrying a top-level
+  `model` reach the backend whose catalogue holds it. Only a request naming no
+  model at all goes to the default.
 - **The first backend is the default.** It serves any model no other backend
   claims, including models that discovery missed and requests that name none.
 - **The first to claim a model id wins.** When two backends both serve `gpt-4o`,
-  the one listed first gets it, and the other is logged rather than silently
-  preferred.
+  the one listed first gets the bare id. The other is still reachable as
+  `NAME/gpt-4o` — see below.
 - **Names must be unique**, and every backend after the first must be named, so
   its requests can be told apart in the metrics.
 
 A single bare `--backend URL` still behaves exactly as before; it is named
 `default`.
+
+#### Naming a backend explicitly
+
+A model id may be qualified with the backend that should serve it:
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -d '{"model": "other/text-embedding-3-small", "input": "hello"}'
+```
+
+The qualifier is the proxy's own addressing and is stripped before the hop, so
+the backend receives the bare `text-embedding-3-small` it published — the
+upstream never sees the `other/` part, and would reject it if it did. It is the
+only way to reach a model id two backends both serve, and it does not override
+exposure: if `mlx` hides `gpt-4o`, then `mlx/gpt-4o` is refused too.
+
+A real model id always wins over the alias that looks like it. An id the proxy
+knows is never re-read as a qualifier, so
+`lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF` routes as itself even if a
+backend shares the first segment's name — and when an alias would collide with
+such an id, the duplicate is left unlisted rather than advertised under a name
+that reaches something else.
+
+The qualifier is matched against the backend names that exist, not split at the
+first `/`, so a backend named `vendor/pool` is addressable as
+`vendor/pool/model`. If two names both prefix an id, the longer one wins.
 
 ### Choosing which models are exposed
 
@@ -182,6 +212,11 @@ advertises and what it will do agree. Exposure decisions are stored per model,
 so a model that vanishes when a backend restarts keeps whatever you chose for
 it.
 
+Exposure is also **per backend**, which is how you pick a vendor for a shared id.
+Hiding `gpt-4o` on `mlx` leaves Copilot's `gpt-4o` listed and served — it simply
+inherits the bare name, since `mlx` has withdrawn its claim on it. Only an id
+that every backend holding it has hidden is refused outright.
+
 ### GitHub Copilot
 
 `--copilot` adds a `copilot` provider backed by a Copilot subscription. Unlike a
@@ -222,7 +257,9 @@ development machine, and not on a shared one.
 
 `GET /v1/models` returns the union across providers, each entry tagged with the
 `provider` that serves it, so a client can name any routable model. An id served
-by more than one provider is listed once, under the provider routing sends it to.
+by more than one provider is listed bare under the provider routing sends it to,
+and qualified — `beta/shared` — under each of the others, so every model has a
+name a client can actually ask for.
 A provider that cannot be reached is skipped rather than emptying the list; if
 none can be reached the endpoint answers `502` rather than claiming the proxy
 serves no models. With a single backend the response is forwarded untouched, so

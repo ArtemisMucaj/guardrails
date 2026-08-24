@@ -55,7 +55,7 @@ async fn discover_models(
                         .map(|p| p.exposes(id))
                         .unwrap_or(true)
                     {
-                        registry.hide(id.clone());
+                        registry.hide(id.clone(), &name);
                         hidden += 1;
                         continue;
                     }
@@ -63,11 +63,14 @@ async fn discover_models(
                         claimed += 1;
                     } else {
                         // Another provider listed this id first. The operator's
-                        // ordering decides; say so rather than silently
-                        // preferring one.
+                        // ordering decides the bare id; say so rather than
+                        // silently preferring one. This copy is still reachable
+                        // — `/v1/models` lists it qualified, and routing accepts
+                        // that form.
                         warn!(
                             provider = %name, model = %id,
-                            "model already served by an earlier provider; not routed here"
+                            qualified = %format!("{name}/{id}"),
+                            "model already served by an earlier provider; reachable under its qualified id"
                         );
                     }
                 }

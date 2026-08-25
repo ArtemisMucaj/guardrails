@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/ArtemisMucaj/guardrails/compare/v0.14.1...v0.15.0) (2026-08-25)
+
+
+### Features
+
+* **admin:** refresh provider discovery without a restart ([#74](https://github.com/ArtemisMucaj/guardrails/issues/74)) ([c0bb328](https://github.com/ArtemisMucaj/guardrails/commit/c0bb32827540866c5ccfe0945f13cec33849109a))
+
+
+### Bug Fixes
+
+* **routing:** refuse a model no provider serves instead of guessing ([#71](https://github.com/ArtemisMucaj/guardrails/issues/71)) ([8147ef6](https://github.com/ArtemisMucaj/guardrails/commit/8147ef677d1a5429cc3846838dc0e76ef3194b15)), closes [#72](https://github.com/ArtemisMucaj/guardrails/issues/72)
+
 ## [0.14.1](https://github.com/ArtemisMucaj/guardrails/compare/v0.14.0...v0.14.1) (2026-08-24)
 
 

@@ -40,6 +40,32 @@ pub struct Management {
     /// answering that discovery is not configured, and the catalogue stays
     /// whatever was recorded at startup.
     discovery: Option<Arc<dyn DiscoveryPort>>,
+    /// Providers built in code rather than described by the configuration,
+    /// keyed by name — today only Copilot.
+    ///
+    /// A configuration entry is a name, a URL and a flag; it cannot express the
+    /// header names a credential-carrying provider owns, and those have to
+    /// survive a rebuild or the credential is displaced by the client's own
+    /// `Authorization`. Keeping the built provider here is what makes that
+    /// recoverable *without* inferring it from the name: a provider merely
+    /// called `copilot` in the config, with no credential behind it, is a
+    /// normal provider and must keep forwarding the caller's headers.
+    credentialed: std::collections::BTreeMap<String, Provider>,
+    /// Serializes everything that reads the configuration and rebuilds from it.
+    ///
+    /// [`Self::discover`] snapshots the providers, spends a network round trip
+    /// per provider, and only then writes what came back. Without this a
+    /// `DELETE` landing inside that window is undone by the reply: the removed
+    /// provider is written back into `discovered`, where the next rebuild
+    /// ignores it — until it is added again under the same name and its stale
+    /// catalogue is routed immediately, which is the exact failure
+    /// [`remove_provider`] clears the entry to prevent. Two concurrent
+    /// discoveries could likewise land out of order.
+    ///
+    /// Held across the fan-out, so a mutation arriving mid-discovery waits for
+    /// it. These are local admin calls and discovery is bounded by the
+    /// providers' own timeouts; ordering is worth more here than concurrency.
+    operations: tokio::sync::Mutex<()>,
 }
 
 impl Management {
@@ -54,7 +80,20 @@ impl Management {
             config_path,
             discovered: RwLock::new(std::collections::BTreeMap::new()),
             discovery: None,
+            credentialed: std::collections::BTreeMap::new(),
+            operations: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Register a provider that was built in code, so a rebuild reproduces it.
+    ///
+    /// Pass the very provider the credential was built with: its reserved
+    /// header names are taken from that one rather than re-declared here, so
+    /// the two cannot drift.
+    pub fn with_credentialed(mut self, provider: Provider) -> Self {
+        self.credentialed
+            .insert(provider.name().to_string(), provider);
+        self
     }
 
     /// Enable re-discovery, so the catalogue routing is decided from can be
@@ -132,6 +171,10 @@ impl Management {
         let Some(discovery) = self.discovery.clone() else {
             anyhow::bail!("model discovery is not configured");
         };
+        // Held until this returns, so the snapshot below, the replies written
+        // against it, and the rebuild are one operation as far as every other
+        // caller is concerned.
+        let _operation = self.operations.lock().await;
 
         // Cloned out from under the lock: the fan-out below is slow (a network
         // round trip per provider) and `rebuild` takes these locks itself, so
@@ -139,7 +182,7 @@ impl Management {
         // deadlock against the rebuild.
         let providers = {
             let config = self.config.read().await;
-            providers_from(&config)
+            providers_from(&config, &self.credentialed)
         };
 
         // Concurrently, like the `/v1/models` aggregate: one unreachable
@@ -195,7 +238,7 @@ impl Management {
         let config = self.config.read().await;
         let discovered = self.discovered.read().await;
 
-        let Some(mut registry) = Registry::new(providers_from(&config)) else {
+        let Some(mut registry) = Registry::new(providers_from(&config, &self.credentialed)) else {
             anyhow::bail!("at least one provider must be enabled");
         };
 
@@ -243,7 +286,21 @@ impl Management {
 /// asked for a catalogue is exactly the set routed to. Building them
 /// separately is how a provider ends up discovered but unreachable, or asked
 /// at the wrong routes.
-fn providers_from(config: &Config) -> Vec<Provider> {
+///
+/// `credentialed` supplies what a configuration entry cannot say: the header
+/// names a provider built in code owns. Its credential lives on an HTTP client
+/// the `Backend` holds by name, and the matching reservation has to be
+/// re-declared on every rebuild or a client's own `Authorization` displaces it.
+///
+/// Matched by name against providers that were **actually built**, never
+/// against the name alone. A configuration entry called `copilot` on a proxy
+/// started without `--copilot` — or before a login — is an ordinary upstream,
+/// and reserving `authorization` for it would strip the caller's own key and
+/// fail every request with a `401` that reads as a bad credential.
+fn providers_from(
+    config: &Config,
+    credentialed: &std::collections::BTreeMap<String, Provider>,
+) -> Vec<Provider> {
     config
         .enabled_providers()
         .map(|p| {
@@ -253,20 +310,11 @@ fn providers_from(config: &Config) -> Vec<Provider> {
             } else {
                 provider
             };
-            // Copilot's credential lives on its HTTP client, which the Backend
-            // still holds by name; the reserved headers must be re-declared
-            // here or a rebuild would drop them.
-            if p.name == crate::copilot::COPILOT_PROVIDER {
-                provider.owning_credential().reserving([
-                    "copilot-integration-id",
-                    "editor-version",
-                    "editor-plugin-version",
-                    "x-github-api-version",
-                    "openai-intent",
-                    "user-agent",
-                ])
-            } else {
-                provider
+            match credentialed.get(&p.name) {
+                // The URL and the route style stay the configuration's to
+                // change; only the reservations come from the built provider.
+                Some(built) => provider.reserving(built.reserved_headers()),
+                None => provider,
             }
         })
         .collect()
@@ -388,6 +436,10 @@ pub(super) async fn update_provider(
         return disabled();
     };
 
+    // Ordered against a discovery in flight, whose replies would
+    // otherwise be written against the configuration this changes.
+    let _operation = management.operations.lock().await;
+
     {
         let mut config = management.config.write().await;
         let Some(provider) = config.provider_mut(&name) else {
@@ -459,6 +511,10 @@ pub(super) async fn add_provider(
         return disabled();
     };
 
+    // Ordered against a discovery in flight, whose replies would
+    // otherwise be written against the configuration this changes.
+    let _operation = management.operations.lock().await;
+
     {
         let mut config = management.config.write().await;
         if config.provider(&new.name).is_some() {
@@ -489,6 +545,10 @@ pub(super) async fn remove_provider(
     let Some(management) = state.management.as_ref() else {
         return disabled();
     };
+
+    // Ordered against a discovery in flight, whose replies would
+    // otherwise be written against the configuration this changes.
+    let _operation = management.operations.lock().await;
 
     {
         let mut config = management.config.write().await;
@@ -564,15 +624,13 @@ fn not_found(name: &str) -> Response {
 mod tests {
     use super::*;
 
-    /// The reserved-header list in `providers_from` is a hand-copy of what
-    /// `copilot::provider` puts on the real thing — it has to be, because a
-    /// rebuild has no token to build an endpoint from. This is what keeps the
-    /// copy honest.
+    /// A rebuilt Copilot provider reserves exactly what the built one does.
     ///
-    /// It matters more than it used to: startup now goes through the same
-    /// rebuild, so a name drifting out of this list would drop a gating header
-    /// on every Copilot request rather than only on those made after the first
-    /// configuration change.
+    /// The reservations cannot come from the configuration — an entry is a
+    /// name, a URL and a flag — so they are taken from the provider the
+    /// credential was built with. Re-declaring them here instead would be a
+    /// copy that drifts, and a name that fell out of it would let a client's
+    /// own header displace what GitHub gates access on.
     #[test]
     fn a_rebuilt_copilot_provider_reserves_what_the_built_one_does() {
         let built = crate::copilot::provider(
@@ -585,10 +643,15 @@ mod tests {
         let mut entry =
             ProviderConfig::new(crate::copilot::COPILOT_PROVIDER, built.provider.base_url());
         entry.unversioned = true;
-        let rebuilt = providers_from(&Config {
+        let config = Config {
             providers: vec![entry],
-        });
+        };
+        let credentialed = std::collections::BTreeMap::from([(
+            built.provider.name().to_string(),
+            built.provider.clone(),
+        )]);
 
+        let rebuilt = providers_from(&config, &credentialed);
         assert_eq!(rebuilt.len(), 1);
         let expected: Vec<&str> = built.provider.reserved_headers().collect();
         let actual: Vec<&str> = rebuilt[0].reserved_headers().collect();
@@ -599,15 +662,46 @@ mod tests {
         assert!(rebuilt[0].is_unversioned(), "Copilot serves at the root");
     }
 
+    /// A provider merely *named* `copilot`, with no credential behind it, is an
+    /// ordinary upstream.
+    ///
+    /// Deciding this by name reserved `authorization` for it, so the adapter
+    /// stripped the caller's own key before the hop and every request came back
+    /// `401` — reading as an expired credential rather than as the proxy having
+    /// taken the header away. It bit only after the first configuration change
+    /// while discovery was separate; now that startup rebuilds through the same
+    /// path, it would have bitten from the first request.
+    #[test]
+    fn a_provider_named_copilot_without_a_credential_reserves_nothing() {
+        let config = Config {
+            providers: vec![ProviderConfig::new(
+                crate::copilot::COPILOT_PROVIDER,
+                "http://127.0.0.1:1234",
+            )],
+        };
+
+        let rebuilt = providers_from(&config, &std::collections::BTreeMap::new());
+
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].reserved_headers().count(), 0);
+        assert!(
+            !rebuilt[0].reserves("authorization"),
+            "the caller's own credential must reach the upstream"
+        );
+    }
+
     /// A disabled provider is not asked and not routed to — the same list feeds
     /// both, so this is one assertion rather than two.
     #[test]
     fn a_disabled_provider_is_not_built() {
         let mut off = ProviderConfig::new("beta", "http://127.0.0.1:2");
         off.enabled = false;
-        let providers = providers_from(&Config {
-            providers: vec![ProviderConfig::new("alpha", "http://127.0.0.1:1"), off],
-        });
+        let providers = providers_from(
+            &Config {
+                providers: vec![ProviderConfig::new("alpha", "http://127.0.0.1:1"), off],
+            },
+            &std::collections::BTreeMap::new(),
+        );
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name(), "alpha");
     }

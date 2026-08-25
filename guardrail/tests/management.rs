@@ -2,6 +2,7 @@
 //! exposed, and have that take effect on the live proxy without a restart.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use guardrail::admin::manage::Management;
 use guardrail::admin::{build_admin_app, AdminInfo, AdminState};
@@ -725,4 +726,63 @@ async fn a_removed_provider_forgets_what_it_reported() {
     let (status, body) = post_json(format!("{}/discovery", h.admin)).await;
     assert_eq!(status, 200);
     assert!(routes(&body, "beta", "b"), "{body}");
+}
+
+#[tokio::test]
+async fn a_removal_during_discovery_is_not_undone_by_the_reply() {
+    // Discovery snapshots the providers, spends a round trip per provider, and
+    // only then writes what came back. A `DELETE` landing inside that window
+    // used to be undone by the reply: the removed provider was written back
+    // into the catalogue, where the next rebuild ignored it — until it was
+    // added again under the same name and its stale models were routed at once,
+    // which is the exact failure removal clears the entry to prevent.
+    let alpha = backend_with("alpha", &["a"]).await;
+    let beta = MockServer::start().await;
+    // Slow enough that the removal below is issued while beta is still being
+    // asked. It has to wait its turn, rather than interleaving.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "object": "list", "data": [{"id": "b", "object": "model"}],
+                }))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&beta)
+        .await;
+
+    let h = harness(
+        "discovery-vs-removal",
+        &[("alpha", &alpha, &["a"]), ("beta", &beta, &["b"])],
+    )
+    .await;
+
+    let admin = h.admin.clone();
+    let discovering =
+        tokio::spawn(async move { post_json(format!("{admin}/discovery")).await });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let removed = reqwest::Client::new()
+        .delete(format!("{}/providers/beta", h.admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    let (status, _) = discovering.await.unwrap();
+    assert_eq!(status, 200, "the discovery itself still succeeds");
+
+    // Adding it back must start from nothing known about it.
+    let added = reqwest::Client::new()
+        .post(format!("{}/providers", h.admin))
+        .json(&serde_json::json!({"name": "beta", "base_url": beta.uri()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+    let body: serde_json::Value = added.json().await.unwrap();
+    assert!(
+        !routes(&body, "beta", "b"),
+        "the reply for a removed provider must not survive as a catalogue: {body}"
+    );
 }

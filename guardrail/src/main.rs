@@ -94,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
     // Copilot is a provider like any other once built, but it needs a
     // credential and its own HTTP client carrying it.
     let mut backend = Backend::new(client.clone());
+    // The Copilot provider as built with its credential, kept so `Management`
+    // can reproduce its reserved header names on every rebuild. Only ever set
+    // when a credential really was built — a configuration entry named
+    // `copilot` on a proxy started without `--copilot` is an ordinary upstream.
+    let mut credentialed: Option<Provider> = None;
     let copilot_login = if cfg.copilot {
         let login = guardrail::copilot::CopilotLogin::new(guardrail::copilot::default_token_path())?;
         match login.token().await {
@@ -127,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
                         config.save(&config_path)?;
                     }
                 }
+                // Registered whether or not the entry is enabled right now:
+                // this is what a rebuild reproduces the credential's header
+                // reservations from, and enabling the provider through the
+                // management API must not have to rebuild them by name.
+                credentialed = Some(built.provider.clone());
                 if config
                     .provider(built.provider.name())
                     .is_some_and(|p| p.enabled)
@@ -169,10 +179,13 @@ async fn main() -> anyhow::Result<()> {
     // the startup catalogue.
     let shared_registry: guardrail::application::SharedRegistry =
         Arc::new(tokio::sync::RwLock::new(Arc::new(registry)));
-    let management = Arc::new(
+    let mut management =
         Management::new(shared_registry.clone(), config.clone(), config_path.clone())
-            .with_discovery(Arc::new(backend.clone())),
-    );
+            .with_discovery(Arc::new(backend.clone()));
+    if let Some(provider) = credentialed {
+        management = management.with_credentialed(provider);
+    }
+    let management = Arc::new(management);
 
     // Ask each provider which models it serves, so requests route by model
     // without the operator hand-maintaining a list. Startup is just the first

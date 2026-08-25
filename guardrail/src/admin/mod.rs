@@ -135,6 +135,13 @@ pub fn build_admin_app(state: AdminState) -> Router {
             "/providers/:name",
             axum::routing::patch(manage::update_provider).delete(manage::remove_provider),
         )
+        // Its own resource rather than `/providers/refresh`: a fixed segment
+        // under `/providers` would win over `/providers/:name` and quietly
+        // reserve that word as a provider name, leaving one called it listed
+        // and routed to but impossible to PATCH or DELETE. Discovery is also a
+        // thing in its own right — what each provider reported, and when — so
+        // a noun leaves room to GET it later.
+        .route("/discovery", axum::routing::post(manage::run_discovery))
         .with_state(state)
 }
 
@@ -174,6 +181,7 @@ async fn index(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let mut endpoints = vec!["/healthz", "/info", "/stats", "/activity", "/requests"];
     if state.management.is_some() {
         endpoints.push("/providers");
+        endpoints.push("/discovery");
     }
     // Listed only when it exists, so discovery does not advertise a route that
     // answers 404.

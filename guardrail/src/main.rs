@@ -10,105 +10,8 @@ use guardrail::domain::metrics::{SqliteRecorder, Stats};
 use guardrail::admin::manage::Management;
 use guardrail::domain::config::{Config as ProxyConfig, ProviderConfig};
 use guardrail::domain::provider::Provider;
-use openai_rs::{ApiRoutes, Model, ModelCatalog, OpenAiModelCatalog, Transport};
 use guardrail::domain::registry::Registry;
 use tracing::{info, warn};
-
-/// Ask every provider for its model list and record the routes.
-///
-/// Best-effort by design. A provider that cannot be reached — not started yet,
-/// no credential — keeps its place in the registry and simply claims no models;
-/// requests naming one of its models still reach it through the default
-/// provider fallback. Failing startup here would make the multi-provider proxy
-/// less robust than the single-backend one it replaces.
-async fn discover_models(
-    backend: &Backend,
-    registry: &mut Registry,
-    config: &ProxyConfig,
-    management: Option<&Arc<Management>>,
-) {
-    // Cloned up front so the registry can be mutated while iterating. Going
-    // through the `Backend` means each provider is asked with its own client —
-    // Copilot's carries the credential its catalogue requires — and through
-    // `target`, so a provider serving its routes at the root is asked at
-    // `/models` rather than a `/v1/models` that would 404.
-    let providers: Vec<Provider> = registry.providers().map(|p| (**p).clone()).collect();
-
-    for provider in &providers {
-        let name = provider.name().to_string();
-        match fetch_models(backend, provider).await {
-            Ok(models) if models.is_empty() => {
-                info!(provider = %name, "no models reported");
-            }
-            Ok(models) => {
-                if let Some(management) = management {
-                    management.set_discovered(&name, models.clone()).await;
-                }
-                let mut claimed = 0usize;
-                let mut hidden = 0usize;
-                for id in models.iter().map(|m| m.id.clone()).collect::<Vec<_>>().iter() {
-                    // A model the user chose not to expose is recorded as
-                    // hidden rather than routed, so it is neither listed nor
-                    // served.
-                    if !config
-                        .provider(&name)
-                        .map(|p| p.exposes(id))
-                        .unwrap_or(true)
-                    {
-                        registry.hide(id.clone(), &name);
-                        hidden += 1;
-                        continue;
-                    }
-                    if registry.route(id.clone(), &name) {
-                        claimed += 1;
-                    } else {
-                        // Another provider listed this id first. The operator's
-                        // ordering decides the bare id; say so rather than
-                        // silently preferring one. This copy is still reachable
-                        // — `/v1/models` lists it qualified, and routing accepts
-                        // that form.
-                        warn!(
-                            provider = %name, model = %id,
-                            qualified = %format!("{name}/{id}"),
-                            "model already served by an earlier provider; reachable under its qualified id"
-                        );
-                    }
-                }
-                info!(provider = %name, discovered = models.len(), routed = claimed, hidden, "models discovered");
-            }
-            Err(e) => {
-                warn!(
-                    provider = %name, error = %e,
-                    "could not list models; requests naming them will fall back to the default provider"
-                );
-            }
-        }
-    }
-}
-
-/// List a provider's models.
-///
-/// Delegates to `openai-rs`, which already normalises the several shapes an
-/// OpenAI-compatible `/models` response comes in into one `Model` type. It is
-/// built on the provider's own HTTP client — Copilot's carries the credential
-/// its catalogue requires — via the transport escape hatch, so this shares the
-/// connection pool and auth rather than constructing a second client that would
-/// not be authenticated.
-async fn fetch_models(backend: &Backend, provider: &Provider) -> anyhow::Result<Vec<Model>> {
-    let routes = if provider.is_unversioned() {
-        ApiRoutes::unversioned()
-    } else {
-        ApiRoutes::default()
-    };
-    let transport = Transport::with_http_client(
-        backend.client_for(provider).clone(),
-        provider.base_url(),
-        routes,
-    );
-    Ok(OpenAiModelCatalog::with_transport(transport)
-        .list_models()
-        .await?)
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -191,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
     // Copilot is a provider like any other once built, but it needs a
     // credential and its own HTTP client carrying it.
     let mut backend = Backend::new(client.clone());
+    // The Copilot provider as built with its credential, kept so `Management`
+    // can reproduce its reserved header names on every rebuild. Only ever set
+    // when a credential really was built — a configuration entry named
+    // `copilot` on a proxy started without `--copilot` is an ordinary upstream.
+    let mut credentialed: Option<Provider> = None;
     let copilot_login = if cfg.copilot {
         let login = guardrail::copilot::CopilotLogin::new(guardrail::copilot::default_token_path())?;
         match login.token().await {
@@ -224,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
                         config.save(&config_path)?;
                     }
                 }
+                // Registered whether or not the entry is enabled right now:
+                // this is what a rebuild reproduces the credential's header
+                // reservations from, and enabling the provider through the
+                // management API must not have to rebuild them by name.
+                credentialed = Some(built.provider.clone());
                 if config
                     .provider(built.provider.name())
                     .is_some_and(|p| p.enabled)
@@ -254,34 +167,44 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Ask each provider which models it serves, so requests route by model
-    // without the operator hand-maintaining a list. A provider that is down at
-    // startup is kept, not dropped: a local server is often started after the
-    // proxy, and refusing to route to it would be worse than discovering its
-    // models late.
-    let Some(mut registry) = Registry::new(providers) else {
+    let Some(registry) = Registry::new(providers) else {
         anyhow::bail!(
             "no provider is enabled — enable one in {} or pass --backend",
             config_path.display()
         );
     };
 
-    // Built before discovery so it can record what each provider reports; the
-    // registry it shares is replaced wholesale on every change.
+    // Built before discovery, because discovery runs through it: the registry
+    // it shares is replaced wholesale on every change, and the first change is
+    // the startup catalogue.
     let shared_registry: guardrail::application::SharedRegistry =
-        Arc::new(tokio::sync::RwLock::new(Arc::new(registry.clone())));
-    let management = Management::new(
-        shared_registry.clone(),
-        config.clone(),
-        config_path.clone(),
-    );
+        Arc::new(tokio::sync::RwLock::new(Arc::new(registry)));
+    let mut management =
+        Management::new(shared_registry.clone(), config.clone(), config_path.clone())
+            .with_discovery(Arc::new(backend.clone()));
+    if let Some(provider) = credentialed {
+        management = management.with_credentialed(provider);
+    }
+    let management = Arc::new(management);
 
-    discover_models(&backend, &mut registry, &config, Some(&management)).await;
-    *shared_registry.write().await = Arc::new(registry.clone());
+    // Ask each provider which models it serves, so requests route by model
+    // without the operator hand-maintaining a list. Startup is just the first
+    // run — the same one `POST /discovery` makes — so a model loaded later
+    // becomes routable without restarting the proxy, and there is one place
+    // routes are decided rather than two that can drift.
+    //
+    // Best-effort, as it has always been: a provider that is down at startup is
+    // kept, not dropped. A local server is often started after the proxy, and
+    // refusing to route to it would be worse than discovering its models late.
+    if let Err(e) = management.discover().await {
+        warn!(error = %e, "could not discover models at startup");
+    }
 
     // Backend URLs are operator-controlled and may embed basic-auth
     // credentials or token-bearing query params; expose only scheme/host/port.
-    let providers_for_log: Vec<String> = registry
+    let providers_for_log: Vec<String> = shared_registry
+        .read()
+        .await
         .providers()
         .map(|p| format!("{}={}", p.name(), redact_backend_url(p.base_url())))
         .collect();
